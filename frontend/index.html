@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI Crypto Trader</title>
+  <link rel="stylesheet" href="style.css" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+</head>
+<body>
+  <!-- ── Header ── -->
+  <header>
+    <div class="header-left">
+      <span class="logo">⚡ AI Crypto Trader</span>
+      <span id="ws-dot" class="dot dot-red" title="WebSocket disconnected"></span>
+    </div>
+    <div class="header-right">
+      <span class="risk-label">Risk:</span>
+      <div class="risk-btns">
+        <button id="risk-conservative" class="btn-risk" onclick="setRiskProfile('conservative')" title="Conservative — high conviction only, 2% max">🛡 Safe</button>
+        <button id="risk-balanced"     class="btn-risk" onclick="setRiskProfile('balanced')"     title="Balanced — default behaviour, 5% max">⚖ Balanced</button>
+        <button id="risk-aggressive"   class="btn-risk" onclick="setRiskProfile('aggressive')"   title="Aggressive — more trades, momentum focus">⚡ Aggressive</button>
+        <button id="risk-fast_profit"  class="btn-risk" onclick="setRiskProfile('fast_profit')"  title="Fast Profit — maximum aggression, 15m/1h signals">🚀 Fast Profit</button>
+      </div>
+      <span style="color:var(--border)">|</span>
+      <span>Mode:</span>
+      <button id="btn-demo" class="btn-mode active" onclick="setMode('demo')">DEMO</button>
+      <button id="btn-real" class="btn-mode" onclick="setMode('real')">REAL</button>
+      <button id="btn-start" class="btn-action btn-green" onclick="startBot()">▶ START</button>
+      <button id="btn-stop" class="btn-action btn-red" onclick="stopBot()">■ STOP</button>
+      <button id="btn-reset" class="btn-action btn-reset" onclick="resetDemo()" title="Wipe all history and reset to $10,000">↺ RESET</button>
+    </div>
+  </header>
+
+  <!-- ── Stats Bar ── -->
+  <section class="stats-bar">
+    <div class="stat-card">
+      <div class="stat-label">Total Value</div>
+      <div id="stat-total" class="stat-value">$—</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Cash (USDT)</div>
+      <div id="stat-cash" class="stat-value">$—</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Positions Value</div>
+      <div id="stat-positions" class="stat-value">$—</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Total P&L</div>
+      <div id="stat-pnl" class="stat-value">$—</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Open Positions</div>
+      <div id="stat-num-pos" class="stat-value">—</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Bot Status</div>
+      <div id="stat-status" class="stat-value">STOPPED</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Claude Cost (session)</div>
+      <div id="stat-credits" class="stat-value" title="Estimated API cost since last restart">$—</div>
+    </div>
+  </section>
+
+  <main>
+    <!-- ── Positions Table ── -->
+    <section class="card">
+      <h2>Open Positions</h2>
+      <div class="table-wrap">
+        <table id="tbl-positions">
+          <thead>
+            <tr>
+              <th>Symbol</th>
+              <th>Quantity</th>
+              <th>Avg Entry</th>
+              <th>Current Price</th>
+              <th>Value (USDT)</th>
+              <th>P&L (USDT)</th>
+              <th>P&L %</th>
+              <th>Stop Loss</th>
+              <th>Take Profit</th>
+            </tr>
+          </thead>
+          <tbody id="positions-body">
+            <tr><td colspan="9" class="empty-msg">No open positions</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ── Portfolio Overview ── -->
+    <div class="two-col-grid">
+      <section class="card">
+        <h2>Portfolio Growth</h2>
+        <div class="chart-container" style="height:200px">
+          <canvas id="growth-chart"></canvas>
+        </div>
+      </section>
+      <section class="card">
+        <h2>Allocation</h2>
+        <div class="donut-wrap">
+          <canvas id="alloc-chart"></canvas>
+        </div>
+        <div id="alloc-legend" class="alloc-legend"></div>
+      </section>
+    </div>
+
+    <!-- ── Claude's Last Decision ── -->
+    <section class="card" id="decision-card">
+      <h2>Claude's Last Decision</h2>
+      <div id="decision-content" class="decision-empty">Waiting for first decision...</div>
+    </section>
+
+    <!-- ── Trade P&L History ── -->
+    <section class="card">
+      <div class="section-header">
+        <h2>Trade P&L History</h2>
+        <div id="analytics-stats" class="analytics-stats"></div>
+      </div>
+      <div class="chart-container" style="height:160px">
+        <canvas id="pnl-chart"></canvas>
+      </div>
+    </section>
+
+    <!-- ── Price Chart ── -->
+    <section class="card">
+      <div class="chart-controls">
+        <h2>Price Chart</h2>
+        <div class="chart-selectors">
+          <select id="chart-symbol" onchange="loadChart()">
+            <option value="">— select symbol —</option>
+          </select>
+          <div class="tf-btns">
+            <button class="btn-tf active" onclick="selectTf(this,'15m')">15m</button>
+            <button class="btn-tf" onclick="selectTf(this,'1h')">1h</button>
+            <button class="btn-tf" onclick="selectTf(this,'4h')">4h</button>
+            <button class="btn-tf" onclick="selectTf(this,'1d')">1d</button>
+          </div>
+        </div>
+      </div>
+      <div class="chart-container">
+        <canvas id="price-chart"></canvas>
+      </div>
+      <div class="chart-container chart-small">
+        <canvas id="rsi-chart"></canvas>
+      </div>
+      <div class="chart-container chart-small">
+        <canvas id="macd-chart"></canvas>
+      </div>
+    </section>
+
+    <!-- ── Trade History ── -->
+    <section class="card">
+      <div class="section-header">
+        <h2>Trade History</h2>
+        <div>
+          <button class="btn-sm" onclick="loadTrades(-1)" id="btn-prev">◀</button>
+          <span id="page-info">Page 1</span>
+          <button class="btn-sm" onclick="loadTrades(1)" id="btn-next">▶</button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table id="tbl-trades">
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Symbol</th>
+              <th>Direction</th>
+              <th>Mode</th>
+              <th>Quantity</th>
+              <th>Price</th>
+              <th>P&L (USDT)</th>
+              <th>P&L %</th>
+            </tr>
+          </thead>
+          <tbody id="trades-body">
+            <tr><td colspan="8" class="empty-msg">No trades yet</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ── AI Decision Feed ── -->
+    <section class="card">
+      <h2>AI Decision Feed</h2>
+      <div id="decision-feed" class="decision-feed">
+        <div class="empty-msg">Waiting for decisions…</div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <span id="footer-msg">Connecting...</span>
+    <span id="next-cycle"></span>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>

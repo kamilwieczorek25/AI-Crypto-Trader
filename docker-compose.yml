@@ -1,0 +1,29 @@
+services:
+  trader:
+    build: ./backend
+    ports:
+      - "9000:8000"
+    env_file:
+      - .env
+    volumes:
+      - trader-db:/data
+      - ./backend/app:/app/app   # hot-reload in dev
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  frontend:
+    image: nginx:alpine
+    ports:
+      - "9080:80"
+    volumes:
+      - ./frontend:/usr/share/nginx/html:ro
+    depends_on:
+      - trader
+    restart: unless-stopped
+
+volumes:
+  trader-db:
