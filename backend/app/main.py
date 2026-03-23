@@ -76,7 +76,17 @@ async def _pretrain_ml() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     configure_logging()
-    await create_tables()
+    try:
+        await create_tables()
+    except Exception as exc:
+        _log.critical(
+            "DATABASE SETUP FAILED: %s\n"
+            "If using PostgreSQL, run:\n"
+            "  sudo -u postgres psql -d ai_trader -c \"GRANT ALL ON SCHEMA public TO ai_trader;\"\n"
+            "Then restart the container.",
+            exc,
+        )
+        raise
 
     # Restore portfolio from DB
     async with AsyncSessionLocal() as db:
