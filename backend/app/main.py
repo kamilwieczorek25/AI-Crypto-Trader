@@ -176,14 +176,27 @@ _ALLOWED_ORIGINS = [
     "http://127.0.0.1:9080",
     f"http://localhost:{os.environ.get('FRONTEND_PORT', '9080')}",
 ]
+# Auto-allow the machine's own hostname/IP on the frontend port
+import socket as _sock
+try:
+    _hostname = _sock.gethostname()
+    _ip = _sock.gethostbyname(_hostname)
+    _ALLOWED_ORIGINS.append(f"http://{_hostname}:9080")
+    _ALLOWED_ORIGINS.append(f"http://{_ip}:9080")
+except Exception:
+    pass
 # Allow user to add extra origins via env (comma-separated)
+# For Docker: set CORS_ORIGINS=* to allow all origins
 _extra = os.environ.get("CORS_ORIGINS", "")
-if _extra:
+if _extra == "*":
+    _ALLOWED_ORIGINS = ["*"]
+elif _extra:
     _ALLOWED_ORIGINS.extend(o.strip() for o in _extra.split(",") if o.strip())
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_ALLOWED_ORIGINS,
+    allow_credentials=_ALLOWED_ORIGINS != ["*"],
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["content-type", "x-admin-token"],
 )
