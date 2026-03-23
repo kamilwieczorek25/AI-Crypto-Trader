@@ -174,7 +174,7 @@ class Settings(BaseSettings):
     CRYPTOCOMPARE_API_KEY: str = ""
 
     # Database
-    DATABASE_URL: str = "sqlite+aiosqlite:////data/trader.db"
+    DATABASE_URL: str = "postgresql+asyncpg://ai_trader:ai_trader@localhost:5432/ai_trader"
 
     # Logging
     LOG_LEVEL: str = "INFO"
