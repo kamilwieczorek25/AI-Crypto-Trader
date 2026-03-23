@@ -5,11 +5,18 @@ from sqlalchemy.orm import DeclarativeBase
 
 from app.config import settings
 
-engine = create_async_engine(
-    settings.DATABASE_URL,
-    echo=False,
-    connect_args={"check_same_thread": False},
-)
+_is_sqlite = settings.DATABASE_URL.startswith("sqlite")
+
+_engine_kwargs: dict = {"echo": False}
+if _is_sqlite:
+    _engine_kwargs["connect_args"] = {"check_same_thread": False}
+else:
+    # PostgreSQL connection pool settings
+    _engine_kwargs["pool_size"] = 5
+    _engine_kwargs["max_overflow"] = 10
+    _engine_kwargs["pool_pre_ping"] = True
+
+engine = create_async_engine(settings.DATABASE_URL, **_engine_kwargs)
 
 AsyncSessionLocal = async_sessionmaker(
     bind=engine,
@@ -35,14 +42,14 @@ async def _apply_migrations(conn) -> None:
     import logging
     log = logging.getLogger(__name__)
     migrations = [
-        ("positions", "highest_price", "REAL DEFAULT 0.0"),
-        ("positions", "trailing_stop_pct", "REAL DEFAULT 0.0"),
+        ("positions", "highest_price", "DOUBLE PRECISION DEFAULT 0.0" if not _is_sqlite else "REAL DEFAULT 0.0"),
+        ("positions", "trailing_stop_pct", "DOUBLE PRECISION DEFAULT 0.0" if not _is_sqlite else "REAL DEFAULT 0.0"),
         ("claude_decisions", "risk_profile", "VARCHAR(20)"),
         ("claude_decisions", "error", "TEXT"),
-        ("trades", "fee_usdt", "REAL DEFAULT 0.0"),
+        ("trades", "fee_usdt", "DOUBLE PRECISION DEFAULT 0.0" if not _is_sqlite else "REAL DEFAULT 0.0"),
         ("positions", "source", "VARCHAR(10) DEFAULT 'bot'"),
         ("positions", "tp_activated", "INTEGER DEFAULT 0"),
-        ("positions", "tp_peak_price", "REAL DEFAULT 0.0"),
+        ("positions", "tp_peak_price", "DOUBLE PRECISION DEFAULT 0.0" if not _is_sqlite else "REAL DEFAULT 0.0"),
     ]
     for table, column, col_def in migrations:
         try:

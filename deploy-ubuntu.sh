@@ -10,6 +10,10 @@ set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 COMPOSE_FILE="$PROJECT_DIR/docker-compose.yml"
 
+DB_NAME="ai_trader"
+DB_USER="ai_trader"
+DB_PASS="ai_trader"
+
 echo "═══════════════════════════════════════════════"
 echo " AI Crypto Trader — Ubuntu deployment"
 echo " Project dir: $PROJECT_DIR"
@@ -28,11 +32,58 @@ if ! docker compose version &>/dev/null; then
 fi
 echo "✔ Docker Compose $(docker compose version --short)"
 
-# ── 2. Copy .env if missing ──────────────────────────────────────────────────
+# ── 2. Install & configure PostgreSQL ────────────────────────────────────────
+echo ""
+echo "▶ Setting up PostgreSQL..."
+
+if ! command -v psql &>/dev/null; then
+  echo "  Installing PostgreSQL..."
+  sudo apt-get update -qq
+  sudo apt-get install -y -qq postgresql postgresql-contrib > /dev/null
+fi
+
+# Ensure PostgreSQL is running
+sudo systemctl start postgresql
+sudo systemctl enable postgresql
+echo "✔ PostgreSQL $(psql --version | grep -oP '\d+\.\d+')"
+
+# Create database user and database (idempotent)
+sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='${DB_USER}'" \
+  | grep -q 1 || sudo -u postgres psql -c "CREATE USER ${DB_USER} WITH PASSWORD '${DB_PASS}';"
+
+sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='${DB_NAME}'" \
+  | grep -q 1 || sudo -u postgres psql -c "CREATE DATABASE ${DB_NAME} OWNER ${DB_USER};"
+
+sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE ${DB_NAME} TO ${DB_USER};" 2>/dev/null || true
+echo "✔ Database '${DB_NAME}' ready (user: ${DB_USER})"
+
+# Allow Docker containers to connect via host.docker.internal (172.17.0.0/16)
+PG_VERSION=$(ls /etc/postgresql/ | sort -V | tail -1)
+PG_HBA="/etc/postgresql/${PG_VERSION}/main/pg_hba.conf"
+PG_CONF="/etc/postgresql/${PG_VERSION}/main/postgresql.conf"
+
+# Listen on all interfaces (needed for Docker containers to connect)
+if ! grep -q "^listen_addresses = '\*'" "$PG_CONF" 2>/dev/null; then
+  echo "  Configuring PostgreSQL to listen on all interfaces..."
+  sudo sed -i "s/^#\?listen_addresses\s*=.*/listen_addresses = '*'/" "$PG_CONF"
+fi
+
+# Allow password auth from Docker bridge network
+if ! grep -q "172.17.0.0/16" "$PG_HBA" 2>/dev/null; then
+  echo "  Adding Docker network to pg_hba.conf..."
+  echo "host    ${DB_NAME}    ${DB_USER}    172.17.0.0/16    md5" | sudo tee -a "$PG_HBA" > /dev/null
+fi
+
+sudo systemctl restart postgresql
+echo "✔ PostgreSQL configured for Docker access"
+
+# ── 3. Copy .env if missing ──────────────────────────────────────────────────
 if [ ! -f "$PROJECT_DIR/.env" ]; then
   echo ""
   echo "▶ Creating .env from template..."
   cp "$PROJECT_DIR/.env.example" "$PROJECT_DIR/.env"
+  # Set the DATABASE_URL to point to host PostgreSQL via Docker gateway
+  sed -i "s|^DATABASE_URL=.*|DATABASE_URL=postgresql+asyncpg://${DB_USER}:${DB_PASS}@host.docker.internal:5432/${DB_NAME}|" "$PROJECT_DIR/.env"
   echo ""
   echo "╔══════════════════════════════════════════════════╗"
   echo "║  ACTION REQUIRED: Edit .env before continuing   ║"
@@ -45,6 +96,12 @@ if [ ! -f "$PROJECT_DIR/.env" ]; then
   echo ""
   echo "After editing, re-run this script."
   exit 1
+else
+  # Ensure existing .env uses host.docker.internal for PostgreSQL
+  if grep -q "^DATABASE_URL=postgresql" "$PROJECT_DIR/.env" && ! grep -q "host.docker.internal" "$PROJECT_DIR/.env"; then
+    echo "  Updating DATABASE_URL to use host.docker.internal..."
+    sed -i "s|^DATABASE_URL=postgresql+asyncpg://\([^@]*\)@localhost:|DATABASE_URL=postgresql+asyncpg://\1@host.docker.internal:|" "$PROJECT_DIR/.env"
+  fi
 fi
 
 # ── 3. Check ANTHROPIC_API_KEY is set ────────────────────────────────────────
@@ -94,8 +151,9 @@ if [ ! -f "$SERVICE_FILE" ]; then
     sudo tee "$SERVICE_FILE" > /dev/null <<EOF
 [Unit]
 Description=AI Crypto Trader
-After=docker.service
+After=docker.service postgresql.service
 Requires=docker.service
+Wants=postgresql.service
 
 [Service]
 Type=oneshot
