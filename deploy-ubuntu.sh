@@ -68,10 +68,12 @@ if ! grep -q "^listen_addresses = '\*'" "$PG_CONF" 2>/dev/null; then
   sudo sed -i "s/^#\?listen_addresses\s*=.*/listen_addresses = '*'/" "$PG_CONF"
 fi
 
-# Allow password auth from Docker bridge network
-if ! grep -q "172.17.0.0/16" "$PG_HBA" 2>/dev/null; then
-  echo "  Adding Docker network to pg_hba.conf..."
-  echo "host    ${DB_NAME}    ${DB_USER}    172.17.0.0/16    md5" | sudo tee -a "$PG_HBA" > /dev/null
+# Allow password auth from Docker networks (bridge + compose networks)
+if ! grep -q "172.16.0.0/12" "$PG_HBA" 2>/dev/null; then
+  echo "  Adding Docker networks to pg_hba.conf..."
+  # Remove old narrow rule if present
+  sudo sed -i '/172\.17\.0\.0\/16.*ai_trader/d' "$PG_HBA" 2>/dev/null || true
+  echo "host    ${DB_NAME}    ${DB_USER}    172.16.0.0/12    md5" | sudo tee -a "$PG_HBA" > /dev/null
 fi
 
 sudo systemctl restart postgresql
