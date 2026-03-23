@@ -194,3 +194,38 @@ async def set_less_fear(req: LessFearRequest) -> dict:
         "less_fear": settings.LESS_FEAR,
     })
     return {"enabled": settings.LESS_FEAR}
+
+
+class AdoptRequest(BaseModel):
+    symbol: str | None = None  # None = adopt all external positions
+    sl_pct: float | None = None
+    tp_pct: float | None = None
+
+
+@router.post("/adopt-positions")
+async def adopt_positions(
+    req: AdoptRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Convert external positions to bot-managed with SL/TP."""
+    from app.services.portfolio import portfolio_service
+
+    adopted = []
+
+    if req.symbol:
+        pos = await portfolio_service.adopt_position(db, req.symbol, req.sl_pct, req.tp_pct)
+        if pos:
+            adopted.append(pos.symbol)
+    else:
+        for pos in portfolio_service.all_positions():
+            if pos.source == "external":
+                result = await portfolio_service.adopt_position(
+                    db, pos.symbol, req.sl_pct, req.tp_pct,
+                )
+                if result:
+                    adopted.append(result.symbol)
+
+    # Broadcast updated portfolio so dashboard refreshes
+    await bot_runner._broadcast("PORTFOLIO_UPDATE", portfolio_service.get_state().model_dump())
+
+    return {"adopted": adopted, "count": len(adopted)}

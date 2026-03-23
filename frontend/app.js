@@ -147,9 +147,10 @@ function renderPositions(positions) {
     tbody.innerHTML = '<tr><td colspan="11" class="empty-msg">No open positions</td></tr>';
     return;
   }
+  const hasExternal = positions.some(p => p.source === 'external');
   tbody.innerHTML = positions.map(p => {
     const srcBadge = p.source === 'external'
-      ? '<span class="badge badge-ext">ext</span>'
+      ? `<button class="badge badge-ext adopt-btn" onclick="adoptPosition('${escapeHtml(p.symbol)}')">ext ⟶ adopt</button>`
       : '<span class="badge badge-bot">bot</span>';
     return `
     <tr>
@@ -166,6 +167,21 @@ function renderPositions(positions) {
       <td>${srcBadge}</td>
     </tr>`;
   }).join('');
+
+  // Show "Adopt All" button when there are external positions
+  let adoptAllBtn = document.getElementById('adopt-all-btn');
+  if (hasExternal) {
+    if (!adoptAllBtn) {
+      adoptAllBtn = document.createElement('button');
+      adoptAllBtn.id = 'adopt-all-btn';
+      adoptAllBtn.className = 'btn btn-adopt-all';
+      adoptAllBtn.textContent = 'Adopt All External';
+      adoptAllBtn.onclick = () => adoptPosition(null);
+      tbody.closest('table')?.parentElement?.insertBefore(adoptAllBtn, tbody.closest('table'));
+    }
+  } else if (adoptAllBtn) {
+    adoptAllBtn.remove();
+  }
 }
 
 /* ═══════════════════════════════════════════════════════════
@@ -353,6 +369,22 @@ async function loadLessFear() {
       syncLessFearButton(data.enabled);
     }
   } catch (_) {}
+}
+
+/* ─── Adopt external positions ─── */
+async function adoptPosition(symbol) {
+  const label = symbol || 'all external positions';
+  if (!confirm(`Adopt ${label}? Bot will manage SL/TP and exits.`)) return;
+  try {
+    const body = symbol ? {symbol} : {};
+    const resp = await fetch(`${API_BASE}/api/bot/adopt-positions`, {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(body),
+    });
+    if (!resp.ok) { const e = await resp.json(); alert(e.detail || 'Failed'); return; }
+    const data = await resp.json();
+    alert(`Adopted ${data.count} position(s): ${data.adopted.join(', ') || 'none'}`);
+  } catch (e) { alert('Error: ' + e.message); }
 }
 
 /* ═══════════════════════════════════════════════════════════

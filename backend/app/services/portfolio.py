@@ -363,6 +363,39 @@ class PortfolioService:
 
         return triggers
 
+    async def adopt_position(
+        self, db: AsyncSession, symbol: str,
+        sl_pct: float | None = None, tp_pct: float | None = None,
+    ) -> Position | None:
+        """Convert an external position to bot-managed with SL/TP.
+
+        If sl_pct / tp_pct are not provided, uses config defaults.
+        Returns the updated position or None if not found / already bot-managed.
+        """
+        pos = self._positions.get(symbol)
+        if pos is None or pos.source == "bot":
+            return None
+
+        if sl_pct is None:
+            sl_pct = settings.MIN_SL_PCT
+        if tp_pct is None:
+            tp_pct = sl_pct * settings.MIN_REWARD_RISK_RATIO
+
+        price = pos.current_price if pos.current_price > 0 else pos.avg_entry_price
+        pos.source = "bot"
+        pos.stop_loss_price = round(price * (1 - sl_pct / 100), 6)
+        pos.take_profit_price = round(price * (1 + tp_pct / 100), 6)
+        pos.highest_price = max(pos.highest_price, price)
+        pos.trailing_stop_pct = sl_pct
+        pos.updated_at = datetime.now(timezone.utc)
+        db.add(pos)
+        await db.commit()
+        logger.info(
+            "Adopted %s: SL=$%.6f (%.1f%%), TP=$%.6f (%.1f%%)",
+            symbol, pos.stop_loss_price, sl_pct, pos.take_profit_price, tp_pct,
+        )
+        return pos
+
     async def _persist_cash(self) -> None:
         """Write current cash balance to bot_state table immediately (crash recovery)."""
         from app.database import save_bot_state
