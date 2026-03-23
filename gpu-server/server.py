@@ -866,7 +866,31 @@ class ExplainRequest(BaseModel):
 
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
-app = FastAPI(title="GPU Inference Server v2")
+
+import json as _json
+
+class _NumpyEncoder(_json.JSONEncoder):
+    """Ensure numpy types are serialised to native Python for JSON responses."""
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.bool_):
+            return bool(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super().default(obj)
+
+
+from fastapi.responses import JSONResponse as _JSONResponse
+
+class _SafeJSONResponse(_JSONResponse):
+    def render(self, content) -> bytes:
+        return _json.dumps(content, cls=_NumpyEncoder).encode("utf-8")
+
+
+app = FastAPI(title="GPU Inference Server v2", default_response_class=_SafeJSONResponse)
 
 _ALLOWED_ORIGINS = os.environ.get(
     "CORS_ORIGINS", "http://localhost:9000,http://127.0.0.1:9000"
@@ -1782,6 +1806,7 @@ def _train_vol_inline(feat: np.ndarray):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/detect/anomaly")
+@gpu_locked
 def detect_anomaly(req: AnomalyDetectRequest):
     """Detect anomalous price/volume patterns (pumps, flash crashes, etc.)."""
     global anomaly_model, anomaly_trained, _anomaly_mean_error, _anomaly_std_error
@@ -1805,7 +1830,7 @@ def detect_anomaly(req: AnomalyDetectRequest):
 
     # Z-score relative to training distribution
     z_score = (error - _anomaly_mean_error) / (_anomaly_std_error + 1e-10)
-    is_anomaly = z_score > ANOMALY_THRESHOLD
+    is_anomaly = bool(z_score > ANOMALY_THRESHOLD)
 
     return {
         "is_anomaly": is_anomaly,
