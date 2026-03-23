@@ -55,6 +55,7 @@ sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='${DB_NAME}'"
   | grep -q 1 || sudo -u postgres psql -c "CREATE DATABASE ${DB_NAME} OWNER ${DB_USER};"
 
 sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE ${DB_NAME} TO ${DB_USER};" 2>/dev/null || true
+sudo -u postgres psql -d "${DB_NAME}" -c "GRANT ALL ON SCHEMA public TO ${DB_USER};" 2>/dev/null || true
 echo "✔ Database '${DB_NAME}' ready (user: ${DB_USER})"
 
 # Allow Docker containers to connect via host.docker.internal (172.17.0.0/16)
