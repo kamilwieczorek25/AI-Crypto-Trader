@@ -166,15 +166,38 @@ def compute_indicators(ohlcv: list[list[float]]) -> dict[str, float]:
         else:
             indicators["macd_hist"] = 0.0
 
-        # Bollinger Bands %B
+        # Bollinger Bands %B + Squeeze detection
         bb = ta.bbands(close, length=20, std=2)
         if bb is not None and not bb.empty:
             pct_col = [c for c in bb.columns if "p" in c.lower()]
             indicators["bb_pct_b"] = _safe_float(
                 bb[pct_col[0]].iloc[-1] if pct_col else None
             )
+            # BB Squeeze: bandwidth = (upper - lower) / middle
+            upper_col = [c for c in bb.columns if "u" in c.lower()]
+            lower_col = [c for c in bb.columns if "l" in c.lower() and "p" not in c.lower()]
+            mid_col = [c for c in bb.columns if "m" in c.lower()]
+            if upper_col and lower_col and mid_col:
+                bbu = bb[upper_col[0]]
+                bbl = bb[lower_col[0]]
+                bbm = bb[mid_col[0]]
+                bw = ((bbu - bbl) / bbm.replace(0, np.nan)).dropna()
+                if len(bw) >= 20:
+                    current_bw = _safe_float(bw.iloc[-1])
+                    avg_bw = _safe_float(bw.rolling(20).mean().iloc[-1])
+                    # Squeeze = bandwidth is <60% of its 20-period average
+                    indicators["bb_squeeze"] = 1.0 if (avg_bw > 0 and current_bw < avg_bw * 0.6) else 0.0
+                    indicators["bb_bandwidth"] = current_bw
+                else:
+                    indicators["bb_squeeze"] = 0.0
+                    indicators["bb_bandwidth"] = 0.0
+            else:
+                indicators["bb_squeeze"] = 0.0
+                indicators["bb_bandwidth"] = 0.0
         else:
             indicators["bb_pct_b"] = 0.5
+            indicators["bb_squeeze"] = 0.0
+            indicators["bb_bandwidth"] = 0.0
 
         # EMA 20
         ema20 = ta.ema(close, length=20)
@@ -193,6 +216,8 @@ def compute_indicators(ohlcv: list[list[float]]) -> dict[str, float]:
         indicators["rsi14"] = _safe_float(rsi_val.iloc[-1])
         indicators["macd_hist"] = 0.0
         indicators["bb_pct_b"] = 0.5
+        indicators["bb_squeeze"] = 0.0
+        indicators["bb_bandwidth"] = 0.0
         indicators["ema20"] = _safe_float(close.ewm(span=20).mean().iloc[-1])
         indicators["atr"] = _safe_float(
             (high - low).rolling(14).mean().iloc[-1]
@@ -222,8 +247,22 @@ def compute_indicators(ohlcv: list[list[float]]) -> dict[str, float]:
     else:
         indicators["obv_trend"] = 0.0
 
-    # Current price and trend label (multi-candle: 3 of last 5 closes above EMA20)
+    # VWAP (Volume Weighted Average Price) — intraday anchor
+    typical_price = (high + low + close) / 3
+    cum_tp_vol = (typical_price * volume).cumsum()
+    cum_vol = volume.cumsum()
+    vwap = cum_tp_vol / cum_vol.replace(0, np.nan)
+    indicators["vwap"] = _safe_float(vwap.iloc[-1])
+    # Price vs VWAP: >0 means above VWAP (bullish), <0 means below (bearish)
     current_close = _safe_float(close.iloc[-1])
+    if indicators["vwap"] > 0 and current_close:
+        indicators["price_vs_vwap"] = round(
+            (current_close - indicators["vwap"]) / indicators["vwap"] * 100, 3
+        )
+    else:
+        indicators["price_vs_vwap"] = 0.0
+
+    # Current price and trend label (multi-candle: 3 of last 5 closes above EMA20)
     indicators["close"] = current_close
     ema20_val = indicators.get("ema20", 0.0)
 
@@ -261,11 +300,15 @@ def _empty_indicators(status: str = "ok") -> dict[str, float]:
         "rsi14": 50.0,
         "macd_hist": 0.0,
         "bb_pct_b": 0.5,
+        "bb_squeeze": 0.0,
+        "bb_bandwidth": 0.0,
         "ema20": 0.0,
         "atr": 0.0,
         "volume_ratio": 1.0,
         "volume_trend": 1.0,
         "obv_trend": 0.0,
+        "vwap": 0.0,
+        "price_vs_vwap": 0.0,
         "close": 0.0,
         "trend": 0.0,
         "rsi_divergence": 0.0,

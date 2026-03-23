@@ -18,15 +18,13 @@ const PALETTE = ['#6366f1','#22c55e','#f59e0b','#3b82f6','#ef4444','#8b5cf6','#1
 const $ = id => document.getElementById(id);
 const fmt = (n, dec=2) => n == null ? '—' : Number(n).toLocaleString('en-US', {minimumFractionDigits: dec, maximumFractionDigits: dec});
 const fmtPrice = n => n == null ? '—' : `$${fmt(n, n < 1 ? 6 : 2)}`;
-const fmtTime = s => s ? new Date(s).toLocaleString() : '—';
+const fmtTime = s => s ? new Date(s.endsWith('Z') ? s : s + 'Z').toLocaleString() : '—';
 
 function timeAgo(dateStr) {
   if (!dateStr) return '—';
-  const diff = (Date.now() - new Date(dateStr)) / 1000;
-  if (diff < 60) return `${Math.round(diff)}s ago`;
-  if (diff < 3600) return `${Math.round(diff / 60)}m ago`;
-  if (diff < 86400) return `${Math.round(diff / 3600)}h ago`;
-  return `${Math.round(diff / 86400)}d ago`;
+  // Backend stores UTC without 'Z' — convert to CET/CEST
+  const utcStr = dateStr.endsWith('Z') ? dateStr : dateStr + 'Z';
+  return new Date(utcStr).toLocaleString('pl-PL', { timeZone: 'Europe/Warsaw', hour12: false });
 }
 
 function pnlClass(v) { return v == null ? '' : v >= 0 ? 'pnl-pos' : 'pnl-neg'; }
@@ -101,10 +99,14 @@ function renderPortfolio(p) {
 function renderPositions(positions) {
   const tbody = $('positions-body');
   if (!positions.length) {
-    tbody.innerHTML = '<tr><td colspan="9" class="empty-msg">No open positions</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="10" class="empty-msg">No open positions</td></tr>';
     return;
   }
-  tbody.innerHTML = positions.map(p => `
+  tbody.innerHTML = positions.map(p => {
+    const srcBadge = p.source === 'external'
+      ? '<span class="badge badge-ext" title="Pre-existing on Binance">external</span>'
+      : '<span class="badge badge-bot" title="Opened by bot">bot</span>';
+    return `
     <tr>
       <td><strong>${p.symbol}</strong></td>
       <td>${fmt(p.quantity, 6)}</td>
@@ -115,7 +117,9 @@ function renderPositions(positions) {
       <td class="${pnlClass(p.pnl_pct)}">${pnlSign(p.pnl_pct)}%</td>
       <td>${fmtPrice(p.stop_loss_price)}</td>
       <td>${fmtPrice(p.take_profit_price)}</td>
-    </tr>`).join('');
+      <td>${srcBadge}</td>
+    </tr>`;
+  }).join('');
 }
 
 /* ─── Claude Decision ─── */
@@ -159,15 +163,48 @@ function renderDecision(d) {
 
 /* ─── Bot Status ─── */
 function renderBotStatus(s) {
-  $('stat-status').textContent = s.running ? '▶ RUNNING' : '■ STOPPED';
-  $('stat-status').style.color = s.running ? 'var(--green)' : 'var(--muted)';
+  const statusEl = $('stat-status');
+  const dotClass = s.circuit_breaker_tripped ? 'error' : (s.running ? 'running' : 'stopped');
+  let label = s.running ? 'RUNNING' : 'STOPPED';
+  if (s.circuit_breaker_tripped) label = 'CIRCUIT BREAKER';
+  statusEl.innerHTML = `<span class="status-dot ${dotClass}"></span> ${label}`;
+  statusEl.style.color = s.circuit_breaker_tripped ? 'var(--red)' : (s.running ? 'var(--green)' : 'var(--muted)');
+
   $('btn-start').disabled = s.running;
   $('btn-stop').disabled  = !s.running;
 
+  // Cycle info line
+  const cycleInfo = $('stat-cycle-info');
+  const cc = s.cycle_count || 0;
+  let cycleTxt = `Cycles: ${cc}`;
+  if (s.last_cycle_at) {
+    const ago = Math.round((Date.now() - new Date(s.last_cycle_at).getTime()) / 1000);
+    if (ago < 120) cycleTxt += ` · ${ago}s ago`;
+    else cycleTxt += ` · ${Math.round(ago / 60)}m ago`;
+  }
+  if (cycleInfo) cycleInfo.textContent = cycleTxt;
+
+  // Cycle countdown bar + next-cycle text
+  const barWrap = $('next-cycle-bar');
+  const barFill = $('next-cycle-fill');
+  const footerNext = $('next-cycle');
   if (s.next_cycle_in_seconds != null && s.running) {
-    $('next-cycle').textContent = `Next cycle in ${s.next_cycle_in_seconds}s`;
+    let pct = 0;
+    if (s.last_cycle_at) {
+      const elapsed = (Date.now() - new Date(s.last_cycle_at).getTime()) / 1000;
+      const total = elapsed + s.next_cycle_in_seconds;
+      pct = total > 0 ? Math.max(0, Math.min(100, (elapsed / total) * 100)) : 0;
+    }
+    if (barWrap) barWrap.style.display = '';
+    if (barFill) barFill.style.width = pct + '%';
+
+    const secs = s.next_cycle_in_seconds;
+    const countdownTxt = secs >= 60 ? `${Math.floor(secs/60)}m ${secs%60}s` : `${secs}s`;
+    if (cycleInfo) cycleInfo.textContent = cycleTxt + ` · next in ${countdownTxt}`;
+    if (footerNext) footerNext.textContent = `Next cycle in ${countdownTxt}`;
   } else {
-    $('next-cycle').textContent = '';
+    if (barWrap) barWrap.style.display = 'none';
+    if (footerNext) footerNext.textContent = '';
   }
 
   // Sync mode buttons
@@ -178,6 +215,24 @@ function renderBotStatus(s) {
   // Sync risk profile buttons
   if (s.risk_profile) {
     syncRiskButtons(s.risk_profile.key || 'balanced');
+    const rpEl = $('stat-risk-profile');
+    if (rpEl) rpEl.textContent = s.risk_profile.label || s.risk_profile.key || '—';
+  }
+
+  // Market regime
+  if (s.market_regime && s.market_regime.regime) {
+    const regimeEl = $('stat-regime');
+    if (regimeEl) {
+      const r = s.market_regime;
+      const emoji = {strong_uptrend:'🟢',uptrend:'🟡',ranging:'⚪',downtrend:'🟠',strong_downtrend:'🔴',choppy:'⚡'}[r.regime] || '❓';
+      regimeEl.textContent = `${emoji} ${r.regime.replace('_',' ').toUpperCase()}`;
+      regimeEl.title = r.description || '';
+    }
+  }
+
+  // Less fear sync
+  if (s.less_fear !== undefined) {
+    syncLessFearButton(s.less_fear);
   }
 }
 
@@ -205,15 +260,53 @@ async function setRiskProfile(profile) {
   } catch (e) { alert('Error: ' + e.message); }
 }
 
+/* ─── Less Fear Toggle ─── */
+let lessFearActive = false;
+
+function syncLessFearButton(enabled) {
+  lessFearActive = enabled;
+  const btn = $('btn-less-fear');
+  if (!btn) return;
+  if (enabled) {
+    btn.classList.add('active');
+    btn.textContent = '🔥 Less Fear ON';
+  } else {
+    btn.classList.remove('active');
+    btn.textContent = '😱 Less Fear';
+  }
+}
+
+async function toggleLessFear() {
+  try {
+    const resp = await fetch(`${API_BASE}/api/bot/less-fear`, {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({enabled: !lessFearActive}),
+    });
+    if (!resp.ok) { const e = await resp.json(); alert(e.detail || 'Failed'); return; }
+    const data = await resp.json();
+    syncLessFearButton(data.enabled);
+  } catch (e) { alert('Error: ' + e.message); }
+}
+
+async function loadLessFear() {
+  try {
+    const resp = await fetch(`${API_BASE}/api/bot/less-fear`);
+    if (resp.ok) {
+      const data = await resp.json();
+      syncLessFearButton(data.enabled);
+    }
+  } catch (_) {}
+}
+
 /* ─── Price tick ─── */
 function handlePriceTick(data) {
   loadPortfolio();
 }
 
 /* ─── Market update — populate symbol selector ─── */
-function handleMarketUpdate(data) {
+function addChartSymbols(symbols) {
   const sel = $('chart-symbol');
-  Object.keys(data).forEach(sym => {
+  symbols.forEach(sym => {
     if (!knownSymbols.has(sym)) {
       knownSymbols.add(sym);
       const opt = document.createElement('option');
@@ -222,6 +315,24 @@ function handleMarketUpdate(data) {
       sel.appendChild(opt);
     }
   });
+}
+
+function handleMarketUpdate(data) {
+  addChartSymbols(Object.keys(data));
+}
+
+async function loadChartSymbols() {
+  try {
+    const resp = await fetch(`${API_BASE}/api/symbols`);
+    const symbols = await resp.json();
+    addChartSymbols(symbols);
+    // Auto-select first symbol and load chart
+    const sel = $('chart-symbol');
+    if (sel.value === '' && symbols.length > 0) {
+      sel.value = symbols[0];
+      loadChart();
+    }
+  } catch (_) {}
 }
 
 /* ─── Trade history ─── */
@@ -294,7 +405,7 @@ function renderPriceChart(labels, closes) {
         fill: false,
       }]
     },
-    options: chartOptions('Price (USDT)'),
+    options: chartOptions('Price'),
   });
 }
 
@@ -452,7 +563,7 @@ function loadAllocChart(portfolio) {
   const colors = ['#4b5563'];
 
   (portfolio.positions || []).forEach((p, i) => {
-    labels.push(p.symbol.replace('/USDT', ''));
+    labels.push(p.symbol.replace(/\/USD[TC]/, ''));
     values.push(Math.max(p.value_usdt || 0, 0));
     colors.push(PALETTE[i % PALETTE.length]);
   });
@@ -512,7 +623,7 @@ async function loadPnlChart() {
       return;
     }
 
-    const labels = sells.map(t => t.symbol.replace('/USDT', ''));
+    const labels = sells.map(t => t.symbol.replace(/\/USD[TC]/, ''));
     const values = sells.map(t => t.pnl_usdt);
 
     if (pnlChart) pnlChart.destroy();
@@ -521,7 +632,7 @@ async function loadPnlChart() {
       data: {
         labels,
         datasets: [{
-          label: 'P&L (USDT)',
+          label: 'P&L ($)',
           data: values,
           backgroundColor: values.map(v => v >= 0 ? 'rgba(34,197,94,0.7)' : 'rgba(239,68,68,0.7)'),
           borderColor: values.map(v => v >= 0 ? '#22c55e' : '#ef4444'),
@@ -567,6 +678,39 @@ async function loadAnalytics() {
       <div class="a-stat"><div class="a-val ${d.avg_pnl_usdt >= 0 ? 'pnl-pos' : 'pnl-neg'}">${avgPnl}</div><div class="a-lbl">Avg P&amp;L</div></div>
       <div class="a-stat"><div class="a-val pnl-pos">${best}</div><div class="a-lbl">Best</div></div>
       <div class="a-stat"><div class="a-val pnl-neg">${worst}</div><div class="a-lbl">Worst</div></div>`;
+
+    // Update secondary stats bar
+    const ddEl = $('stat-drawdown');
+    if (ddEl) {
+      ddEl.textContent = d.max_drawdown_pct != null ? `${fmt(d.max_drawdown_pct, 1)}%` : '—';
+      ddEl.style.color = d.max_drawdown_pct > 10 ? 'var(--red)' : d.max_drawdown_pct > 5 ? 'var(--yellow, #f59e0b)' : 'var(--green)';
+    }
+    const shEl = $('stat-sharpe');
+    if (shEl) {
+      shEl.textContent = d.sharpe_ratio != null ? fmt(d.sharpe_ratio, 2) : '—';
+      if (d.sharpe_ratio != null) shEl.style.color = d.sharpe_ratio >= 1 ? 'var(--green)' : d.sharpe_ratio >= 0 ? 'var(--muted)' : 'var(--red)';
+    }
+    const stEl = $('stat-streak');
+    if (stEl) {
+      const cw = d.max_consecutive_wins || 0;
+      const cl = d.max_consecutive_losses || 0;
+      stEl.innerHTML = `<span style="color:var(--green)">${cw}W</span> / <span style="color:var(--red)">${cl}L</span>`;
+    }
+    const feEl = $('stat-fees');
+    if (feEl) feEl.textContent = d.total_fees_usdt ? `$${fmt(d.total_fees_usdt)}` : '$0.00';
+
+    // Bot Realized P&L card in stats bar
+    const botPnlEl = $('stat-bot-pnl');
+    if (botPnlEl && d.total_realized_pnl != null) {
+      const rp = d.total_realized_pnl;
+      botPnlEl.textContent = `${rp >= 0 ? '+' : ''}$${fmt(rp)}`;
+      botPnlEl.className = 'stat-value ' + (rp >= 0 ? 'pnl-pos' : 'pnl-neg');
+    }
+    const botRecEl = $('stat-bot-record');
+    if (botRecEl && d.closed_trades > 0) {
+      const wr2 = Math.round(d.win_rate * 100);
+      botRecEl.textContent = `${d.wins}W ${d.losses}L (${wr2}%)`;
+    }
   } catch (_) {}
 }
 
@@ -660,7 +804,41 @@ async function syncBotStatus() {
   } catch (_) {}
 }
 
-/* ─── Claude session cost ─── */
+/* ─── GPU Server status poll ─── */
+async function loadGpuStatus() {
+  const statusEl = $('stat-gpu-status');
+  const infoEl = $('stat-gpu-info');
+  if (!statusEl || !infoEl) return;
+  try {
+    const resp = await fetch(`${API_BASE}/api/health`);
+    if (!resp.ok) return;
+    const data = await resp.json();
+    const gpu = data.gpu_server;
+    if (!gpu) {
+      statusEl.innerHTML = '<span class="status-dot stopped"></span> OFF';
+      infoEl.textContent = 'Not configured';
+      return;
+    }
+    if (gpu.status === 'unreachable') {
+      statusEl.innerHTML = '<span class="status-dot error"></span> DOWN';
+      infoEl.textContent = 'Unreachable';
+      return;
+    }
+    // GPU server is active
+    statusEl.innerHTML = '<span class="status-dot running"></span> ACTIVE';
+    const gpuName = (gpu.gpu || 'CPU').replace(/NVIDIA\s*/i, '');
+    const vram = gpu.vram_gb ? ` ${gpu.vram_gb}GB` : '';
+    const models = [];
+    if (gpu.transformer_trained) models.push('TRF');
+    if (gpu.lstm_trained) models.push('LSTM');
+    if (gpu.rl_trained) models.push('RL');
+    if (gpu.sentiment_loaded) models.push('NLP');
+    const modelStr = models.length ? models.join('+') : 'no models';
+    infoEl.textContent = `${gpuName}${vram} | ${modelStr}`;
+  } catch (_) {}
+}
+
+/* ─── Claude session cost + optimization stats ─── */
 async function loadCreditBalance() {
   try {
     const resp = await fetch(`${API_BASE}/api/usage`);
@@ -669,11 +847,41 @@ async function loadCreditBalance() {
     const el = $('stat-credits');
     if (!el) return;
     const cost = Number(data.total_cost_usd || 0);
+    const calls = data.total_calls || 0;
+    const skipped = data.calls_skipped || 0;
+    const sonnet = data.calls_sonnet || 0;
+    const haiku = data.calls_haiku || 0;
     el.textContent = `$${cost.toFixed(4)}`;
     el.title =
-      `Calls: ${data.total_calls} | ` +
-      `Input: ${(data.total_input_tokens/1000).toFixed(1)}k tokens | ` +
-      `Output: ${(data.total_output_tokens/1000).toFixed(1)}k tokens`;
+      `Calls: ${calls} (${sonnet}S/${haiku}H/${skipped}skip) | ` +
+      `Input: ${((data.total_input_tokens || 0)/1000).toFixed(1)}k | ` +
+      `Output: ${((data.total_output_tokens || 0)/1000).toFixed(1)}k | ` +
+      `Cache: ${((data.total_cache_read_tokens || 0)/1000).toFixed(1)}k hit`;
+
+    // Model mix (Sonnet vs Haiku)
+    const mmEl = $('stat-model-mix');
+    if (mmEl && calls > 0) {
+      mmEl.innerHTML = `<span style="color:var(--green)">${haiku}H</span>/<span style="color:var(--blue,#60a5fa)">${sonnet}S</span>`;
+      mmEl.title = `Haiku (cheap): ${haiku} | Sonnet (powerful): ${sonnet}`;
+    }
+
+    // Cache hit rate
+    const chEl = $('stat-cache-hit');
+    if (chEl) {
+      const totalIn = data.total_input_tokens || 0;
+      const cacheRead = data.total_cache_read_tokens || 0;
+      const hitPct = totalIn > 0 ? Math.round(cacheRead / totalIn * 100) : 0;
+      chEl.textContent = totalIn > 0 ? `${hitPct}%` : '—';
+      chEl.style.color = hitPct > 50 ? 'var(--green)' : hitPct > 20 ? 'var(--muted)' : 'var(--red)';
+    }
+
+    // Skipped cycles
+    const skEl = $('stat-skipped');
+    if (skEl) {
+      const totalCycles = calls + skipped;
+      const skipPct = totalCycles > 0 ? Math.round(skipped / totalCycles * 100) : 0;
+      skEl.textContent = totalCycles > 0 ? `${skipped} (${skipPct}%)` : '—';
+    }
   } catch (_) {}
 }
 
@@ -700,6 +908,10 @@ async function loadLastDecision() {
     loadPnlChart(),
     loadAnalytics(),
     loadDecisionFeed(),
+    loadExchangeAccount(),
+    loadChartSymbols(),
+    loadLessFear(),
+    loadGpuStatus(),
   ]);
 
   // Periodic fallback polls (in case WS events are missed)
@@ -709,4 +921,71 @@ async function loadLastDecision() {
   setInterval(loadGrowthChart, 60_000);
   setInterval(loadAnalytics, 60_000);
   setInterval(loadDecisionFeed, 30_000);
+  setInterval(loadExchangeAccount, 120_000);  // refresh exchange account every 2m
+  setInterval(loadGpuStatus, 60_000);           // refresh GPU status every 1m
 })();
+
+/* ─── Binance Account ─── */
+async function loadExchangeAccount() {
+  try {
+    const resp = await fetch(`${API_BASE}/api/exchange-account`);
+    const data = await resp.json();
+    renderExchangeAccount(data);
+  } catch (e) {
+    const tbody = $('exchange-body');
+    if (tbody) tbody.innerHTML = '<tr><td colspan="8" class="empty-msg">Failed to load exchange data</td></tr>';
+  }
+}
+
+function renderExchangeAccount(data) {
+  const summary = $('exchange-summary');
+  const tbody = $('exchange-body');
+  if (!tbody) return;
+
+  if (data.error) {
+    tbody.innerHTML = `<tr><td colspan="8" class="empty-msg">${escapeHtml(data.error)}</td></tr>`;
+    if (summary) summary.innerHTML = '';
+    return;
+  }
+
+  // Summary bar
+  if (summary) {
+    const stables = data.assets.filter(a => a.type === 'stablecoin');
+    const cryptos = data.assets.filter(a => a.type === 'crypto');
+    const fiats = data.assets.filter(a => a.type === 'fiat');
+    const cashVal = stables.reduce((s, a) => s + a.value_usdt, 0);
+    const cryptoVal = cryptos.reduce((s, a) => s + a.value_usdt, 0);
+    const fiatVal = fiats.reduce((s, a) => s + a.value_usdt, 0);
+    summary.innerHTML = `
+      <span class="exch-stat">Total: <strong>$${fmt(data.total_value_usdt)}</strong></span>
+      <span class="exch-stat">Cash: <strong>$${fmt(cashVal)}</strong></span>
+      <span class="exch-stat">Crypto: <strong>$${fmt(cryptoVal)}</strong></span>
+      ${fiatVal > 0 ? `<span class="exch-stat">Fiat: <strong>$${fmt(fiatVal)}</strong></span>` : ''}
+      <span class="exch-stat">${data.num_assets} assets</span>
+    `;
+  }
+
+  if (!data.assets || !data.assets.length) {
+    tbody.innerHTML = '<tr><td colspan="8" class="empty-msg">No assets found</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = data.assets.map(a => {
+    const typeIcon = {stablecoin: '💵', crypto: '🪙', fiat: '🏦'}[a.type] || '';
+    const managed = a.managed_by === 'bot' ? '<span class="badge badge-bot">bot</span>'
+                  : a.managed_by === 'external' ? '<span class="badge badge-ext">tracked</span>'
+                  : '<span class="badge badge-none">—</span>';
+    const valClass = a.value_usdt < 1 ? 'dust-row' : '';
+    return `
+    <tr class="${valClass}">
+      <td><strong>${escapeHtml(a.asset)}</strong></td>
+      <td>${typeIcon} ${escapeHtml(a.type)}</td>
+      <td>${a.total < 0.001 ? a.total.toExponential(2) : fmt(a.total, 6)}</td>
+      <td>${a.free < 0.001 ? a.free.toExponential(2) : fmt(a.free, 6)}</td>
+      <td>${a.locked > 0 ? fmt(a.locked, 6) : '—'}</td>
+      <td>${a.pair ? fmtPrice(a.price) : '—'}</td>
+      <td${a.value_usdt >= 1 ? ' style="font-weight:600"' : ''}>$${fmt(a.value_usdt)}</td>
+      <td>${managed}</td>
+    </tr>`;
+  }).join('');
+}

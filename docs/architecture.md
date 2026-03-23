@@ -1,0 +1,99 @@
+# AI Crypto Trader — Full Process Flow
+
+> Open [architecture.mmd](architecture.mmd) in VS Code with the Mermaid extension for interactive preview.
+
+```mermaid
+flowchart TD
+    START([🚀 Bot Start]) --> SYNC[🔄 Exchange Sync\nFetch Binance balances\nImport USDT + holdings]
+    SYNC --> CIRCUIT{⚡ Circuit Breaker\nDrawdown >= 15%?}
+    CIRCUIT -->|Yes| PAUSE([⏸ Bot Paused])
+    CIRCUIT -->|No| UNIVERSE[🌍 Symbol Universe\nFetch all USDT pairs\nFilter by volume > $10M\nInject top gainers + new listings]
+
+    %% Whale Detector — always-on WebSocket
+    subgraph WHALE [🐋 Whale Detector — real-time WebSocket]
+        direction TB
+        WH1[Binance aggTrade stream\n100 USDT pairs] --> WH2[Flag trades > $50K\nTrack buy/sell flow\n30min rolling window]
+    end
+
+    %% Fast Scanner — parallel background process
+    subgraph SCANNER [🔍 Fast Local Scanner — runs every 60s]
+        direction TB
+        SC1[Scan ALL USDT pairs\nmin vol $1M\n~200+ altcoins] --> SC2[Compute signals:\n• Price momentum 1m/5m\n• Volume ratio vs avg\n• Bid/Ask imbalance\n• 24h high/low proximity\n• Whale activity boost]
+        SC2 --> SC3[Score & rank\ntop 10 → Hot List]
+    end
+
+    WHALE -.->|whale events| SCANNER
+    WHALE -.->|whale flow data| QUANT
+    SCANNER -.->|inject hot symbols| UNIVERSE
+
+    UNIVERSE --> FETCH[📊 Data Fetch\nOHLCV 15m/1h/4h/1d\nOrderbooks depth\nBTC anchor]
+
+    FETCH --> INDICATORS[📈 Technical Indicators\nRSI, MACD, Bollinger Bands\nVWAP, OBV, ATR\nSupport/Resistance\nBB Squeeze detection\nMarket Regime detection\nCorrelation matrix]
+
+    INDICATORS --> ML[🤖 ML Signals\nLSTM price prediction\nRL agent recommendation\nRAG historical context]
+
+    ML --> INTEL[🌐 Market Intelligence\nFear & Greed Index\nFunding rates\nLong/Short ratios\nOpen Interest\nCoinGecko trending]
+
+    INTEL --> QUANT[⚖️ Quant Scorer\n17 weighted factors\nScore 0-100 per symbol\n+ whale flow + depth imbalance\nATR-based SL/TP\nMin R:R = 2:1]
+
+    QUANT --> CANDIDATES{Candidates\nabove threshold?}
+    CANDIDATES -->|No| HOLD_SKIP([⏭ HOLD — Skip cycle\nNo Claude call\nSave API cost])
+
+    CANDIDATES -->|Yes| CORR{🔗 Correlation\nRejection\nr > 0.8 with\nheld positions?}
+    CORR -->|Rejected| HOLD_SKIP
+
+    CORR -->|Pass| CLAUDE[🧠 Claude Validation\nTop 2 candidates sent\nHaiku for BUY-only\nSonnet for SELL decisions\nValidator system prompt]
+
+    CLAUDE --> DECISION{Claude says?}
+    DECISION -->|HOLD| HOLD_LOG([📝 Log HOLD\nNo trade])
+    DECISION -->|BUY/SELL| SIZING[📐 Position Sizing\nAuto-bump to $6 min\nDynamic streak multiplier\nKelly criterion\nCap at MAX_POSITION_PCT]
+
+    SIZING --> COOLDOWN{🧊 Cooldown\nactive on symbol?}
+    COOLDOWN -->|Yes| HOLD_LOG
+    COOLDOWN -->|No| EXECUTE
+
+    subgraph EXECUTE [💰 Trade Execution]
+        direction TB
+        E1{Real or Demo?}
+        E1 -->|Demo| DEMO[Simulated fill\n+ slippage + fees]
+        E1 -->|Real| REAL[Binance market order\nvia CCXT]
+        DEMO --> DCA{DCA enabled?}
+        REAL --> DCA
+        DCA -->|Yes| DCA_SPLIT[60% now\n40% pending at -2% dip]
+        DCA -->|No| DONE[✅ Trade recorded]
+        DCA_SPLIT --> DONE
+    end
+
+    EXECUTE --> NOTIFY[📢 Discord notification\n+ WebSocket broadcast\n+ DB logging]
+
+    NOTIFY --> PYRAMID{🏔 Pyramiding\nHeld pos > +3% P&L\nAND score > 70?}
+    PYRAMID -->|Yes| PYRAMID_ADD[Add 50% of\noriginal size]
+    PYRAMID -->|No| SNAPSHOT
+
+    PYRAMID_ADD --> SNAPSHOT[📸 Portfolio Snapshot\nPersist to DB]
+
+    SNAPSHOT --> WAIT[⏳ Wait cycle interval\n300 seconds]
+    WAIT --> PRICE_TICK[💹 Price Tick\nUpdate positions\nCheck SL/TP/Time exits]
+
+    PRICE_TICK --> SL_TP{SL/TP/Time\ntriggered?}
+    SL_TP -->|Stop Loss| SL_EXIT[🔴 Auto SELL\n+ 60min cooldown\n+ Discord alert]
+    SL_TP -->|Take Profit| TP_EXIT[🟢 Auto SELL\n+ Discord alert]
+    SL_TP -->|Time Exit| TIME_EXIT[⏰ Close stagnant\npos > 48h, P&L ±1%]
+    SL_TP -->|Trailing Stop| TRAIL[📈 Ratchet SL up\non new highs]
+    SL_TP -->|No| DCA_CHECK
+
+    SL_EXIT --> DCA_CHECK
+    TP_EXIT --> DCA_CHECK
+    TIME_EXIT --> DCA_CHECK
+    TRAIL --> DCA_CHECK
+
+    DCA_CHECK[🔄 Check DCA fills\nPending orders hit?] --> WAIT
+    WAIT --> SYNC
+
+    subgraph BACKTEST [🔬 Auto-Tuner — runs every 24h]
+        direction LR
+        BT1[Run backtest\n30 days history] --> BT2[Analyze\nwin rate\nscore buckets]
+        BT2 --> BT3[Adjust weights\nMIN_QUANT_SCORE\nSL multiplier]
+        BT3 --> BT4[Update Kelly\nfraction]
+    end
+```

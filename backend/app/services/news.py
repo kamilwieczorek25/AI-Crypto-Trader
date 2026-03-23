@@ -122,12 +122,28 @@ async def fetch_news_sentiment(symbols: list[str]) -> dict[str, Any]:
     # Per-symbol sentiment collectors for min/max/std tracking
     sym_sentiments: dict[str, list[float]] = {sym: [] for sym in symbols}
 
-    for article in articles:
+    # Try GPU semantic sentiment (batch all article texts at once)
+    gpu_scores: dict[int, float] = {}
+    from app.services import gpu_client
+    if gpu_client.is_enabled() and articles:
+        texts = [f"{a.get('title', '')} {a.get('body', '')}" for a in articles]
+        gpu_result = await gpu_client.sentiment(texts)
+        if gpu_result and gpu_result.get("scores"):
+            for i, score in enumerate(gpu_result["scores"]):
+                gpu_scores[i] = score
+            logger.info("GPU sentiment scored %d articles (model=%s)",
+                        len(gpu_scores), gpu_result.get("model"))
+
+    for idx, article in enumerate(articles):
         title = article.get("title", "")
         body = article.get("body", "")
         categories = article.get("categories", "").upper()
-        combined = f"{title} {body}"
-        sentiment = _score_text(combined)
+        # Use GPU semantic score if available, else keyword fallback
+        if idx in gpu_scores:
+            sentiment = gpu_scores[idx]
+        else:
+            combined = f"{title} {body}"
+            sentiment = _score_text(combined)
 
         # Match article to symbols with improved ticker matching
         for coin, sym in coin_map.items():

@@ -1,0 +1,15 @@
+services:
+  gpu-server:
+    build: .
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./data:/app/data
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped

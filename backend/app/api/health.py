@@ -36,9 +36,15 @@ async def health() -> dict:
     # Check Anthropic API key validity (lightweight check)
     anthropic_ok = bool(settings.ANTHROPIC_API_KEY and len(settings.ANTHROPIC_API_KEY) > 10)
 
+    # Check remote GPU server (if configured)
+    gpu_info = None
+    if settings.GPU_SERVER_URL:
+        from app.services import gpu_client
+        gpu_info = await gpu_client.health()
+
     all_ok = db_ok and binance_ok and anthropic_ok
     status = "ok" if all_ok else "degraded"
-    return {
+    result = {
         "status": status,
         "db": "ok" if db_ok else "error",
         "binance": "ok" if binance_ok else "error",
@@ -46,3 +52,6 @@ async def health() -> dict:
         "mode": settings.MODE,
         "risk_profile": settings.RISK_PROFILE,
     }
+    if settings.GPU_SERVER_URL:
+        result["gpu_server"] = gpu_info if gpu_info else {"status": "unreachable"}
+    return result

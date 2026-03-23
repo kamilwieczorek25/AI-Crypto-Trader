@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>AI Crypto Trader</title>
-  <link rel="stylesheet" href="style.css" />
+  <link rel="stylesheet" href="style.css?v=9" />
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
 </head>
 <body>
@@ -22,6 +22,8 @@
         <button id="risk-aggressive"   class="btn-risk" onclick="setRiskProfile('aggressive')"   title="Aggressive — more trades, momentum focus">⚡ Aggressive</button>
         <button id="risk-fast_profit"  class="btn-risk" onclick="setRiskProfile('fast_profit')"  title="Fast Profit — maximum aggression, 15m/1h signals">🚀 Fast Profit</button>
       </div>
+      <span style="color:var(--border)">|</span>
+      <button id="btn-less-fear" class="btn-fear" onclick="toggleLessFear()" title="Override Claude's conservative bias — auto-approve high-scoring trades">😱 Less Fear</button>
       <span style="color:var(--border)">|</span>
       <span>Mode:</span>
       <button id="btn-demo" class="btn-mode active" onclick="setMode('demo')">DEMO</button>
@@ -51,16 +53,62 @@
       <div id="stat-pnl" class="stat-value">$—</div>
     </div>
     <div class="stat-card">
+      <div class="stat-label">Bot Realized P&L</div>
+      <div id="stat-bot-pnl" class="stat-value">$—</div>
+      <div id="stat-bot-record" class="stat-sub">—</div>
+    </div>
+    <div class="stat-card">
       <div class="stat-label">Open Positions</div>
       <div id="stat-num-pos" class="stat-value">—</div>
     </div>
-    <div class="stat-card">
+    <div class="stat-card stat-card-status" id="stat-card-status">
       <div class="stat-label">Bot Status</div>
-      <div id="stat-status" class="stat-value">STOPPED</div>
+      <div id="stat-status" class="stat-value"><span class="status-dot stopped"></span> STOPPED</div>
+      <div id="stat-cycle-info" class="stat-sub">Cycles: 0</div>
+      <div id="next-cycle-bar" class="cycle-bar-wrap" style="display:none">
+        <div id="next-cycle-fill" class="cycle-bar-fill"></div>
+      </div>
     </div>
     <div class="stat-card">
       <div class="stat-label">Claude Cost (session)</div>
       <div id="stat-credits" class="stat-value" title="Estimated API cost since last restart">$—</div>
+    </div>
+  </section>
+
+  <!-- ── Market Info Bar ── -->
+  <section class="stats-bar stats-bar-secondary" id="market-bar">
+    <div class="stat-card">
+      <div class="stat-label">Market Regime</div>
+      <div id="stat-regime" class="stat-value">—</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Risk Profile</div>
+      <div id="stat-risk-profile" class="stat-value">—</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Max Drawdown</div>
+      <div id="stat-drawdown" class="stat-value">—</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Sharpe Ratio</div>
+      <div id="stat-sharpe" class="stat-value">—</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Model Mix</div>
+      <div id="stat-model-mix" class="stat-value" title="Sonnet (powerful) vs Haiku (cheap) calls">—</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Cache Hit%</div>
+      <div id="stat-cache-hit" class="stat-value" title="Prompt cache hit rate (saves ~90% input cost)">—</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Skipped</div>
+      <div id="stat-skipped" class="stat-value" title="Cycles skipped (no Claude call needed)">—</div>
+    </div>
+    <div class="stat-card" id="stat-card-gpu">
+      <div class="stat-label">GPU Server</div>
+      <div id="stat-gpu-status" class="stat-value"><span class="status-dot stopped"></span> OFF</div>
+      <div id="stat-gpu-info" class="stat-sub">Not configured</div>
     </div>
   </section>
 
@@ -81,10 +129,39 @@
               <th>P&L %</th>
               <th>Stop Loss</th>
               <th>Take Profit</th>
+              <th>Source</th>
             </tr>
           </thead>
           <tbody id="positions-body">
-            <tr><td colspan="9" class="empty-msg">No open positions</td></tr>
+            <tr><td colspan="10" class="empty-msg">No open positions</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ── Binance Account ── -->
+    <section class="card" id="exchange-card">
+      <div class="section-header">
+        <h2>Binance Account</h2>
+        <button class="btn-sm" onclick="loadExchangeAccount()" title="Refresh from Binance">↻ Sync</button>
+      </div>
+      <div id="exchange-summary" class="exchange-summary"></div>
+      <div class="table-wrap">
+        <table id="tbl-exchange">
+          <thead>
+            <tr>
+              <th>Asset</th>
+              <th>Type</th>
+              <th>Total</th>
+              <th>Free</th>
+              <th>Locked</th>
+              <th>Price (USDT)</th>
+              <th>Value (USDT)</th>
+              <th>Managed By</th>
+            </tr>
+          </thead>
+          <tbody id="exchange-body">
+            <tr><td colspan="8" class="empty-msg">Loading exchange data…</td></tr>
           </tbody>
         </table>
       </div>
@@ -196,6 +273,6 @@
     <span id="next-cycle"></span>
   </footer>
 
-  <script src="app.js"></script>
+  <script src="app.js?v=9"></script>
 </body>
 </html>

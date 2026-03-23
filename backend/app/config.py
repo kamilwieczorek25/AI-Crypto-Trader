@@ -29,6 +29,10 @@ class Settings(BaseSettings):
     BINANCE_API_KEY: str = ""
     BINANCE_SECRET: str = ""
 
+    # Quote currency — determines which trading pairs the bot uses
+    # "USDT" for /USDT pairs, "USDC" for /USDC pairs
+    QUOTE_CURRENCY: str = "USDC"
+
     # Trading mode
     MODE: str = "demo"           # "demo" | "real"
     REAL_TRADING: bool = False   # second safety gate
@@ -36,6 +40,108 @@ class Settings(BaseSettings):
     # Risk profile — controls Claude's aggressiveness
     # conservative | balanced | aggressive | fast_profit
     RISK_PROFILE: str = "balanced"
+
+    # Auto-adjust risk profile based on market regime (overrides RISK_PROFILE each cycle)
+    AUTO_RISK_PROFILE: bool = True
+
+    # Less-fear mode: override Claude's conservative HOLD bias
+    # When enabled: lowers quant threshold, disables auto-risk downgrade, forces Claude to approve high-score candidates
+    LESS_FEAR: bool = False
+
+    # Max drawdown circuit breaker (% of initial balance — pauses bot if exceeded)
+    MAX_DRAWDOWN_PCT: float = 15.0
+
+    # Discord webhook URL for trade notifications (blank = disabled)
+    DISCORD_WEBHOOK_URL: str = ""
+
+    # ── Cost optimisation ─────────────────────────────────────────────────
+    # Max symbols to send to Claude (pre-filtered by score). 0 = all.
+    MAX_PROMPT_SYMBOLS: int = 8
+    # Skip Claude call when market is flat (saves ~20-40% of calls)
+    SKIP_FLAT_CYCLES: bool = True
+    # Use cheaper Haiku model for routine/flat cycles, Sonnet for actionable
+    USE_HAIKU_FOR_HOLD: bool = True
+
+    # ── Quant scorer ────────────────────────────────────────────────────────
+    # Minimum composite score (0-100) to consider a trade candidate
+    MIN_QUANT_SCORE: float = 60.0
+    # ATR multiplier for stop-loss (2.5 = 2.5x ATR — gives room for noise)
+    SL_ATR_MULTIPLIER: float = 2.5
+    # Minimum reward-to-risk ratio (2.0 = TP must be 2x SL distance)
+    MIN_REWARD_RISK_RATIO: float = 2.0
+    # Min/max stop-loss % (clamp ATR-based SL to sane range)
+    MIN_SL_PCT: float = 3.0
+    MAX_SL_PCT: float = 12.0
+
+    # ── Auto-backtest & tuning ─────────────────────────────────────────────
+    # Run backtest on bot startup and auto-tune scorer settings
+    AUTO_BACKTEST: bool = True
+    # Re-run backtest every N hours (0 = startup only, no repeat)
+    BACKTEST_INTERVAL_HOURS: float = 24.0
+    # How many days of history per backtest run (shorter = faster)
+    BACKTEST_DAYS: int = 30
+    # How many symbols to include in backtest
+    BACKTEST_SYMBOLS: int = 8
+
+    # ── DCA (Dollar-Cost Averaging) ──────────────────────────────────────
+    # Split BUY entries into two tranches for better average price
+    DCA_ENABLED: bool = True
+    # First tranche as % of total position (rest is pending DCA order)
+    DCA_SPLIT_PCT: float = 60.0
+    # Dip % below entry for second tranche to fill
+    DCA_DIP_PCT: float = 2.0
+
+    # ── Kelly criterion sizing ───────────────────────────────────────────
+    # Use Kelly formula (from backtest results) to scale position sizes
+    KELLY_SIZING: bool = True
+    # Cap on Kelly fraction (0.5 = half-Kelly, safer than full Kelly)
+    KELLY_FRACTION_CAP: float = 0.5
+
+    # ── Time-based exit ──────────────────────────────────────────────────
+    # Max hours to hold a stagnant position (0 = disabled)
+    MAX_HOLD_HOURS: float = 48.0
+
+    # ── Pyramiding (add to winners) ──────────────────────────────────────
+    # Add to profitable positions when quant score stays high
+    PYRAMID_ENABLED: bool = True
+    # Minimum P&L % before pyramiding is considered
+    PYRAMID_MIN_PNL_PCT: float = 3.0
+    # Minimum quant score for the symbol to pyramid into
+    PYRAMID_MIN_SCORE: float = 70.0
+    # How much to add as % of original position value
+    PYRAMID_ADD_PCT: float = 50.0
+
+    # ── Whale trade detector ───────────────────────────────────────────
+    # Minimum trade size (USDT) to qualify as a "whale" trade
+    WHALE_MIN_USDT: float = 50_000.0
+    # How many minutes to remember whale events (rolling window)
+    WHALE_MEMORY_MINUTES: int = 30
+
+    # ── Fast local scanner ──────────────────────────────────────────────
+    # Background scanner interval (seconds) — checks wide altcoin universe
+    SCANNER_INTERVAL_SECONDS: int = 60
+    # Minimum 24h volume to include in fast scan (lower than main universe)
+    SCANNER_MIN_VOLUME_USDT: float = 300_000.0
+    # Max hot-list candidates to inject into main cycle
+    SCANNER_HOT_LIST_SIZE: int = 10
+    # Minimum scanner score (0-100) to qualify as "hot"
+    SCANNER_MIN_SCORE: float = 15.0
+
+    # ── Remote GPU server (optional) ─────────────────────────────────
+    # URL of the GPU inference server (e.g. http://192.168.1.50:9090)
+    # When set, LSTM/RL training and prediction are offloaded to that machine.
+    # When blank, ML runs locally on CPU (default behaviour).
+    GPU_SERVER_URL: str = ""
+    # Timeout in seconds for GPU server HTTP calls
+    GPU_SERVER_TIMEOUT: int = 120
+    # Shared auth token for GPU server (must match GPU_SERVER_TOKEN on the GPU machine)
+    GPU_SERVER_TOKEN: str = ""
+
+    # ── Exchange sync ─────────────────────────────────────────────────
+    # Sync portfolio state from Binance on startup (real mode only)
+    SYNC_EXCHANGE_ON_STARTUP: bool = True
+    # Minimum holding value (USDT) to import as position (filters dust)
+    SYNC_MIN_VALUE_USDT: float = 5.0
 
     # Bot behaviour
     CYCLE_INTERVAL_SECONDS: int = 300
@@ -47,9 +153,15 @@ class Settings(BaseSettings):
     # TOP_N_SYMBOLS: 0 = all pairs passing the volume filter, >0 = hard cap
     TOP_N_SYMBOLS: int = 0
     # Minimum 24h quote volume (USDT) to be included in the universe
-    MIN_VOLUME_USDT: float = 10_000_000.0
+    MIN_VOLUME_USDT: float = 5_000_000.0
     # Max concurrent OHLCV/orderbook fetches (avoid rate-limit bans)
     FETCH_CONCURRENCY: int = 10
+    # Top gainers: min 24h price change % to qualify as a "gainer"
+    GAINER_MIN_PCT: float = 5.0
+    # How many top gainers to inject into the symbol universe each cycle
+    GAINER_INJECT_COUNT: int = 10
+    # How many hours to keep watching a newly listed coin (auto-inject into universe)
+    NEW_LISTING_WATCH_HOURS: float = 48.0
 
     # News
     CRYPTOCOMPARE_API_KEY: str = ""

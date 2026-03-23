@@ -49,6 +49,21 @@ header {
 .btn-risk.active-fast_profit  { background: #ef444422; color: #ef4444; border-color: #ef444466; }
 .risk-label { font-size: 11px; color: var(--muted); }
 
+/* Less Fear toggle */
+.btn-fear {
+  padding: 5px 14px; border-radius: 6px; border: 1px solid var(--border);
+  background: transparent; color: var(--muted); cursor: pointer; font-size: 12px; font-weight: 600;
+  transition: background .15s, color .15s, border-color .15s;
+}
+.btn-fear.active {
+  background: #f59e0b33; color: #f59e0b; border-color: #f59e0b88;
+  animation: fear-pulse 2s ease-in-out infinite;
+}
+@keyframes fear-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(245,158,11,0.3); }
+  50% { box-shadow: 0 0 12px 2px rgba(245,158,11,0.25); }
+}
+
 .btn-action {
   padding: 6px 18px; border-radius: 6px; border: none; cursor: pointer;
   font-size: 13px; font-weight: 700; transition: opacity .2s;
@@ -67,6 +82,23 @@ header {
 .stat-card { background: var(--surface); padding: 14px 20px; }
 .stat-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; margin-bottom: 4px; }
 .stat-value { font-size: 20px; font-weight: 700; }
+.stat-sub { font-size: 11px; color: var(--muted); margin-top: 2px; }
+.stats-bar-secondary { grid-template-columns: repeat(6, 1fr); }
+.stats-bar-secondary .stat-value { font-size: 16px; }
+
+/* Status dot indicator */
+.status-dot {
+  display: inline-block; width: 10px; height: 10px; border-radius: 50%;
+  margin-right: 4px; vertical-align: middle;
+}
+.status-dot.running { background: var(--green); box-shadow: 0 0 6px var(--green); animation: pulse-dot 2s ease-in-out infinite; }
+.status-dot.stopped { background: var(--muted); }
+.status-dot.error   { background: var(--red); box-shadow: 0 0 6px var(--red); }
+@keyframes pulse-dot { 0%,100% { opacity:.6; } 50% { opacity:1; } }
+
+/* Cycle countdown bar */
+.cycle-bar-wrap { height: 3px; background: var(--border); border-radius: 2px; margin-top: 6px; overflow: hidden; }
+.cycle-bar-fill { height: 100%; background: var(--accent); border-radius: 2px; transition: width 1s linear; }
 
 /* ─── Main ─── */
 main { padding: 20px 24px; display: flex; flex-direction: column; gap: 20px; max-width: 1600px; margin: 0 auto; }
@@ -171,6 +203,16 @@ footer {
 .feed-conf-bg  { width: 60px; height: 4px; border-radius: 2px; background: var(--border); }
 .feed-conf-bar { height: 4px; border-radius: 2px; background: var(--accent); }
 .feed-snippet  { font-size: 11px; color: var(--muted); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ─── Exchange Account ─── */
+.exchange-summary { display: flex; gap: 18px; padding: 8px 0 12px; flex-wrap: wrap; }
+.exch-stat { font-size: 13px; color: var(--muted); }
+.exch-stat strong { color: var(--text); }
+.badge { font-size: 10px; padding: 2px 7px; border-radius: 6px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
+.badge-bot { background: rgba(99,102,241,.2); color: var(--accent); }
+.badge-ext { background: rgba(234,179,8,.15); color: var(--yellow); }
+.badge-none { color: var(--muted); background: none; }
+.dust-row { opacity: 0.45; }
 
 /* ─── Responsive ─── */
 @media (max-width: 1200px) {

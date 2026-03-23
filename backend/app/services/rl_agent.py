@@ -28,7 +28,7 @@ if not TORCH_AVAILABLE:
     logger.warning("torch not installed — RL agent disabled (install torch to enable)")
 
 AGENT_PATH  = Path(os.environ.get("DATA_DIR", "/data")) / "rl_agent.pt"
-STATE_SIZE  = 12
+STATE_SIZE  = 14        # matches GPU server DuelingDQN input size
 ACTION_SIZE = 3         # 0=HOLD, 1=BUY, 2=SELL
 ACTION_MAP  = {0: "HOLD", 1: "BUY", 2: "SELL"}
 ACTION_INV  = {"HOLD": 0, "BUY": 1, "SELL": 2}
@@ -150,10 +150,18 @@ class RLTradingAgent:
         lstm: dict,
         has_position: bool,
     ) -> np.ndarray:
-        """Build a normalised 12-dim state vector."""
+        """Build a normalised 14-dim state vector.
+
+        Dims 0-11 are the original 12 features.
+        Dims 12-13 are new: OBV trend and BB squeeze — both always present in
+        the indicators dict and meaningful for momentum/breakout detection.
+        The 14-dim size matches the GPU server's DuelingDQN input so remote
+        predictions use all features rather than zero-padding the last two.
+        """
         total = max(portfolio.get("total_value_usdt", 10_000), 1.0)
         close = ind.get("close", 1.0) or 1.0
         return np.array([
+            # ── Original 12 dims ────────────────────────────────────────
             np.clip(ind.get("rsi14", 50) / 100,  0,  1),
             np.clip(ind.get("macd_hist", 0) / (close * 0.02 + 1e-10), -1, 1),
             np.clip(ind.get("bb_pct_b", 0.5),    0,  1),
@@ -169,9 +177,30 @@ class RLTradingAgent:
             np.clip(portfolio.get("cash_usdt", 5000) / total, 0, 1),
             np.clip(portfolio.get("total_pnl_pct", 0) / 20, -1, 1),
             float(np.clip(ind.get("trend", 0), -1, 1)) * 0.5 + 0.5,
+            # ── New dims 12-13 (match GPU server STATE_SIZE=14) ─────────
+            # OBV trend: -1=falling, 0=flat, +1=rising → normalised to [0, 1]
+            float(np.clip(ind.get("obv_trend", 0), -1, 1)) * 0.5 + 0.5,
+            # BB squeeze: 1.0 = squeeze active (breakout likely), 0.0 = no squeeze
+            float(np.clip(ind.get("bb_squeeze", 0), 0, 1)),
         ], dtype=np.float32)
 
     # ── recommendation ────────────────────────────────────────────────────────
+    async def recommend_remote(self, state: np.ndarray) -> dict | None:
+        """Try GPU server for RL prediction; returns None if unavailable."""
+        from app.services import gpu_client
+        if not gpu_client.is_enabled():
+            return None
+        result = await gpu_client.predict_rl(state.tolist())
+        if result and result.get("trained"):
+            return {
+                "action":   result["action"],
+                "q_values": result["q_values"],
+                "epsilon":  round(self.epsilon, 3),
+                "trained":  True,
+                "steps":    self._steps,
+            }
+        return None
+
     def recommend(self, state: np.ndarray) -> dict:
         """Return action recommendation with Q-values for Claude's context."""
         action_idx = random.randint(0, ACTION_SIZE - 1)
@@ -326,6 +355,15 @@ class RLTradingAgent:
             logger.info("RL pre-training done (%d gradient steps)", trained_steps)
 
     async def pretrain_async(self, all_candles: dict[str, list]) -> None:
+        # Try GPU server first
+        from app.services import gpu_client
+        if gpu_client.is_enabled():
+            result = await gpu_client.train_rl(all_candles)
+            if result and result.get("status") == "ok":
+                logger.info("RL pre-trained on GPU server (%s)", result)
+                self._trained = True
+                return
+            logger.info("GPU RL train unavailable, falling back to local CPU")
         await asyncio.to_thread(self.pretrain_on_history, all_candles)
 
     @property

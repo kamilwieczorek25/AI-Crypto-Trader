@@ -186,6 +186,44 @@ async def get_usage() -> dict:
     return get_usage_stats()
 
 
+@router.get("/market-info")
+async def get_market_info() -> dict:
+    """Return current market regime, BTC anchor data, and risk profile."""
+    from app.services.bot_runner import bot_runner
+    from app.services.claude_engine import get_profile_info
+
+    regime = getattr(bot_runner, "_last_regime", {})
+    return {
+        "market_regime": regime,
+        "risk_profile": get_profile_info(),
+        "auto_risk_profile": settings.AUTO_RISK_PROFILE,
+        "circuit_breaker_tripped": getattr(bot_runner, "_circuit_breaker_tripped", False),
+        "max_drawdown_limit_pct": settings.MAX_DRAWDOWN_PCT,
+    }
+
+
+@router.get("/symbols")
+async def get_symbols() -> list[str]:
+    """Return the current symbol universe + position symbols for chart dropdown."""
+    from app.services.market_data import market_data_service
+    from app.services.fast_scanner import fast_scanner
+
+    symbols: set[str] = set()
+    # Add position symbols
+    state = portfolio_service.get_state()
+    for p in state.positions:
+        symbols.add(p.symbol)
+    # Add hot scanner symbols
+    for s in fast_scanner.hot_symbols:
+        symbols.add(s)
+    # Add cached OHLCV symbols (already fetched in previous cycles)
+    for key in market_data_service._ohlcv_cache:
+        sym = key.split(":")[0]
+        symbols.add(sym)
+    # Sort alphabetically
+    return sorted(symbols)
+
+
 @router.get("/ohlcv/{symbol}/{timeframe}")
 async def get_ohlcv(symbol: str, timeframe: str) -> list[dict]:
     """Return OHLCV data for the chart (symbol uses _ instead of /)."""
@@ -204,3 +242,101 @@ async def get_ohlcv(symbol: str, timeframe: str) -> list[dict]:
         }
         for row in ohlcv
     ]
+
+
+@router.get("/exchange-account")
+async def get_exchange_account() -> dict:
+    """Return full Binance account state — all balances, fiat, crypto, dust."""
+    from app.services.market_data import market_data_service
+
+    if settings.is_demo:
+        return {"error": "Exchange account only available in real mode", "assets": []}
+
+    if not settings.BINANCE_API_KEY:
+        return {"error": "No Binance API key configured", "assets": []}
+
+    try:
+        balances = await market_data_service.fetch_spot_balances()
+    except Exception as exc:
+        return {"error": str(exc), "assets": []}
+
+    if not balances:
+        return {"error": "No balances returned (check API permissions)", "assets": []}
+
+    # Fetch all tickers in one call for price resolution
+    exchange = await market_data_service._get_exchange()
+    try:
+        tickers = await exchange.fetch_tickers()
+    except Exception:
+        tickers = {}
+
+    stablecoins = {"USDT", "USDC", "BUSD", "TUSD", "FDUSD", "DAI"}
+    fiats = {"USD", "EUR", "GBP", "PLN", "TRY", "BRL", "ARS", "UAH", "RUB",
+             "NGN", "AUD", "JPY", "KRW", "INR", "ZAR", "CAD", "CHF",
+             "CZK", "SEK", "NOK", "DKK", "HUF", "RON", "BGN", "HRK"}
+
+    assets = []
+    total_value = 0.0
+
+    for asset, info in sorted(balances.items()):
+        total = info["total"]
+        free = info["free"]
+        locked = round(total - free, 8)
+
+        # Determine type and value
+        if asset in stablecoins:
+            asset_type = "stablecoin"
+            value_usdt = total
+            price = 1.0
+            pair = ""
+        elif asset in fiats:
+            asset_type = "fiat"
+            # Try to get fiat rate
+            pair = f"{asset}/{settings.QUOTE_CURRENCY}"
+            t = tickers.get(pair)
+            if not t or not t.get("last"):
+                pair = f"{asset}/USDT"
+                t = tickers.get(pair)
+            price = float(t["last"]) if t and t.get("last") else 0.0
+            value_usdt = total * price if price > 0 else 0.0
+        else:
+            asset_type = "crypto"
+            pair = f"{asset}/{settings.QUOTE_CURRENCY}"
+            t = tickers.get(pair)
+            price = float(t["last"]) if t and t.get("last") else 0.0
+            if price <= 0:
+                # Fallback to the other stablecoin
+                fallback = "USDT" if settings.QUOTE_CURRENCY == "USDC" else "USDC"
+                pair = f"{asset}/{fallback}"
+                t = tickers.get(pair)
+                price = float(t["last"]) if t and t.get("last") else 0.0
+            if price <= 0:
+                pair = ""
+            value_usdt = total * price if price > 0 else 0.0
+
+        # Check if bot manages this position
+        pos = portfolio_service.get_position(f"{asset}/{settings.QUOTE_CURRENCY}") or portfolio_service.get_position(f"{asset}/USDT") or portfolio_service.get_position(f"{asset}/USDC")
+        source = getattr(pos, "source", None) if pos else None
+
+        total_value += value_usdt
+        assets.append({
+            "asset": asset,
+            "type": asset_type,
+            "total": total,
+            "free": free,
+            "locked": locked,
+            "pair": pair,
+            "price": round(price, 6),
+            "value_usdt": round(value_usdt, 2),
+            "managed_by": source,  # "bot", "external", or null
+        })
+
+    # Sort: stablecoins first, then by value descending
+    type_order = {"stablecoin": 0, "crypto": 1, "fiat": 2}
+    assets.sort(key=lambda a: (type_order.get(a["type"], 9), -a["value_usdt"]))
+
+    return {
+        "total_value_usdt": round(total_value, 2),
+        "num_assets": len(assets),
+        "assets": assets,
+    }

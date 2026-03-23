@@ -40,6 +40,7 @@ async def _apply_migrations(conn) -> None:
         ("claude_decisions", "risk_profile", "VARCHAR(20)"),
         ("claude_decisions", "error", "TEXT"),
         ("trades", "fee_usdt", "REAL DEFAULT 0.0"),
+        ("positions", "source", "VARCHAR(10) DEFAULT 'bot'"),
     ]
     for table, column, col_def in migrations:
         try:

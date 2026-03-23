@@ -235,9 +235,25 @@ class LSTMPredictor:
         return True
 
     async def train_async(self, all_candles: dict[str, list]) -> bool:
+        # Try GPU server first
+        from app.services import gpu_client
+        if gpu_client.is_enabled():
+            result = await gpu_client.train_lstm(all_candles)
+            if result and result.get("status") == "ok":
+                logger.info("LSTM trained on GPU server (%s)", result)
+                self._trained = True  # mark so predict() tries remote too
+                return True
+            logger.info("GPU LSTM train unavailable, falling back to local CPU")
         return await asyncio.to_thread(self.train, all_candles)
 
     # ── inference ─────────────────────────────────────────────────────────────
+    async def predict_remote(self, candles: list) -> dict | None:
+        """Try GPU server for prediction; returns None if unavailable."""
+        from app.services import gpu_client
+        if not gpu_client.is_enabled():
+            return None
+        return await gpu_client.predict_lstm(candles)
+
     def predict(self, candles: list) -> dict:
         """Return {'BUY': p, 'HOLD': p, 'SELL': p, 'signal': str, 'confidence': float}"""
         neutral = {

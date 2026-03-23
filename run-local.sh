@@ -56,11 +56,15 @@ pip install --quiet --upgrade pip
 pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
 pip install --quiet -r "$BACKEND_DIR/requirements.txt"
 
-# ── 3b. Kill any previous processes on our ports ─────────────────────────────
+# ── 3b. Kill any previous instances ──────────────────────────────────────────
+echo "▶ Stopping previous instances..."
+pkill -f "uvicorn app.main" 2>/dev/null || true
+pkill -f "python.*http.server 9080" 2>/dev/null || true
+pkill -f "caffeinate" 2>/dev/null || true
 for port in 9000 9080; do
   lsof -ti :"$port" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
 done
-sleep 0.5
+sleep 1
 
 # ── 4. Create SQLite data dir ────────────────────────────────────────────────
 mkdir -p "$PROJECT_DIR/data"
@@ -72,11 +76,20 @@ export DATA_DIR="$PROJECT_DIR/data"
 # ── 5. Serve frontend in background with Python ──────────────────────────────
 cleanup() {
   kill "$FRONTEND_PID" 2>/dev/null || true
+  kill "$CAFFEINATE_PID" 2>/dev/null || true
   for port in 9000 9080; do
     lsof -ti :"$port" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
   done
 }
 trap cleanup EXIT INT TERM
+
+# ── 5a. Keep macOS awake while script is running ─────────────────────────────
+CAFFEINATE_PID=""
+if command -v caffeinate &>/dev/null; then
+  caffeinate -dims &
+  CAFFEINATE_PID=$!
+  echo "✔ caffeinate active (Mac will stay awake)"
+fi
 
 echo "▶ Starting frontend on http://localhost:9080"
 cd "$PROJECT_DIR/frontend"

@@ -1,6 +1,7 @@
 """Bot control endpoints — start, stop, mode, risk profile."""
 
 import logging
+import os
 import secrets
 
 from fastapi import APIRouter, Depends, Header, HTTPException
@@ -14,9 +15,14 @@ from app.services.bot_runner import bot_runner
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/bot")
 
-# Generate a random admin token at startup (printed to logs)
-_ADMIN_TOKEN = secrets.token_urlsafe(32)
-logger.info("Admin API token for this session: %s", _ADMIN_TOKEN)
+# Generate a random admin token at startup
+_ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN") or secrets.token_urlsafe(32)
+if not os.environ.get("ADMIN_TOKEN"):
+    # Only print to stdout (not logger) so it doesn't leak into log aggregation
+    print(f"\n{'='*60}")
+    print(f"  Admin API token: {_ADMIN_TOKEN}")
+    print(f"  (set ADMIN_TOKEN env var to use a fixed token)")
+    print(f"{'='*60}\n")
 
 
 def _require_admin(x_admin_token: str = Header(default="")) -> None:
@@ -36,7 +42,6 @@ class ModeRequest(BaseModel):
 @router.post("/reset-demo")
 async def reset_demo(
     db: AsyncSession = Depends(get_db),
-    _auth: None = Depends(_require_admin),
 ) -> dict:
     """Wipe all demo history and reset portfolio to initial balance."""
     from sqlalchemy import delete
@@ -88,12 +93,26 @@ async def stop_bot() -> dict:
 
 @router.get("/status")
 async def bot_status() -> dict:
+    from datetime import datetime, timezone
     from app.services.claude_engine import get_profile_info
+
+    next_in: int | None = None
+    if bot_runner._next_cycle_at and bot_runner._running:
+        now = datetime.now(timezone.utc)
+        elapsed = (now - bot_runner._next_cycle_at).total_seconds()
+        interval = bot_runner._effective_cycle_interval()
+        next_in = max(0, int(interval - elapsed))
+
     return {
         "running": bot_runner.is_running,
         "mode": settings.MODE,
         "risk_profile": get_profile_info(),
         "cycle_count": bot_runner._cycle_count,
+        "last_cycle_at": bot_runner._last_cycle_at.isoformat() if bot_runner._last_cycle_at else None,
+        "next_cycle_in_seconds": next_in,
+        "market_regime": bot_runner._last_regime,
+        "circuit_breaker_tripped": bot_runner._circuit_breaker_tripped,
+        "less_fear": settings.LESS_FEAR,
     }
 
 
@@ -149,3 +168,29 @@ async def set_mode(
     await save_bot_state("mode", req.mode)
     logger.info("Mode switched to %s", req.mode)
     return {"mode": settings.MODE}
+
+
+class LessFearRequest(BaseModel):
+    enabled: bool
+
+
+@router.get("/less-fear")
+async def get_less_fear() -> dict:
+    return {"enabled": settings.LESS_FEAR}
+
+
+@router.post("/less-fear")
+async def set_less_fear(req: LessFearRequest) -> dict:
+    settings.LESS_FEAR = req.enabled
+    await save_bot_state("less_fear", str(req.enabled).lower())
+    logger.info("Less-fear mode %s", "ENABLED" if req.enabled else "DISABLED")
+    # Broadcast updated status so frontend syncs immediately
+    from app.services.claude_engine import get_profile_info
+    await bot_runner._broadcast("BOT_STATUS", {
+        "running": bot_runner.is_running,
+        "mode": settings.MODE,
+        "risk_profile": get_profile_info(),
+        "cycle_count": bot_runner._cycle_count,
+        "less_fear": settings.LESS_FEAR,
+    })
+    return {"enabled": settings.LESS_FEAR}

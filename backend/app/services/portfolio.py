@@ -41,7 +41,11 @@ class PortfolioService:
         cash_state = await db.get(BotState, "cash_usdt")
         if cash_state is not None:
             self._cash_usdt = float(cash_state.value)
-            self._initial_value = settings.DEMO_INITIAL_BALANCE
+            # In real mode, initial value is set by sync_from_exchange later
+            if settings.is_demo:
+                self._initial_value = settings.DEMO_INITIAL_BALANCE
+            else:
+                self._initial_value = self._cash_usdt + self.positions_value
             logger.info(
                 "Portfolio loaded: %d positions, cash=$%.2f (from bot_state — crash-safe)",
                 len(self._positions),
@@ -58,7 +62,10 @@ class PortfolioService:
         snap = snap_row.scalar_one_or_none()
         if snap is not None:
             self._cash_usdt = snap.cash_usdt
-            self._initial_value = settings.DEMO_INITIAL_BALANCE  # P&L always vs original balance
+            if settings.is_demo:
+                self._initial_value = settings.DEMO_INITIAL_BALANCE
+            else:
+                self._initial_value = self._cash_usdt + self.positions_value
             logger.info(
                 "Portfolio loaded: %d positions, cash=$%.2f (from snapshot %s)",
                 len(self._positions),
@@ -71,6 +78,167 @@ class PortfolioService:
                 len(self._positions),
                 self._cash_usdt,
             )
+
+    # ------------------------------------------------------------------ #
+    # Exchange sync (real mode)
+    # ------------------------------------------------------------------ #
+    async def sync_from_exchange(self, db: AsyncSession) -> dict[str, Any]:
+        """Read actual Binance spot balances and reconcile with internal state.
+
+        - Imports USDT balance as cash
+        - Imports non-USDT holdings as external positions
+        - Preserves bot-opened positions (source='bot')
+        - Returns summary of what changed
+
+        Only call in real mode with valid API keys.
+        """
+        from app.services.market_data import market_data_service
+
+        changes: dict[str, Any] = {"imported": [], "updated": [], "usdt_synced": False}
+
+        # 1. Fetch real balances
+        try:
+            balances = await market_data_service.fetch_spot_balances()
+        except Exception as exc:
+            logger.error("Exchange sync failed: %s", exc)
+            return changes
+
+        if not balances:
+            logger.warning("Exchange sync: no balances returned (check API key permissions)")
+            return changes
+
+        # 2. Sync cash balance (USDT + USDC + other stablecoins → treated as cash)
+        _STABLECOINS = ("USDT", "USDC", "BUSD", "TUSD", "FDUSD", "DAI")
+        real_cash = 0.0
+        for stable in _STABLECOINS:
+            info = balances.pop(stable, {})
+            real_cash += info.get("free", 0.0)
+
+        if real_cash > 0:
+            old_cash = self._cash_usdt
+            self._cash_usdt = real_cash
+            self._initial_value = self._cash_usdt + self.positions_value
+            changes["usdt_synced"] = True
+            logger.info(
+                "Exchange sync: cash $%.2f -> $%.2f (from Binance stablecoins)",
+                old_cash, real_cash,
+            )
+            await self._persist_cash()
+
+        # 3. Sync spot holdings as positions
+        for asset, info in balances.items():
+            total = info.get("total", 0.0)
+            if total <= 0:
+                continue
+
+            # Skip stablecoins (already consumed above), fiat currencies, and non-tradeable
+            _SKIP = ("USD", "LDUSDT", "LDUSDC",
+                     "EUR", "GBP", "PLN", "TRY", "BRL", "ARS", "UAH", "RUB",
+                     "NGN", "AUD", "JPY", "KRW", "INR", "ZAR", "CAD", "CHF",
+                     "CZK", "SEK", "NOK", "DKK", "HUF", "RON", "BGN", "HRK")
+            if asset in _STABLECOINS or asset in _SKIP:
+                continue
+
+            # Try quote currency pair first, then fallback
+            symbol = f"{asset}/{settings.QUOTE_CURRENCY}"
+            try:
+                price = await market_data_service.get_price(symbol)
+            except Exception:
+                price = 0.0
+
+            if price <= 0:
+                # Fallback: try the other stablecoin pair
+                fallback_quote = "USDT" if settings.QUOTE_CURRENCY == "USDC" else "USDC"
+                symbol_fallback = f"{asset}/{fallback_quote}"
+                try:
+                    price = await market_data_service.get_price(symbol_fallback)
+                    if price > 0:
+                        symbol = symbol_fallback
+                except Exception:
+                    price = 0.0
+
+            if price <= 0:
+                continue
+
+            value_usdt = total * price
+            if value_usdt < settings.SYNC_MIN_VALUE_USDT:
+                continue  # skip dust
+
+            # Deduplicate: if this asset already exists under a different quote pair, merge
+            alt_quote = "USDT" if settings.QUOTE_CURRENCY == "USDC" else "USDC"
+            alt_symbol = f"{asset}/{alt_quote}"
+            if symbol != alt_symbol and alt_symbol in self._positions:
+                old_pos = self._positions.pop(alt_symbol)
+                logger.info(
+                    "Exchange sync: migrating %s -> %s (quote currency change)",
+                    alt_symbol, symbol,
+                )
+                # Delete old DB record
+                from app.models.position import Position as PosModel
+                from sqlalchemy import delete
+                await db.execute(
+                    delete(PosModel).where(PosModel.symbol == alt_symbol)
+                )
+                changes["updated"].append({
+                    "symbol": alt_symbol, "reason": "migrated_to", "new_symbol": symbol,
+                })
+
+            existing = self._positions.get(symbol)
+            if existing and existing.source == "bot":
+                # Bot-managed position: don't overwrite, but verify quantity matches
+                if abs(existing.quantity - total) / max(total, 0.0001) > 0.01:
+                    logger.warning(
+                        "Exchange sync: %s quantity mismatch — bot=%.6f, exchange=%.6f",
+                        symbol, existing.quantity, total,
+                    )
+                    changes["updated"].append({
+                        "symbol": symbol, "reason": "quantity_mismatch",
+                        "bot_qty": existing.quantity, "exchange_qty": total,
+                    })
+                continue
+
+            if existing and existing.source == "external":
+                # Update external position with latest exchange data
+                existing.quantity = total
+                existing.current_price = price
+                existing.avg_entry_price = price  # best estimate for externals
+                existing.updated_at = datetime.now(timezone.utc)
+                db.add(existing)
+                changes["updated"].append({"symbol": symbol, "quantity": total, "value_usdt": value_usdt})
+            else:
+                # New external holding — import it
+                pos = Position(
+                    symbol=symbol,
+                    quantity=total,
+                    avg_entry_price=price,  # we don't know real entry, use current
+                    current_price=price,
+                    stop_loss_price=0.0,    # no SL for external positions
+                    take_profit_price=0.0,  # no TP for external positions
+                    highest_price=price,
+                    trailing_stop_pct=0.0,
+                    source="external",
+                )
+                db.add(pos)
+                await db.flush()
+                self._positions[symbol] = pos
+                changes["imported"].append({"symbol": symbol, "quantity": total, "value_usdt": value_usdt})
+                logger.info(
+                    "Exchange sync: imported %s — %.6f units ($%.2f)",
+                    symbol, total, value_usdt,
+                )
+
+        await db.commit()
+
+        # Update initial value to reflect full portfolio
+        self._initial_value = self.total_value
+
+        n_imp = len(changes["imported"])
+        n_upd = len(changes["updated"])
+        logger.info(
+            "Exchange sync complete: USDT=$%.2f, %d imported, %d updated, %d total positions",
+            self._cash_usdt, n_imp, n_upd, len(self._positions),
+        )
+        return changes
 
     # ------------------------------------------------------------------ #
     # Balance helpers
@@ -295,6 +463,7 @@ class PortfolioService:
                 stop_loss_price=p.stop_loss_price,
                 take_profit_price=p.take_profit_price,
                 opened_at=p.opened_at,
+                source=getattr(p, "source", "bot"),
             )
             for p in self._positions.values()
         ]

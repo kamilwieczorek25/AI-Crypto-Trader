@@ -16,3 +16,5 @@ trader-db/
 node_modules/
 .venv/
 venv/
+*.pt
+*.pth

@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
@@ -62,12 +63,36 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     async with AsyncSessionLocal() as db:
         await portfolio_service.load_from_db(db)
 
-    # Restore persisted bot settings (risk profile, mode)
+        # Sync with Binance exchange in real mode (read actual balances + holdings)
+        if not settings.is_demo and settings.SYNC_EXCHANGE_ON_STARTUP:
+            if settings.BINANCE_API_KEY and settings.BINANCE_SECRET:
+                _log.info("Real mode: syncing portfolio from Binance exchange...")
+                try:
+                    sync_result = await portfolio_service.sync_from_exchange(db)
+                    n_imp = len(sync_result.get("imported", []))
+                    n_upd = len(sync_result.get("updated", []))
+                    _log.info(
+                        "Exchange sync done: %d imported, %d updated, USDT=$%.2f",
+                        n_imp, n_upd, portfolio_service.cash_usdt,
+                    )
+                except Exception as exc:
+                    _log.warning("Exchange sync failed (non-fatal): %s", exc)
+            else:
+                _log.warning(
+                    "Real mode but no BINANCE_API_KEY/SECRET — "
+                    "cannot sync exchange state. Using DB-only portfolio."
+                )
+
+    # Restore persisted bot settings (risk profile, mode, less_fear)
     state = await load_bot_state()
     if "risk_profile" in state:
         settings.RISK_PROFILE = state["risk_profile"]
     if "mode" in state and state["mode"] in ("demo", "real"):
         settings.MODE = state["mode"]
+    if "less_fear" in state:
+        settings.LESS_FEAR = state["less_fear"].lower() == "true"
+        if settings.LESS_FEAR:
+            _log.info("Less-fear mode restored from DB: ENABLED")
 
     # Warn early if Anthropic key is missing
     if not settings.ANTHROPIC_API_KEY:
@@ -79,24 +104,59 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Wire WebSocket hub into bot runner
     bot_runner.set_ws_hub(ws.ws_hub)
 
+    # Check GPU server connectivity (if configured)
+    from app.services import gpu_client
+    if gpu_client.is_enabled():
+        info = await gpu_client.health()
+        if info:
+            _log.info("GPU server connected: %s (%s, VRAM %.1fGB)",
+                      info.get("gpu"), info.get("device"), info.get("vram_gb", 0))
+        else:
+            _log.warning("GPU_SERVER_URL is set but server is unreachable — ML will run on local CPU")
+
+    # Start fast local scanner (background, zero API cost)
+    from app.services.fast_scanner import fast_scanner
+    asyncio.create_task(fast_scanner.start(), name="fast_scanner_start")
+
+    # Start whale trade detector (Binance WebSocket, zero API cost)
+    from app.services.whale_detector import whale_detector
+    asyncio.create_task(whale_detector.start(), name="whale_detector_start")
+
     # Kick off ML pre-training in the background (non-blocking)
     asyncio.create_task(_pretrain_ml(), name="ml_pretrain")
+
+    # Auto-start the bot so it runs immediately on server startup
+    await bot_runner.start()
 
     yield
 
     # Cleanup
     await bot_runner.stop()
+    from app.services.fast_scanner import fast_scanner as _fs
+    await _fs.stop()
+    from app.services.whale_detector import whale_detector as _wd
+    await _wd.stop()
     from app.services.market_data import market_data_service
     await market_data_service.close()
 
 
 app = FastAPI(title="AI Crypto Trader", lifespan=lifespan)
 
+_ALLOWED_ORIGINS = [
+    "http://localhost:9080",
+    "http://127.0.0.1:9080",
+    f"http://localhost:{os.environ.get('FRONTEND_PORT', '9080')}",
+]
+# Allow user to add extra origins via env (comma-separated)
+_extra = os.environ.get("CORS_ORIGINS", "")
+if _extra:
+    _ALLOWED_ORIGINS.extend(o.strip() for o in _extra.split(",") if o.strip())
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_ALLOWED_ORIGINS,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["content-type", "x-admin-token"],
 )
 
 app.include_router(health.router)

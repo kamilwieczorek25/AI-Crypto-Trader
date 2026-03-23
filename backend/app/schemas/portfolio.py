@@ -16,6 +16,7 @@ class PositionOut(BaseModel):
     stop_loss_price: float
     take_profit_price: float
     opened_at: datetime
+    source: str = "bot"  # "bot" or "external"
 
     model_config = {"from_attributes": True}
 

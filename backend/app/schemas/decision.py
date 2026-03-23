@@ -9,7 +9,7 @@ class TradeDecision(BaseModel):
     action: str = Field(..., pattern="^(BUY|SELL|HOLD)$")
     symbol: str
     timeframe: str
-    quantity_pct: Annotated[float, Field(ge=0.0, le=5.0)]
+    quantity_pct: Annotated[float, Field(ge=0.0, le=100.0)]
     stop_loss_pct: Annotated[float, Field(ge=0.0, le=20.0)]
     take_profit_pct: Annotated[float, Field(ge=0.0, le=50.0)]
     confidence: Annotated[float, Field(ge=0.0, le=1.0)]

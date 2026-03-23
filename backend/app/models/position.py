@@ -32,6 +32,8 @@ class Position(Base):
     highest_price: Mapped[float] = mapped_column(Float, default=0.0)
     # Original SL distance in % (used to compute trailing SL)
     trailing_stop_pct: Mapped[float] = mapped_column(Float, default=0.0)
+    # Source: "bot" (opened by the bot) or "external" (pre-existing on exchange)
+    source: Mapped[str] = mapped_column(String(10), default="bot")
 
     @property
     def value_usdt(self) -> float:
