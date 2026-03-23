@@ -33,13 +33,16 @@ async def create_tables() -> None:
     """Create all tables (called at startup) and apply lightweight migrations."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        # Add columns introduced after initial schema (idempotent ALTERs)
-        await _apply_migrations(conn)
+
+    # Migrations run in separate transactions — in PostgreSQL a failed statement
+    # aborts the entire transaction, so each ALTER needs its own.
+    await _apply_migrations()
 
 
-async def _apply_migrations(conn) -> None:
+async def _apply_migrations() -> None:
     """Add missing columns to existing tables. Each ALTER is safe to re-run."""
     import logging
+    import sqlalchemy as sa
     log = logging.getLogger(__name__)
     migrations = [
         ("positions", "highest_price", "DOUBLE PRECISION DEFAULT 0.0" if not _is_sqlite else "REAL DEFAULT 0.0"),
@@ -53,11 +56,10 @@ async def _apply_migrations(conn) -> None:
     ]
     for table, column, col_def in migrations:
         try:
-            await conn.execute(
-                __import__("sqlalchemy").text(
-                    f"ALTER TABLE {table} ADD COLUMN {column} {col_def}"
+            async with engine.begin() as conn:
+                await conn.execute(
+                    sa.text(f"ALTER TABLE {table} ADD COLUMN {column} {col_def}")
                 )
-            )
             log.info("Migration: added %s.%s", table, column)
         except Exception:
             pass  # column already exists
