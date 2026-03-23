@@ -3,7 +3,7 @@
 import json
 from typing import Any
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -224,10 +224,16 @@ async def get_symbols() -> list[str]:
     return sorted(symbols)
 
 
+_VALID_TIMEFRAMES = {"1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w", "1M"}
+
+
 @router.get("/ohlcv/{symbol}/{timeframe}")
 async def get_ohlcv(symbol: str, timeframe: str) -> list[dict]:
     """Return OHLCV data for the chart (symbol uses _ instead of /)."""
     from app.services.market_data import market_data_service
+
+    if timeframe not in _VALID_TIMEFRAMES:
+        raise HTTPException(status_code=400, detail=f"Invalid timeframe. Allowed: {sorted(_VALID_TIMEFRAMES)}")
 
     sym = symbol.replace("_", "/")
     ohlcv = await market_data_service.get_ohlcv(sym, timeframe, limit=200)

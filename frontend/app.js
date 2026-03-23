@@ -11,8 +11,17 @@ let tradePage = 1;
 let priceChart = null, rsiChart = null, macdChart = null;
 let growthChart = null, allocChart = null, pnlChart = null;
 let knownSymbols = new Set();
+let _sessionAdminToken = '';
 
 const PALETTE = ['#6366f1','#22c55e','#f59e0b','#3b82f6','#ef4444','#8b5cf6','#14b8a6','#f97316','#ec4899','#06b6d4'];
+
+/* ─── Admin token helper ─── */
+function getAdminToken() {
+  if (!_sessionAdminToken) {
+    _sessionAdminToken = prompt('Enter the Admin API token (printed in server startup logs):') || '';
+  }
+  return _sessionAdminToken;
+}
 
 /* ─── DOM helpers ─── */
 const $ = id => document.getElementById(id);
@@ -108,7 +117,7 @@ function renderPositions(positions) {
       : '<span class="badge badge-bot" title="Opened by bot">bot</span>';
     return `
     <tr>
-      <td><strong>${p.symbol}</strong></td>
+      <td><strong>${escapeHtml(p.symbol)}</strong></td>
       <td>${fmt(p.quantity, 6)}</td>
       <td>${fmtPrice(p.avg_entry_price)}</td>
       <td>${fmtPrice(p.current_price)}</td>
@@ -349,17 +358,20 @@ async function loadTrades(delta) {
     tbody.innerHTML = '<tr><td colspan="8" class="empty-msg">No trades yet</td></tr>';
     return;
   }
-  tbody.innerHTML = items.map(t => `
+  tbody.innerHTML = items.map(t => {
+    const modeClass = t.mode === 'real' ? 'badge-real' : 'badge-demo';
+    return `
     <tr>
       <td>${fmtTime(t.created_at)}</td>
-      <td><strong>${t.symbol}</strong></td>
-      <td class="${t.direction==='BUY'?'dir-buy':'dir-sell'}">${t.direction}</td>
-      <td><span class="badge-${t.mode}">${t.mode.toUpperCase()}</span></td>
+      <td><strong>${escapeHtml(t.symbol)}</strong></td>
+      <td class="${t.direction==='BUY'?'dir-buy':'dir-sell'}">${escapeHtml(t.direction)}</td>
+      <td><span class="${modeClass}">${escapeHtml(t.mode.toUpperCase())}</span></td>
       <td>${fmt(t.quantity, 6)}</td>
       <td>${fmtPrice(t.price)}</td>
       <td class="${pnlClass(t.pnl_usdt)}">${pnlSign(t.pnl_usdt)}</td>
       <td class="${pnlClass(t.pnl_pct)}">${pnlSign(t.pnl_pct)}%</td>
-    </tr>`).join('');
+    </tr>`;
+  }).join('');
 }
 
 /* ─── Chart ─── */
@@ -733,16 +745,17 @@ async function loadDecisionFeed() {
       const badgeCls = {BUY: 'feed-buy', SELL: 'feed-sell', HOLD: 'feed-hold'}[d.action] || 'feed-hold';
       const signal = (d.primary_signals && d.primary_signals[0]) || (d.reasoning || '').slice(0, 80) || '—';
       const sym = d.symbol || 'MARKET';
+      const titleAttr = escapeHtml((d.primary_signals || []).join(' | '));
       return `
         <div class="feed-item">
           <span class="feed-time">${timeAgo(d.created_at)}</span>
-          <span class="feed-badge ${badgeCls}">${d.action}</span>
-          <span class="feed-sym">${sym}</span>
+          <span class="feed-badge ${badgeCls}">${escapeHtml(d.action)}</span>
+          <span class="feed-sym">${escapeHtml(sym)}</span>
           <div style="display:flex;align-items:center;gap:5px;min-width:90px;">
             <div class="feed-conf-bg"><div class="feed-conf-bar" style="width:${confPct}%"></div></div>
             <span style="font-size:10px;color:var(--muted)">${confPct}%</span>
           </div>
-          <span class="feed-snippet" title="${(d.primary_signals || []).join(' | ')}">${signal}</span>
+          <span class="feed-snippet" title="${titleAttr}">${escapeHtml(signal)}</span>
         </div>`;
     }).join('');
   } catch (_) {}
@@ -759,11 +772,14 @@ async function loadPortfolio() {
 
 async function setMode(mode) {
   try {
+    const token = getAdminToken();
+    if (!token) return;
     const resp = await fetch(`${API_BASE}/api/bot/mode`, {
-      method: 'POST', headers: {'Content-Type':'application/json'},
+      method: 'POST', headers: {'Content-Type':'application/json', 'X-Admin-Token': token},
       body: JSON.stringify({mode}),
     });
     if (!resp.ok) {
+      if (resp.status === 403) _sessionAdminToken = '';  // clear cached token on auth failure
       const err = await resp.json();
       alert(err.detail || 'Mode change failed');
       return;
@@ -783,7 +799,12 @@ async function stopBot() {
 
 async function resetDemo() {
   if (!confirm('Reset demo? This will wipe ALL trade history, decisions, and positions and restore the $10,000 balance.')) return;
-  const resp = await fetch(`${API_BASE}/api/bot/reset-demo`, {method:'POST'});
+  const token = getAdminToken();
+  if (!token) return;
+  const resp = await fetch(`${API_BASE}/api/bot/reset-demo`, {
+    method: 'POST',
+    headers: {'X-Admin-Token': token},
+  });
   if (resp.ok) {
     await Promise.all([
       loadPortfolio(), loadTrades(0), syncBotStatus(), loadLastDecision(),
@@ -791,7 +812,9 @@ async function resetDemo() {
     ]);
     $('decision-content').innerHTML = '<div class="decision-empty">History cleared. Start the bot to begin.</div>';
   } else {
-    alert('Reset failed');
+    if (resp.status === 403) _sessionAdminToken = '';  // clear cached token on auth failure
+    const err = await resp.json().catch(() => ({}));
+    alert(err.detail || 'Reset failed');
   }
 }
 

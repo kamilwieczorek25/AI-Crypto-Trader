@@ -42,6 +42,7 @@ class ModeRequest(BaseModel):
 @router.post("/reset-demo")
 async def reset_demo(
     db: AsyncSession = Depends(get_db),
+    _auth: None = Depends(_require_admin),
 ) -> dict:
     """Wipe all demo history and reset portfolio to initial balance."""
     from sqlalchemy import delete

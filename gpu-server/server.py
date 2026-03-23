@@ -16,6 +16,7 @@ import asyncio
 import logging
 import math
 import os
+import secrets
 import time
 from pathlib import Path
 
@@ -512,7 +513,9 @@ async def auth_middleware(request, call_next):
     """Verify bearer token on all non-health endpoints when GPU_SERVER_TOKEN is set."""
     if _GPU_TOKEN and request.url.path != "/health":
         auth = request.headers.get("authorization", "")
-        if auth != f"Bearer {_GPU_TOKEN}":
+        expected = f"Bearer {_GPU_TOKEN}"
+        # Use constant-time comparison to prevent timing attacks
+        if not secrets.compare_digest(auth, expected):
             from starlette.responses import JSONResponse
             return JSONResponse(status_code=403, content={"detail": "Invalid or missing GPU server token"})
     return await call_next(request)

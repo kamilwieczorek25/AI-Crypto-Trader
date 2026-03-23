@@ -33,6 +33,7 @@ async def create_tables() -> None:
 async def _apply_migrations(conn) -> None:
     """Add missing columns to existing tables. Each ALTER is safe to re-run."""
     import logging
+    from sqlalchemy import text as sa_text
     log = logging.getLogger(__name__)
     migrations = [
         ("positions", "highest_price", "REAL DEFAULT 0.0"),
@@ -45,9 +46,7 @@ async def _apply_migrations(conn) -> None:
     for table, column, col_def in migrations:
         try:
             await conn.execute(
-                __import__("sqlalchemy").text(
-                    f"ALTER TABLE {table} ADD COLUMN {column} {col_def}"
-                )
+                sa_text(f"ALTER TABLE {table} ADD COLUMN {column} {col_def}")
             )
             log.info("Migration: added %s.%s", table, column)
         except Exception:
