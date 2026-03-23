@@ -303,17 +303,64 @@ class PortfolioService:
     def check_sl_tp_triggers(self) -> list[tuple[str, str, float]]:
         """Return (symbol, reason, price) for positions that hit SL or TP.
 
+        Trailing TP: when price first hits TP, don't sell — activate trailing
+        mode and track the peak. Sell only when price pulls back from peak
+        by TRAILING_TP_PULLBACK_PCT, or drops back below original TP.
+
         reason is 'stop_loss' or 'take_profit'.
         """
+        from app.config import settings
+
+        pullback_pct = settings.TRAILING_TP_PULLBACK_PCT
+        floor_enabled = settings.TRAILING_TP_FLOOR
         triggers: list[tuple[str, str, float]] = []
+
         for sym, pos in list(self._positions.items()):
             price = pos.current_price
             if price <= 0:
                 continue
+
+            # Stop-loss always fires immediately
             if pos.stop_loss_price > 0 and price <= pos.stop_loss_price:
                 triggers.append((sym, "stop_loss", price))
-            elif pos.take_profit_price > 0 and price >= pos.take_profit_price:
-                triggers.append((sym, "take_profit", price))
+                continue
+
+            if pos.take_profit_price <= 0:
+                continue
+
+            if not pos.tp_activated:
+                # TP not yet hit — check if price just reached it
+                if price >= pos.take_profit_price:
+                    pos.tp_activated = True
+                    pos.tp_peak_price = price
+                    logger.info(
+                        "Trailing TP activated: %s hit TP $%.6f (now $%.6f) — letting profits run",
+                        sym, pos.take_profit_price, price,
+                    )
+            else:
+                # TP already activated — track peak and check pullback
+                if price > pos.tp_peak_price:
+                    pos.tp_peak_price = price
+
+                # Safety floor: price fell back below original TP → sell now
+                if floor_enabled and price < pos.take_profit_price:
+                    logger.info(
+                        "Trailing TP floor: %s dropped back below TP $%.6f → selling at $%.6f",
+                        sym, pos.take_profit_price, price,
+                    )
+                    triggers.append((sym, "take_profit", price))
+                    continue
+
+                # Pullback from peak → sell
+                if pos.tp_peak_price > 0:
+                    drop_from_peak = (pos.tp_peak_price - price) / pos.tp_peak_price * 100
+                    if drop_from_peak >= pullback_pct:
+                        logger.info(
+                            "Trailing TP triggered: %s pulled back %.1f%% from peak $%.6f → selling at $%.6f",
+                            sym, drop_from_peak, pos.tp_peak_price, price,
+                        )
+                        triggers.append((sym, "take_profit", price))
+
         return triggers
 
     async def _persist_cash(self) -> None:

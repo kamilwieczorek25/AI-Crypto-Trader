@@ -1142,7 +1142,20 @@ class BotRunner:
             async with AsyncSessionLocal() as db:
                 # Log a synthetic SELL decision so the audit trail is complete
                 from app.models.decision import ClaudeDecision
-                label = "Stop-loss" if reason == "stop_loss" else "Take-profit"
+
+                # Build descriptive label
+                if reason == "stop_loss":
+                    label = "Stop-loss"
+                elif reason == "take_profit":
+                    pos = self._portfolio.get_position(symbol)
+                    if pos and pos.tp_peak_price > 0 and pos.tp_peak_price > pos.take_profit_price:
+                        peak = pos.tp_peak_price
+                        extra_pct = (peak - pos.take_profit_price) / pos.take_profit_price * 100
+                        label = f"Trailing take-profit (ran +{extra_pct:.1f}% past TP, peak ${peak:.6f})"
+                    else:
+                        label = "Take-profit"
+                else:
+                    label = "Time exit"
                 db_decision = ClaudeDecision(
                     raw_prompt=f"[AUTO {reason.upper()}]",
                     raw_response=f"Auto-triggered at ${price:.6f}",

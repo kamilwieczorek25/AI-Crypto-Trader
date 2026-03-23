@@ -32,6 +32,10 @@ class Position(Base):
     highest_price: Mapped[float] = mapped_column(Float, default=0.0)
     # Original SL distance in % (used to compute trailing SL)
     trailing_stop_pct: Mapped[float] = mapped_column(Float, default=0.0)
+    # Trailing TP: activated once price first hits take_profit_price
+    tp_activated: Mapped[bool] = mapped_column(Integer, default=0)
+    # Peak price seen after TP activation (for trailing pullback calc)
+    tp_peak_price: Mapped[float] = mapped_column(Float, default=0.0)
     # Source: "bot" (opened by the bot) or "external" (pre-existing on exchange)
     source: Mapped[str] = mapped_column(String(10), default="bot")
 
