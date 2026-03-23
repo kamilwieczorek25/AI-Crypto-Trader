@@ -49,6 +49,25 @@ async def _pretrain_ml() -> None:
         _log.info("ML pre-training: pre-training RL agent…")
         await rl_agent.pretrain_async(all_candles)
 
+        # Train GPU Multi-Timeframe Fusion model (15m/1h/4h/1d simultaneously)
+        from app.services import gpu_client
+        if gpu_client.is_enabled():
+            _log.info("ML pre-training: fetching multi-TF candles for MTF model…")
+            all_tf_candles: dict[str, dict[str, list]] = {}
+            for sym in train_syms:
+                sym_tfs: dict[str, list] = {}
+                for tf in ("15m", "1h", "4h", "1d"):
+                    c = await market_data_service.get_ohlcv(sym, tf, limit=300)
+                    if c:
+                        sym_tfs[tf] = c
+                if sym_tfs:
+                    all_tf_candles[sym] = sym_tfs
+            if all_tf_candles:
+                result = await gpu_client.train_mtf(all_tf_candles)
+                _log.info("GPU MTF model trained: %s", result)
+            else:
+                _log.warning("ML pre-training: no multi-TF data available — MTF skipped")
+
         _log.info("ML pre-training complete.")
     except Exception as exc:
         _log.warning("ML pre-training failed (non-fatal): %s", exc)

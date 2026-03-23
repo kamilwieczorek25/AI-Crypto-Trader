@@ -40,6 +40,10 @@ class BotRunner:
         self._ws_hub: "WebSocketHub | None" = None  # injected after import
         # ML: per-cycle RL state cache (symbol -> state vector)
         self._rl_states: dict = {}
+        # Exit RL: last-known exit state per open position (symbol -> 18-dim state)
+        self._exit_states: dict[str, list[float]] = {}
+        # Cache of last cycle's ml_signals for use in _build_exit_state()
+        self._ml_signals_cache: dict = {}
         # Dynamic sizing: recent trade streak tracking
         self._recent_results: list[bool] = []  # True=win, False=loss (last 10)
         # Kelly criterion: cached fraction from backtest results
@@ -399,6 +403,28 @@ class BotRunner:
                             # Update correlation_info with GPU-computed data
                             if gpu_corr.get("high_corr_pairs"):
                                 correlation_info["gpu_high_corr_pairs"] = gpu_corr["high_corr_pairs"]
+
+                # Cache ml_signals for next-cycle exit state building
+                self._ml_signals_cache = dict(ml_signals)
+
+                # Exit RL: for each open position, predict optimal exit action
+                if gpu_client.is_enabled():
+                    for pos in self._portfolio.all_positions():
+                        sym = pos.symbol
+                        ind_1h = symbols_data.get(sym, {}).get("indicators", {}).get("1h", {})
+                        exit_state = self._build_exit_state(pos, ind_1h, btc_anchor)
+                        self._exit_states[sym] = exit_state
+                        try:
+                            exit_pred = await gpu_client.predict_exit(exit_state)
+                        except Exception:
+                            exit_pred = None
+                        if exit_pred:
+                            if sym not in ml_signals:
+                                ml_signals[sym] = {}
+                            ml_signals[sym]["exit_rl"] = {
+                                "action":   exit_pred.get("action", "HOLD_POS"),
+                                "q_values": exit_pred.get("q_values", []),
+                            }
 
             except Exception as exc:
                 logger.warning("ML signal computation failed (non-fatal): %s", exc)
@@ -892,6 +918,11 @@ class BotRunner:
                 if trade.direction == "SELL" and trade.pnl_usdt is not None:
                     self._recent_results.append(trade.pnl_usdt > 0)
                     self._recent_results = self._recent_results[-10:]
+                    # Exit RL: submit close experience so the model learns from this outcome
+                    if trade.pnl_pct is not None:
+                        await self._submit_exit_experience(
+                            trade.symbol, trade.pnl_pct, action=3
+                        )  # action 3 = CLOSE
 
             # 12b. RL: record action & compute reward NOW (after execution)
             #      so the reward is attributed to the correct action
@@ -1176,9 +1207,151 @@ class BotRunner:
                     await self._broadcast(
                         "PORTFOLIO_UPDATE", self._portfolio.get_state().model_dump()
                     )
+                    # Exit RL: submit SL/TP close experience for offline learning
+                    if trade.pnl_pct is not None:
+                        await self._submit_exit_experience(
+                            trade.symbol, trade.pnl_pct, action=3
+                        )  # action 3 = CLOSE
 
     async def _broadcast_error(self, message: str) -> None:
         await self._broadcast("ERROR", {"message": message})
+
+    # ------------------------------------------------------------------ #
+    # Exit RL helpers
+    # ------------------------------------------------------------------ #
+
+    def _build_exit_state(self, pos, ind: dict, btc_anchor: dict) -> list[float]:
+        """Build an 18-dimensional state vector for the GPU Exit RL model.
+
+        Dimensions:
+          0  pnl_pct        — normalised to [-1, 1]  (maps ±50% → ±1)
+          1  hold_hours     — normalised 0–1 (48 h = full)
+          2  sl_dist        — price distance to stop-loss as fraction of entry (0–1)
+          3  tp_dist        — price distance to take-profit as fraction of entry (0–1)
+          4  rsi_14         — normalised 0–1
+          5  macd_hist      — soft-clamped via tanh
+          6  bb_squeeze     — 0 or 1
+          7  volume_ratio   — log-ratio, clamped 0–1
+          8  obv_trend      — normalised 0–1
+          9  vwap_dist      — soft-clamped via tanh (positive = price above VWAP)
+          10 btc_trend      — BTC 1h close return, tanh-normalised
+          11 market_regime  — 1=bull, 0.5=sideways, 0=bear
+          12 cash_ratio     — cash / portfolio total (0–1)
+          13 exposure_frac  — total altcoin exposure fraction (0–1)
+          14 n_positions    — open positions / 10, clamped 0–1
+          15 win_streak     — recent win-rate from last 10 trades (0–1)
+          16 ensemble_conf  — ML ensemble confidence cached on pos (0–1)
+          17 anomaly_score  — anomaly score cached on pos (0–1)
+        """
+        import math
+        import numpy as np
+
+        def _safe(v, default: float = 0.0) -> float:
+            try:
+                f = float(v)
+                return f if math.isfinite(f) else default
+            except Exception:
+                return default
+
+        # Position metrics
+        pnl_norm   = float(np.clip(_safe(getattr(pos, "pnl_pct", 0)) / 50.0, -1.0, 1.0))
+        hold_h     = 0.0
+        opened     = getattr(pos, "opened_at", None)
+        if opened is not None:
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc)
+            if opened.tzinfo is None:
+                opened = opened.replace(tzinfo=timezone.utc)
+            hold_h = float(np.clip((now - opened).total_seconds() / 3600.0 / 48.0, 0.0, 1.0))
+
+        ep   = _safe(getattr(pos, "entry_price", 0))
+        cur  = _safe(getattr(pos, "current_price", ep))
+        sl   = _safe(getattr(pos, "stop_loss", 0))
+        tp   = _safe(getattr(pos, "take_profit", 0))
+        sl_d = float(np.clip(abs(cur - sl) / max(ep, 1e-9), 0.0, 1.0)) if sl else 0.0
+        tp_d = float(np.clip(abs(tp - cur) / max(ep, 1e-9), 0.0, 1.0)) if tp else 0.0
+
+        # Technical indicators for this symbol
+        rsi  = float(np.clip(_safe(ind.get("rsi_14", 50)) / 100.0, 0.0, 1.0))
+        macd = float(np.tanh(_safe(ind.get("macd_hist", 0)) * 5.0))
+        bbsq = float(np.clip(_safe(ind.get("bb_squeeze", 0)), 0.0, 1.0))
+        vol  = float(np.clip(math.log1p(max(_safe(ind.get("volume_ratio", 1.0)) - 1.0, 0.0)), 0.0, 1.0))
+        obv  = float(np.clip(_safe(ind.get("obv_trend", 0)) * 0.5 + 0.5, 0.0, 1.0))
+        vwap = float(np.tanh(_safe(ind.get("vwap_dist_pct", 0)) / 3.0))
+
+        # BTC anchor context
+        btc_1h  = btc_anchor.get("1h", {}) if btc_anchor else {}
+        btc_ret = float(np.tanh(_safe(btc_1h.get("close_change_pct", 0)) / 3.0))
+
+        # Market regime (from last known regime dict)
+        regime_map = {"bull": 1.0, "sideways": 0.5, "bear": 0.0}
+        regime_str = self._last_regime.get("regime", "sideways")
+        regime_f   = regime_map.get(regime_str, 0.5)
+
+        # Portfolio context
+        total = max(_safe(self._portfolio.total_value), 1.0)
+        cash  = float(np.clip(_safe(self._portfolio.cash_usdt) / total, 0.0, 1.0))
+        exp   = float(np.clip(_safe(getattr(self._portfolio, "total_exposure_pct", 0)) / 100.0, 0.0, 1.0))
+        n_pos = float(np.clip(len(self._portfolio.all_positions()) / 10.0, 0.0, 1.0))
+        win_r = (sum(self._recent_results) / len(self._recent_results)
+                 if self._recent_results else 0.5)
+
+        # Cached ML signals (may be stale from prior cycle — acceptable)
+        prior = self._ml_signals_cache.get(pos.symbol, {}) if hasattr(self, "_ml_signals_cache") else {}
+        ens_conf  = float(np.clip(_safe(prior.get("ensemble", {}).get("confidence", 0.5)), 0.0, 1.0))
+        anom_s    = float(np.clip(_safe(prior.get("anomaly", {}).get("anomaly_score", 0.0)), 0.0, 1.0))
+
+        return [
+            pnl_norm, hold_h, sl_d, tp_d,
+            rsi, macd, bbsq, vol, obv, vwap,
+            btc_ret, regime_f,
+            cash, exp, n_pos, win_r,
+            ens_conf, anom_s,
+        ]
+
+    async def _submit_exit_experience(
+        self, symbol: str, pnl_pct: float, action: int
+    ) -> None:
+        """Send a completed position's outcome to the GPU Exit RL for offline learning.
+
+        action mapping (must match gpu-server ExitDQN):
+          0 = HOLD_POS  (not used here — only called on close)
+          1 = PARTIAL_25
+          2 = PARTIAL_50
+          3 = CLOSE
+        """
+        try:
+            from app.services import gpu_client
+            if not gpu_client.is_enabled():
+                return
+
+            entry_state = self._exit_states.get(symbol)
+            if entry_state is None:
+                return  # no exit state recorded for this position
+
+            # Terminal next-state: zero vector (position is closed)
+            next_state = [0.0] * 18
+
+            # Reward: scaled P&L (the model sees raw return signal)
+            reward = float(pnl_pct / 100.0)
+
+            experience = {
+                "state":      entry_state,
+                "action":     action,
+                "reward":     reward,
+                "next_state": next_state,
+                "done":       True,
+            }
+            result = await gpu_client.train_exit([experience])
+            if result:
+                logger.debug("Exit RL experience submitted for %s (pnl=%.2f%%): %s",
+                             symbol, pnl_pct, result)
+
+            # Clean up stale exit state
+            self._exit_states.pop(symbol, None)
+
+        except Exception as exc:
+            logger.debug("Exit RL experience submission failed (non-fatal): %s", exc)
 
     # ------------------------------------------------------------------ #
     # Pyramiding — add to winning positions

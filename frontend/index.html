@@ -4,144 +4,304 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>AI Crypto Trader</title>
-  <link rel="stylesheet" href="style.css?v=9" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css?v=20" />
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
 </head>
 <body>
+
   <!-- ── Header ── -->
   <header>
     <div class="header-left">
-      <span class="logo">⚡ AI Crypto Trader</span>
-      <span id="ws-dot" class="dot dot-red" title="WebSocket disconnected"></span>
+      <div class="logo-group">
+        <span class="logo-icon">◆</span>
+        <span class="logo-text">AI Trader</span>
+        <span class="logo-badge">PRO</span>
+      </div>
+      <div class="ws-indicator" id="ws-indicator" title="WebSocket disconnected">
+        <span id="ws-dot" class="ws-dot disconnected"></span>
+        <span id="ws-label" class="ws-label">Offline</span>
+      </div>
+    </div>
+    <div class="header-center">
+      <div class="risk-group">
+        <span class="control-label">Risk</span>
+        <div class="risk-btns">
+          <button id="risk-conservative" class="btn-risk" onclick="setRiskProfile('conservative')" title="Conservative — high conviction only, 2% max">🛡 Safe</button>
+          <button id="risk-balanced"     class="btn-risk" onclick="setRiskProfile('balanced')"     title="Balanced — default behaviour, 5% max">⚖ Balanced</button>
+          <button id="risk-aggressive"   class="btn-risk" onclick="setRiskProfile('aggressive')"   title="Aggressive — more trades, momentum focus">⚡ Aggressive</button>
+          <button id="risk-fast_profit"  class="btn-risk" onclick="setRiskProfile('fast_profit')"  title="Fast Profit — maximum aggression, 15m/1h signals">🚀 Fast</button>
+        </div>
+      </div>
+      <div class="header-sep"></div>
+      <button id="btn-less-fear" class="btn-fear" onclick="toggleLessFear()" title="Override Claude's conservative bias — auto-approve high-scoring trades">😱 Less Fear</button>
     </div>
     <div class="header-right">
-      <span class="risk-label">Risk:</span>
-      <div class="risk-btns">
-        <button id="risk-conservative" class="btn-risk" onclick="setRiskProfile('conservative')" title="Conservative — high conviction only, 2% max">🛡 Safe</button>
-        <button id="risk-balanced"     class="btn-risk" onclick="setRiskProfile('balanced')"     title="Balanced — default behaviour, 5% max">⚖ Balanced</button>
-        <button id="risk-aggressive"   class="btn-risk" onclick="setRiskProfile('aggressive')"   title="Aggressive — more trades, momentum focus">⚡ Aggressive</button>
-        <button id="risk-fast_profit"  class="btn-risk" onclick="setRiskProfile('fast_profit')"  title="Fast Profit — maximum aggression, 15m/1h signals">🚀 Fast Profit</button>
+      <div class="mode-group">
+        <span class="control-label">Mode</span>
+        <div class="mode-btns">
+          <button id="btn-demo" class="btn-mode active" onclick="setMode('demo')">DEMO</button>
+          <button id="btn-real" class="btn-mode" onclick="setMode('real')">REAL</button>
+        </div>
       </div>
-      <span style="color:var(--border)">|</span>
-      <button id="btn-less-fear" class="btn-fear" onclick="toggleLessFear()" title="Override Claude's conservative bias — auto-approve high-scoring trades">😱 Less Fear</button>
-      <span style="color:var(--border)">|</span>
-      <span>Mode:</span>
-      <button id="btn-demo" class="btn-mode active" onclick="setMode('demo')">DEMO</button>
-      <button id="btn-real" class="btn-mode" onclick="setMode('real')">REAL</button>
-      <button id="btn-start" class="btn-action btn-green" onclick="startBot()">▶ START</button>
-      <button id="btn-stop" class="btn-action btn-red" onclick="stopBot()">■ STOP</button>
-      <button id="btn-reset" class="btn-action btn-reset" onclick="resetDemo()" title="Wipe all history and reset to $10,000">↺ RESET</button>
+      <div class="action-btns">
+        <button id="btn-start" class="btn-action btn-start" onclick="startBot()">▶ Start</button>
+        <button id="btn-stop" class="btn-action btn-stop" onclick="stopBot()">■ Stop</button>
+        <button id="btn-reset" class="btn-action btn-reset" onclick="resetDemo()" title="Wipe all history and reset to $10,000">↺ Reset</button>
+      </div>
     </div>
   </header>
 
-  <!-- ── Stats Bar ── -->
-  <section class="stats-bar">
-    <div class="stat-card">
-      <div class="stat-label">Total Value</div>
-      <div id="stat-total" class="stat-value">$—</div>
-    </div>
-    <div class="stat-card">
-      <div class="stat-label">Cash (USDT)</div>
-      <div id="stat-cash" class="stat-value">$—</div>
-    </div>
-    <div class="stat-card">
-      <div class="stat-label">Positions Value</div>
-      <div id="stat-positions" class="stat-value">$—</div>
-    </div>
-    <div class="stat-card">
-      <div class="stat-label">Total P&L</div>
-      <div id="stat-pnl" class="stat-value">$—</div>
-    </div>
-    <div class="stat-card">
-      <div class="stat-label">Bot Realized P&L</div>
-      <div id="stat-bot-pnl" class="stat-value">$—</div>
-      <div id="stat-bot-record" class="stat-sub">—</div>
-    </div>
-    <div class="stat-card">
-      <div class="stat-label">Open Positions</div>
-      <div id="stat-num-pos" class="stat-value">—</div>
-    </div>
-    <div class="stat-card stat-card-status" id="stat-card-status">
-      <div class="stat-label">Bot Status</div>
-      <div id="stat-status" class="stat-value"><span class="status-dot stopped"></span> STOPPED</div>
-      <div id="stat-cycle-info" class="stat-sub">Cycles: 0</div>
-      <div id="next-cycle-bar" class="cycle-bar-wrap" style="display:none">
-        <div id="next-cycle-fill" class="cycle-bar-fill"></div>
+  <!-- ── KPI Cards ── -->
+  <section class="kpi-strip">
+    <div class="kpi-card">
+      <div class="kpi-icon kpi-icon-value">◈</div>
+      <div class="kpi-body">
+        <div class="kpi-label">Total Value</div>
+        <div id="stat-total" class="kpi-value">$—</div>
       </div>
     </div>
-    <div class="stat-card">
-      <div class="stat-label">Claude Cost (session)</div>
-      <div id="stat-credits" class="stat-value" title="Estimated API cost since last restart">$—</div>
+    <div class="kpi-card">
+      <div class="kpi-icon kpi-icon-cash">$</div>
+      <div class="kpi-body">
+        <div class="kpi-label">Cash (USDC)</div>
+        <div id="stat-cash" class="kpi-value">$—</div>
+      </div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-icon kpi-icon-pos">⬡</div>
+      <div class="kpi-body">
+        <div class="kpi-label">Positions Value</div>
+        <div id="stat-positions" class="kpi-value">$—</div>
+      </div>
+    </div>
+    <div class="kpi-card kpi-card-pnl">
+      <div class="kpi-icon kpi-icon-pnl">△</div>
+      <div class="kpi-body">
+        <div class="kpi-label">Total P&L</div>
+        <div id="stat-pnl" class="kpi-value">$—</div>
+      </div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-icon kpi-icon-bot">⚙</div>
+      <div class="kpi-body">
+        <div class="kpi-label">Bot Realized P&L</div>
+        <div id="stat-bot-pnl" class="kpi-value">$—</div>
+        <div id="stat-bot-record" class="kpi-sub">—</div>
+      </div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-icon kpi-icon-open">◎</div>
+      <div class="kpi-body">
+        <div class="kpi-label">Open Positions</div>
+        <div id="stat-num-pos" class="kpi-value">—</div>
+      </div>
+    </div>
+    <div class="kpi-card kpi-card-status" id="stat-card-status">
+      <div class="kpi-icon kpi-icon-status">●</div>
+      <div class="kpi-body">
+        <div class="kpi-label">Bot Status</div>
+        <div id="stat-status" class="kpi-value"><span class="status-dot stopped"></span> STOPPED</div>
+        <div id="stat-cycle-info" class="kpi-sub">Cycles: 0</div>
+        <div id="next-cycle-bar" class="cycle-bar-wrap" style="display:none">
+          <div id="next-cycle-fill" class="cycle-bar-fill"></div>
+        </div>
+      </div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-icon kpi-icon-cost">✦</div>
+      <div class="kpi-body">
+        <div class="kpi-label">Claude Cost</div>
+        <div id="stat-credits" class="kpi-value" title="Estimated API cost since last restart">$—</div>
+      </div>
     </div>
   </section>
 
-  <!-- ── Market Info Bar ── -->
-  <section class="stats-bar stats-bar-secondary" id="market-bar">
-    <div class="stat-card">
-      <div class="stat-label">Market Regime</div>
-      <div id="stat-regime" class="stat-value">—</div>
+  <!-- ── Metrics Strip ── -->
+  <section class="metrics-strip">
+    <div class="metric-pill">
+      <span class="metric-label">Regime</span>
+      <span id="stat-regime" class="metric-value">—</span>
     </div>
-    <div class="stat-card">
-      <div class="stat-label">Risk Profile</div>
-      <div id="stat-risk-profile" class="stat-value">—</div>
+    <div class="metric-pill">
+      <span class="metric-label">Risk Profile</span>
+      <span id="stat-risk-profile" class="metric-value">—</span>
     </div>
-    <div class="stat-card">
-      <div class="stat-label">Max Drawdown</div>
-      <div id="stat-drawdown" class="stat-value">—</div>
+    <div class="metric-pill">
+      <span class="metric-label">Win Rate</span>
+      <span id="stat-win-rate" class="metric-value">—</span>
     </div>
-    <div class="stat-card">
-      <div class="stat-label">Sharpe Ratio</div>
-      <div id="stat-sharpe" class="stat-value">—</div>
+    <div class="metric-pill">
+      <span class="metric-label">Max Drawdown</span>
+      <span id="stat-drawdown" class="metric-value">—</span>
     </div>
-    <div class="stat-card">
-      <div class="stat-label">Model Mix</div>
-      <div id="stat-model-mix" class="stat-value" title="Sonnet (powerful) vs Haiku (cheap) calls">—</div>
+    <div class="metric-pill">
+      <span class="metric-label">Sharpe</span>
+      <span id="stat-sharpe" class="metric-value">—</span>
     </div>
-    <div class="stat-card">
-      <div class="stat-label">Cache Hit%</div>
-      <div id="stat-cache-hit" class="stat-value" title="Prompt cache hit rate (saves ~90% input cost)">—</div>
+    <div class="metric-pill">
+      <span class="metric-label">Streaks</span>
+      <span id="stat-streak" class="metric-value">—</span>
     </div>
-    <div class="stat-card">
-      <div class="stat-label">Skipped</div>
-      <div id="stat-skipped" class="stat-value" title="Cycles skipped (no Claude call needed)">—</div>
+    <div class="metric-pill">
+      <span class="metric-label">Fees Paid</span>
+      <span id="stat-fees" class="metric-value">—</span>
     </div>
-    <div class="stat-card" id="stat-card-gpu">
-      <div class="stat-label">GPU Server</div>
-      <div id="stat-gpu-status" class="stat-value"><span class="status-dot stopped"></span> OFF</div>
-      <div id="stat-gpu-info" class="stat-sub">Not configured</div>
+    <div class="metric-pill">
+      <span class="metric-label">Model Mix</span>
+      <span id="stat-model-mix" class="metric-value" title="Haiku (cheap) vs Sonnet (powerful)">—</span>
+    </div>
+    <div class="metric-pill">
+      <span class="metric-label">Cache</span>
+      <span id="stat-cache-hit" class="metric-value" title="Prompt cache hit rate">—</span>
+    </div>
+    <div class="metric-pill">
+      <span class="metric-label">Skipped</span>
+      <span id="stat-skipped" class="metric-value" title="Cycles with no Claude call">—</span>
+    </div>
+    <div class="metric-pill metric-pill-gpu" id="stat-card-gpu">
+      <span class="metric-label">GPU</span>
+      <span id="stat-gpu-status" class="metric-value"><span class="status-dot stopped"></span> OFF</span>
+      <span id="stat-gpu-info" class="metric-sub">—</span>
     </div>
   </section>
 
   <main>
-    <!-- ── Positions Table ── -->
-    <section class="card">
-      <h2>Open Positions</h2>
-      <div class="table-wrap">
-        <table id="tbl-positions">
-          <thead>
-            <tr>
-              <th>Symbol</th>
-              <th>Quantity</th>
-              <th>Avg Entry</th>
-              <th>Current Price</th>
-              <th>Value (USDT)</th>
-              <th>P&L (USDT)</th>
-              <th>P&L %</th>
-              <th>Stop Loss</th>
-              <th>Take Profit</th>
-              <th>Source</th>
-            </tr>
-          </thead>
-          <tbody id="positions-body">
-            <tr><td colspan="10" class="empty-msg">No open positions</td></tr>
-          </tbody>
-        </table>
-      </div>
-    </section>
+    <!-- ── Row 1: Positions + Claude Decision ── -->
+    <div class="grid-2-1">
+      <!-- Left: Positions -->
+      <section class="card">
+        <div class="card-header">
+          <h2>Open Positions</h2>
+          <span id="positions-count" class="card-badge">0</span>
+        </div>
+        <div class="table-wrap">
+          <table id="tbl-positions">
+            <thead>
+              <tr>
+                <th>Symbol</th>
+                <th>Qty</th>
+                <th>Entry</th>
+                <th>Current</th>
+                <th>Value</th>
+                <th>P&L</th>
+                <th>P&L %</th>
+                <th>SL</th>
+                <th>TP</th>
+                <th>Hold</th>
+                <th>Source</th>
+              </tr>
+            </thead>
+            <tbody id="positions-body">
+              <tr><td colspan="11" class="empty-msg">No open positions</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
 
-    <!-- ── Binance Account ── -->
+      <!-- Right: Claude Decision -->
+      <section class="card card-decision" id="decision-card">
+        <div class="card-header">
+          <h2>Claude's Last Decision</h2>
+        </div>
+        <div id="decision-content" class="decision-empty">Waiting for first decision…</div>
+      </section>
+    </div>
+
+    <!-- ── Row 2: Charts + Decision Feed ── -->
+    <div class="grid-2-1">
+      <!-- Left: Price Charts -->
+      <section class="card">
+        <div class="card-header">
+          <h2>Price Chart</h2>
+          <div class="chart-selectors">
+            <select id="chart-symbol" onchange="loadChart()">
+              <option value="">— symbol —</option>
+            </select>
+            <div class="tf-btns">
+              <button class="btn-tf active" onclick="selectTf(this,'15m')">15m</button>
+              <button class="btn-tf" onclick="selectTf(this,'1h')">1h</button>
+              <button class="btn-tf" onclick="selectTf(this,'4h')">4h</button>
+              <button class="btn-tf" onclick="selectTf(this,'1d')">1d</button>
+            </div>
+          </div>
+        </div>
+        <div class="chart-container" style="height:240px">
+          <canvas id="price-chart"></canvas>
+        </div>
+        <div class="chart-indicators">
+          <div class="chart-container chart-small">
+            <canvas id="rsi-chart"></canvas>
+          </div>
+          <div class="chart-container chart-small">
+            <canvas id="macd-chart"></canvas>
+          </div>
+        </div>
+      </section>
+
+      <!-- Right: Decision Feed -->
+      <section class="card">
+        <div class="card-header">
+          <h2>AI Decision Feed</h2>
+        </div>
+        <div id="decision-feed" class="decision-feed">
+          <div class="empty-msg">Waiting for decisions…</div>
+        </div>
+      </section>
+    </div>
+
+    <!-- ── Row 3: Portfolio Growth + Allocation ── -->
+    <div class="grid-1-1">
+      <section class="card">
+        <div class="card-header">
+          <h2>Portfolio Growth</h2>
+        </div>
+        <div class="chart-container" style="height:220px">
+          <canvas id="growth-chart"></canvas>
+        </div>
+      </section>
+      <section class="card">
+        <div class="card-header">
+          <h2>Allocation</h2>
+        </div>
+        <div class="alloc-content">
+          <div class="donut-wrap">
+            <canvas id="alloc-chart"></canvas>
+          </div>
+          <div id="alloc-legend" class="alloc-legend"></div>
+        </div>
+      </section>
+    </div>
+
+    <!-- ── Row 4: Trade P&L + GPU Models ── -->
+    <div class="grid-2-1">
+      <section class="card">
+        <div class="card-header">
+          <h2>Trade P&L History</h2>
+          <div id="analytics-stats" class="analytics-stats"></div>
+        </div>
+        <div class="chart-container" style="height:180px">
+          <canvas id="pnl-chart"></canvas>
+        </div>
+      </section>
+
+      <!-- GPU Models Panel -->
+      <section class="card card-gpu" id="gpu-models-card">
+        <div class="card-header">
+          <h2>GPU Models</h2>
+          <span id="gpu-models-count" class="card-badge">0/10</span>
+        </div>
+        <div id="gpu-models-grid" class="gpu-models-grid">
+          <div class="empty-msg">Checking GPU server…</div>
+        </div>
+      </section>
+    </div>
+
+    <!-- ── Row 5: Binance Account ── -->
     <section class="card" id="exchange-card">
-      <div class="section-header">
+      <div class="card-header">
         <h2>Binance Account</h2>
         <button class="btn-sm" onclick="loadExchangeAccount()" title="Refresh from Binance">↻ Sync</button>
       </div>
@@ -157,84 +317,23 @@
               <th>Locked</th>
               <th>Price (USDT)</th>
               <th>Value (USDT)</th>
-              <th>Managed By</th>
+              <th>Managed</th>
             </tr>
           </thead>
           <tbody id="exchange-body">
-            <tr><td colspan="8" class="empty-msg">Loading exchange data…</td></tr>
+            <tr><td colspan="8" class="empty-msg">Loading…</td></tr>
           </tbody>
         </table>
       </div>
     </section>
 
-    <!-- ── Portfolio Overview ── -->
-    <div class="two-col-grid">
-      <section class="card">
-        <h2>Portfolio Growth</h2>
-        <div class="chart-container" style="height:200px">
-          <canvas id="growth-chart"></canvas>
-        </div>
-      </section>
-      <section class="card">
-        <h2>Allocation</h2>
-        <div class="donut-wrap">
-          <canvas id="alloc-chart"></canvas>
-        </div>
-        <div id="alloc-legend" class="alloc-legend"></div>
-      </section>
-    </div>
-
-    <!-- ── Claude's Last Decision ── -->
-    <section class="card" id="decision-card">
-      <h2>Claude's Last Decision</h2>
-      <div id="decision-content" class="decision-empty">Waiting for first decision...</div>
-    </section>
-
-    <!-- ── Trade P&L History ── -->
+    <!-- ── Row 6: Trade History ── -->
     <section class="card">
-      <div class="section-header">
-        <h2>Trade P&L History</h2>
-        <div id="analytics-stats" class="analytics-stats"></div>
-      </div>
-      <div class="chart-container" style="height:160px">
-        <canvas id="pnl-chart"></canvas>
-      </div>
-    </section>
-
-    <!-- ── Price Chart ── -->
-    <section class="card">
-      <div class="chart-controls">
-        <h2>Price Chart</h2>
-        <div class="chart-selectors">
-          <select id="chart-symbol" onchange="loadChart()">
-            <option value="">— select symbol —</option>
-          </select>
-          <div class="tf-btns">
-            <button class="btn-tf active" onclick="selectTf(this,'15m')">15m</button>
-            <button class="btn-tf" onclick="selectTf(this,'1h')">1h</button>
-            <button class="btn-tf" onclick="selectTf(this,'4h')">4h</button>
-            <button class="btn-tf" onclick="selectTf(this,'1d')">1d</button>
-          </div>
-        </div>
-      </div>
-      <div class="chart-container">
-        <canvas id="price-chart"></canvas>
-      </div>
-      <div class="chart-container chart-small">
-        <canvas id="rsi-chart"></canvas>
-      </div>
-      <div class="chart-container chart-small">
-        <canvas id="macd-chart"></canvas>
-      </div>
-    </section>
-
-    <!-- ── Trade History ── -->
-    <section class="card">
-      <div class="section-header">
+      <div class="card-header">
         <h2>Trade History</h2>
-        <div>
-          <button class="btn-sm" onclick="loadTrades(-1)" id="btn-prev">◀</button>
-          <span id="page-info">Page 1</span>
+        <div class="pagination">
+          <button class="btn-sm" onclick="loadTrades(-1)" id="btn-prev" disabled>◀</button>
+          <span id="page-info" class="page-info">Page 1</span>
           <button class="btn-sm" onclick="loadTrades(1)" id="btn-next">▶</button>
         </div>
       </div>
@@ -246,9 +345,9 @@
               <th>Symbol</th>
               <th>Direction</th>
               <th>Mode</th>
-              <th>Quantity</th>
+              <th>Qty</th>
               <th>Price</th>
-              <th>P&L (USDT)</th>
+              <th>P&L</th>
               <th>P&L %</th>
             </tr>
           </thead>
@@ -258,21 +357,19 @@
         </table>
       </div>
     </section>
-
-    <!-- ── AI Decision Feed ── -->
-    <section class="card">
-      <h2>AI Decision Feed</h2>
-      <div id="decision-feed" class="decision-feed">
-        <div class="empty-msg">Waiting for decisions…</div>
-      </div>
-    </section>
   </main>
 
   <footer>
-    <span id="footer-msg">Connecting...</span>
-    <span id="next-cycle"></span>
+    <div class="footer-left">
+      <span id="footer-msg">Connecting…</span>
+    </div>
+    <div class="footer-right">
+      <span id="next-cycle"></span>
+      <span class="footer-sep">·</span>
+      <span id="footer-time"></span>
+    </div>
   </footer>
 
-  <script src="app.js?v=9"></script>
+  <script src="app.js?v=20"></script>
 </body>
 </html>
