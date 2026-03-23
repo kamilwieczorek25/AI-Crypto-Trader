@@ -394,9 +394,13 @@ def _extract_attention_weights(model: TransformerPredictor, tensor: torch.Tensor
             # Get attention weights from multi-head attention
             x_norm = layer.norm1(x)
             attn_out, weights = layer.self_attn(
-                x_norm, x_norm, x_norm, need_weights=True, average_attn_heads=True
+                x_norm, x_norm, x_norm, need_weights=True,
             )
-            attn_weights.append(weights.cpu().numpy()[0])  # (seq_len, seq_len)
+            # weights: (batch, n_heads, seq, seq) or (batch, seq, seq) depending on version
+            w_np = weights.cpu().numpy()[0]
+            if w_np.ndim == 3:
+                w_np = w_np.mean(axis=0)  # average across heads → (seq, seq)
+            attn_weights.append(w_np)
             # Continue forward pass
             x = x + layer.dropout1(attn_out)
             x = x + layer._ff_block(layer.norm2(x))
