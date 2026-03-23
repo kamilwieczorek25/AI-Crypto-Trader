@@ -88,8 +88,8 @@ Run `gpu-server/server.py` on any machine (GPU optional — falls back to CPU) t
 ## Quick Start — Docker (recommended)
 
 ```bash
-git clone https://github.com/your-username/AI_Trader-1.git
-cd AI_Trader-1
+git clone https://github.com/kamilwieczorek25/AI-Crypto-Trader.git
+cd AI-Crypto-Trader
 
 cp .env.example .env
 ```
@@ -121,8 +121,8 @@ The bot auto-starts on server startup. The dashboard shows live portfolio stats,
 Requires **Python 3.10+**.
 
 ```bash
-git clone https://github.com/your-username/AI_Trader-1.git
-cd AI_Trader-1
+git clone https://github.com/kamilwieczorek25/AI-Crypto-Trader.git
+cd AI-Crypto-Trader
 
 cp .env.example .env
 # Edit .env — add ANTHROPIC_API_KEY at minimum
@@ -145,8 +145,8 @@ Re-running `bash run-local.sh` kills any previous instance and restarts cleanly.
 Requires Docker already installed.
 
 ```bash
-git clone https://github.com/your-username/AI_Trader-1.git ~/AI_Trader-1
-cd ~/AI_Trader-1
+git clone https://github.com/kamilwieczorek25/AI-Crypto-Trader.git ~/AI-Crypto-Trader
+cd ~/AI-Crypto-Trader
 
 cp .env.example .env
 nano .env   # add ANTHROPIC_API_KEY at minimum
