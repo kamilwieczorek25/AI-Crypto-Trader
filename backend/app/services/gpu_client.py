@@ -141,3 +141,32 @@ async def predict_ensemble(
     except Exception as e:
         logger.warning("GPU ensemble predict failed: %s", e)
         return None
+
+
+async def monte_carlo(
+    candles: list,
+    entry_price: float,
+    stop_loss_pct: float,
+    take_profit_pct: float,
+    hours_ahead: int = 24,
+    simulations: int = 10000,
+) -> dict | None:
+    """GPU Monte Carlo simulation for SL/TP probability estimation."""
+    c = _get_client()
+    if c is None:
+        return None
+    try:
+        payload = {
+            "candles": candles,
+            "entry_price": entry_price,
+            "stop_loss_pct": stop_loss_pct,
+            "take_profit_pct": take_profit_pct,
+            "hours_ahead": hours_ahead,
+            "simulations": simulations,
+        }
+        r = await c.post("/simulate/montecarlo", json=payload)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        logger.warning("GPU Monte Carlo failed: %s", e)
+        return None

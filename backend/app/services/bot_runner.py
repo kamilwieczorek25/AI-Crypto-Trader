@@ -411,6 +411,44 @@ class BotRunner:
                 market_intel=market_intel,
             )
 
+            # 4e. Refine BUY candidates with GPU Monte Carlo simulation
+            try:
+                from app.services import gpu_client as _gpu
+                _gpu_available = _gpu.is_enabled()
+            except Exception:
+                _gpu_available = False
+            if quant_candidates and _gpu_available:
+                from app.services.quant_scorer import refine_with_monte_carlo
+
+                async def _mc_refine(cand):
+                    if cand.action != "BUY":
+                        return cand
+                    candles_1h = all_ohlcv.get(cand.symbol, {}).get("1h", [])
+                    levels = {
+                        "sl_pct": cand.stop_loss_pct,
+                        "tp_pct": cand.take_profit_pct,
+                        "rr_ratio": cand.reward_risk_ratio,
+                        "quantity_pct": cand.quantity_pct,
+                        "atr_pct": 0,
+                    }
+                    refined = await refine_with_monte_carlo(levels, candles_1h, cand.entry_price)
+                    cand.stop_loss_pct = refined["sl_pct"]
+                    cand.take_profit_pct = refined["tp_pct"]
+                    cand.reward_risk_ratio = refined["rr_ratio"]
+                    cand.stop_loss_price = round(cand.entry_price * (1 - refined["sl_pct"] / 100), 6)
+                    cand.take_profit_price = round(cand.entry_price * (1 + refined["tp_pct"] / 100), 6)
+                    if "mc_edge" in refined:
+                        cand.signals["mc_edge"] = refined["mc_edge"]
+                        cand.signals["mc_tp_prob"] = refined.get("mc_tp_prob", 0)
+                        cand.signals["mc_sl_prob"] = refined.get("mc_sl_prob", 0)
+                    return cand
+
+                mc_results = await asyncio.gather(
+                    *[_mc_refine(c) for c in quant_candidates],
+                    return_exceptions=True,
+                )
+                quant_candidates = [r for r in mc_results if not isinstance(r, Exception)]
+
             # 5a. No candidates → HOLD (no Claude call, saves API cost)
             if not quant_candidates:
                 logger.info("Quant scorer: 0 candidates — HOLD cycle (no Claude call)")

@@ -519,11 +519,13 @@ async def auth_middleware(request, call_next):
 
 
 @app.on_event("startup")
-def startup():
+async def startup():
     _load_models()
     _load_rl()
     _load_sentiment_model()
     _init_sentiment_anchors()
+    # Start continuous background training loop
+    asyncio.create_task(_background_training_loop())
 
 
 @app.get("/health")
@@ -542,6 +544,9 @@ def health():
         "lstm_trained": lstm_trained,
         "rl_trained": rl_trained,
         "sentiment_loaded": _sentiment_model is not None,
+        "bg_training_active": _bg_training_active,
+        "bg_training_cycles": _bg_epoch_count,
+        "stored_symbols": len(_stored_candles),
     }
 
 
@@ -550,6 +555,8 @@ def health():
 async def train_lstm(req: TrainLSTMRequest):
     """Trains BOTH the Transformer (primary) and LSTM (ensemble member)."""
     global transformer_model, transformer_trained, lstm_model, lstm_trained
+    # Store candles for continuous background retraining
+    _stored_candles.update(req.candles)
 
     def _train():
         global transformer_model, transformer_trained, lstm_model, lstm_trained
@@ -692,6 +699,7 @@ def predict_lstm(req: PredictLSTMRequest):
 @app.post("/train/rl")
 async def train_rl(req: TrainRLRequest):
     global rl_policy, rl_target, rl_buffer, rl_trained
+    _stored_candles.update(req.candles)
 
     def _train():
         global rl_policy, rl_target, rl_buffer, rl_trained
@@ -809,7 +817,134 @@ def sentiment(req: SentimentRequest):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 4. ENSEMBLE ENDPOINT — combines ALL models for highest-confidence signals
+# 5. CONTINUOUS BACKGROUND TRAINING — keeps the GPU warm
+#    Between bot cycles the GPU sits idle. This loop continuously retrains
+#    on stored candle data with data augmentation (noise, time shifts),
+#    improving model generalisation and keeping the GPU busy.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_stored_candles: dict[str, list] = {}   # cached training data from last /train call
+_bg_training_active = False
+_bg_epoch_count = 0
+
+
+def _augment_features(X_batch: torch.Tensor) -> torch.Tensor:
+    """Add slight noise + time-warp for training diversity on GPU."""
+    noise = torch.randn_like(X_batch) * 0.02
+    # Random magnitude scaling per sample: 0.95 – 1.05
+    scale = 0.95 + torch.rand(X_batch.size(0), 1, 1, device=X_batch.device) * 0.10
+    return (X_batch + noise) * scale
+
+
+async def _background_training_loop():
+    """Runs forever in background — retrains Transformer + DQN on augmented data."""
+    global _bg_training_active, _bg_epoch_count
+    global transformer_model, transformer_trained, rl_policy, rl_target, rl_trained
+
+    _bg_training_active = True
+    logger.info("Background training loop started")
+
+    while True:
+        await asyncio.sleep(60)  # wait between cycles
+
+        if not _stored_candles or len(_stored_candles) < 2:
+            continue
+
+        try:
+            # --- Rebuild dataset from stored candles ---
+            X_all, y_all = [], []
+            for sym, candles in _stored_candles.items():
+                feat = build_features(candles)
+                if feat is None:
+                    continue
+                labels = build_labels(candles)
+                n = len(feat) - SEQ_LEN - LOOKAHEAD
+                for i in range(max(n, 0)):
+                    X_all.append(feat[i: i + SEQ_LEN])
+                    y_all.append(int(labels[i + SEQ_LEN - 1]))
+
+            if len(X_all) < 128:
+                continue
+
+            X = torch.tensor(np.array(X_all), dtype=torch.float32)
+            y = torch.tensor(y_all, dtype=torch.long)
+
+            def _bg_train():
+                global transformer_model, transformer_trained, _bg_epoch_count
+                global rl_policy, rl_target, rl_trained
+
+                loader = DataLoader(TensorDataset(X, y), batch_size=64, shuffle=True, drop_last=True)
+                counts = torch.bincount(y, minlength=N_CLASSES).float()
+                weights = (counts.sum() / (N_CLASSES * counts.clamp(min=1))).to(DEVICE)
+
+                # --- Transformer fine-tune with augmentation (10 epochs) ---
+                if transformer_model is not None:
+                    trf = transformer_model
+                    trf.train()
+                    opt = optim.AdamW(trf.parameters(), lr=1e-4, weight_decay=1e-3)
+                    crit = nn.CrossEntropyLoss(weight=weights, label_smoothing=0.05)
+                    for _ in range(10):
+                        for xb, yb in loader:
+                            xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+                            xb = _augment_features(xb)  # data augmentation
+                            opt.zero_grad()
+                            loss = crit(trf(xb), yb)
+                            loss.backward()
+                            nn.utils.clip_grad_norm_(trf.parameters(), 1.0)
+                            opt.step()
+                    trf.eval()
+                    torch.save(trf.state_dict(), DATA_DIR / "transformer_model.pt")
+
+                # --- RL continued training from replay buffer ---
+                if rl_policy is not None and rl_buffer is not None and len(rl_buffer) >= 128:
+                    policy = rl_policy
+                    target = rl_target
+                    opt = optim.Adam(policy.parameters(), lr=1e-5)
+                    policy.train()
+                    for step in range(200):
+                        beta = min(1.0, 0.4 + step * 0.003)
+                        s, a, r, s2, d, w, idx = rl_buffer.sample(64, beta=beta)
+                        s, a, r, s2, d, w = (t.to(DEVICE) for t in [s, a, r, s2, d, w])
+                        q = policy(s).gather(1, a.unsqueeze(1)).squeeze()
+                        with torch.no_grad():
+                            next_a = policy(s2).argmax(1)
+                            q_next = target(s2).gather(1, next_a.unsqueeze(1)).squeeze()
+                            q_targ = r + 0.99 * q_next * (1 - d)
+                        td = (q - q_targ).detach().cpu().numpy()
+                        rl_buffer.update_priorities(idx, td)
+                        loss = (w.to(DEVICE) * F.smooth_l1_loss(q, q_targ, reduction='none')).mean()
+                        opt.zero_grad()
+                        loss.backward()
+                        nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
+                        opt.step()
+                        if step % 50 == 0:
+                            target.load_state_dict(policy.state_dict())
+                    policy.eval()
+                    torch.save({"policy": policy.state_dict(), "target": target.state_dict()},
+                               DATA_DIR / "rl_agent.pt")
+
+                _bg_epoch_count += 1
+                logger.info("Background training cycle #%d complete (%d samples)", _bg_epoch_count, len(X_all))
+
+            await asyncio.to_thread(_bg_train)
+
+        except Exception as e:
+            logger.warning("Background training error (non-fatal): %s", e)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 6. MONTE CARLO PRICE SIMULATION — GPU-parallel risk estimation
+#    Runs thousands of price paths simultaneously on GPU to estimate
+#    probability of hitting stop-loss vs take-profit.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class MonteCarloRequest(BaseModel):
+    candles: list           # recent OHLCV for volatility estimation
+    entry_price: float
+    stop_loss_pct: float    # e.g. 3.0 for -3%
+    take_profit_pct: float  # e.g. 6.0 for +6%
+    hours_ahead: int = 24
+    simulations: int = 10000
 #    Transformer + LSTM + RL + Sentiment → single recommendation
 #    Agreement across diverse models = much higher conviction
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -895,6 +1030,65 @@ def predict_ensemble(req: EnsembleRequest):
     result["agreement_score"] = round(agreement, 2)
 
     return result
+
+
+# ── Monte Carlo simulation endpoint ──────────────────────────────────────────
+@app.post("/simulate/montecarlo")
+def monte_carlo(req: MonteCarloRequest):
+    """GPU-parallel Monte Carlo: estimate SL/TP hit probabilities."""
+    closes = np.array([c[4] for c in req.candles], dtype=np.float64)
+    if len(closes) < 20:
+        return {"error": "Need at least 20 candles"}
+
+    # Estimate hourly return distribution from recent data
+    returns = np.diff(np.log(closes))
+    mu = float(returns.mean())
+    sigma = float(returns.std())
+    if sigma < 1e-10:
+        sigma = 0.001
+
+    # Run simulations on GPU
+    def _simulate():
+        n_steps = req.hours_ahead
+        n_sims = req.simulations
+        sl_level = req.entry_price * (1 - req.stop_loss_pct / 100)
+        tp_level = req.entry_price * (1 + req.take_profit_pct / 100)
+
+        # Generate all random walks on GPU at once
+        rand = torch.randn(n_sims, n_steps, device=DEVICE) * sigma + mu
+        log_prices = torch.cumsum(rand, dim=1)
+        prices = req.entry_price * torch.exp(log_prices)
+
+        # Check SL/TP hits
+        hit_sl = (prices <= sl_level).any(dim=1)
+        hit_tp = (prices >= tp_level).any(dim=1)
+
+        # First-hit analysis: which gets hit first?
+        sl_first_step = torch.where(prices <= sl_level, torch.arange(n_steps, device=DEVICE).unsqueeze(0).expand_as(prices), torch.tensor(n_steps + 1, device=DEVICE)).min(dim=1).values
+        tp_first_step = torch.where(prices >= tp_level, torch.arange(n_steps, device=DEVICE).unsqueeze(0).expand_as(prices), torch.tensor(n_steps + 1, device=DEVICE)).min(dim=1).values
+
+        tp_wins = (tp_first_step < sl_first_step).sum().item()
+        sl_wins = (sl_first_step < tp_first_step).sum().item()
+        neither = n_sims - tp_wins - sl_wins
+
+        final_prices = prices[:, -1]
+        expected_return = ((final_prices / req.entry_price) - 1).mean().item() * 100
+        max_drawdown = ((prices.min(dim=1).values / req.entry_price) - 1).mean().item() * 100
+
+        return {
+            "simulations": n_sims,
+            "hours_ahead": n_steps,
+            "tp_probability": round(tp_wins / n_sims * 100, 1),
+            "sl_probability": round(sl_wins / n_sims * 100, 1),
+            "neutral_probability": round(neither / n_sims * 100, 1),
+            "expected_return_pct": round(expected_return, 3),
+            "avg_max_drawdown_pct": round(max_drawdown, 3),
+            "reward_risk_ratio": round((tp_wins / max(sl_wins, 1)), 2),
+            "edge": round((tp_wins * req.take_profit_pct - sl_wins * req.stop_loss_pct) / n_sims, 3),
+            "volatility_hourly": round(sigma * 100, 4),
+        }
+
+    return _simulate()
 
 
 if __name__ == "__main__":

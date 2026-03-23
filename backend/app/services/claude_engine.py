@@ -511,7 +511,14 @@ def build_validation_prompt(
             lines.append(f"  SL: ${c.stop_loss_price:.6f} (-{c.stop_loss_pct:.1f}%)")
             lines.append(f"  TP: ${c.take_profit_price:.6f} (+{c.take_profit_pct:.1f}%)")
             lines.append(f"  Size: {c.quantity_pct:.1f}% of portfolio")
-        lines.append(f"  Signals: {', '.join(c.signals)}")
+            # Monte Carlo risk simulation (when available)
+            if "mc_edge" in c.signals:
+                lines.append(
+                    f"  MC Sim: TP prob={c.signals['mc_tp_prob']:.1f}% "
+                    f"SL prob={c.signals['mc_sl_prob']:.1f}% "
+                    f"edge={c.signals['mc_edge']:.3f}"
+                )
+        lines.append(f"  Signals: {', '.join(k for k in c.signals if not k.startswith('mc_'))}")
 
         # Top factor scores
         top_factors = sorted(

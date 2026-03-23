@@ -579,6 +579,48 @@ def compute_trade_levels(
     }
 
 
+async def refine_with_monte_carlo(
+    sl_tp: dict,
+    candles_1h: list,
+    price: float,
+) -> dict:
+    """Refine SL/TP levels using GPU Monte Carlo simulation.
+
+    Returns the original dict enriched with MC probability estimates,
+    or the original dict unchanged if GPU is unavailable.
+    """
+    from app.services import gpu_client
+
+    if not gpu_client.is_enabled() or not candles_1h or price <= 0:
+        return sl_tp
+
+    mc = await gpu_client.monte_carlo(
+        candles=candles_1h,
+        entry_price=price,
+        stop_loss_pct=sl_tp["sl_pct"],
+        take_profit_pct=sl_tp["tp_pct"],
+        hours_ahead=48,
+        simulations=10000,
+    )
+    if not mc or "error" in mc:
+        return sl_tp
+
+    sl_tp["mc_tp_prob"] = mc.get("tp_probability", 0)
+    sl_tp["mc_sl_prob"] = mc.get("sl_probability", 0)
+    sl_tp["mc_edge"] = mc.get("edge", 0)
+    sl_tp["mc_rr"] = mc.get("reward_risk_ratio", 0)
+
+    # If MC shows negative edge, tighten TP or widen SL
+    edge = mc.get("edge", 0)
+    if edge < -0.5 and sl_tp["tp_pct"] > sl_tp["sl_pct"] * 1.5:
+        # Reduce TP to improve hit probability
+        sl_tp["tp_pct"] = round(sl_tp["sl_pct"] * settings.MIN_REWARD_RISK_RATIO, 2)
+        sl_tp["rr_ratio"] = round(sl_tp["tp_pct"] / sl_tp["sl_pct"], 2)
+        sl_tp["mc_adjusted"] = True
+
+    return sl_tp
+
+
 # ── Main entry point: rank & build candidates ───────────────────────────────
 
 def rank_symbols(
