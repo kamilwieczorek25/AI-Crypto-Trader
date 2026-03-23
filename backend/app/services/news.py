@@ -1,7 +1,9 @@
-"""News sentiment service — CryptoCompare free API + keyword scoring."""
+"""News sentiment service — CryptoCompare free API + CryptoPanic burst detection."""
 
 import logging
 import re
+import time
+from collections import defaultdict, deque
 from typing import Any
 
 import httpx
@@ -11,6 +13,7 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 _BASE_URL = "https://min-api.cryptocompare.com/data/v2/news/"
+_CRYPTOPANIC_URL = "https://cryptopanic.com/api/free/v1/posts/"
 
 # Positive / negative keyword lists for fast sentiment scoring
 _POSITIVE = {
@@ -71,6 +74,109 @@ def _matches_symbol(coin: str, categories: str, title: str) -> bool:
 # In-memory sentiment history for time-series tracking
 _sentiment_history: dict[str, list[tuple[float, float]]] = {}  # symbol -> [(timestamp, sentiment)]
 _MAX_HISTORY = 100  # per symbol
+
+# CryptoPanic article timestamp buffer: symbol -> deque of article publish timestamps
+# Used to detect "news burst" = N+ articles in a rolling 30-min window
+_cp_article_buffer: dict[str, deque] = defaultdict(lambda: deque(maxlen=50))
+_cp_cache_ts: float = 0.0          # when CryptoPanic was last fetched
+_CP_CACHE_TTL = 120.0              # seconds between CryptoPanic fetches
+_CP_BURST_WINDOW = 1800.0          # 30 minutes
+_CP_BURST_THRESHOLD = 3            # 3 articles in 30 min = burst event
+
+
+async def fetch_cryptopanic_news(symbols: list[str]) -> dict[str, Any]:
+    """Fetch latest posts from CryptoPanic free public API.
+
+    CryptoPanic aggregates news + social posts with coin tagging.  The free
+    tier (no API key required) provides recent posts with currency metadata.
+
+    Updates the internal `_cp_article_buffer` per symbol and returns a burst
+    dict: {symbol: {"burst": bool, "count_30m": int, "articles": [str]}}.
+    """
+    global _cp_cache_ts
+
+    now = time.time()
+    # Rate-limit: only re-fetch if cache is stale
+    if now - _cp_cache_ts < _CP_CACHE_TTL:
+        return _detect_news_burst(symbols)
+
+    coin_map: dict[str, str] = {sym.split("/")[0].lower(): sym for sym in symbols}
+
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(8.0, connect=4.0)) as client:
+            resp = await client.get(
+                _CRYPTOPANIC_URL,
+                params={
+                    "auth_token": "anonymous",  # free public endpoint
+                    "public": "true",
+                    "kind": "news",
+                    "filter": "hot",
+                    "regions": "en",
+                },
+            )
+            if resp.status_code != 200:
+                logger.debug("CryptoPanic returned %d — skipping", resp.status_code)
+                return _detect_news_burst(symbols)
+
+            data = resp.json()
+            posts = data.get("results", [])
+
+    except Exception as exc:
+        logger.debug("CryptoPanic fetch failed (non-fatal): %s", exc)
+        return _detect_news_burst(symbols)
+
+    _cp_cache_ts = now
+
+    for post in posts:
+        # Extract publish timestamp (ISO 8601 e.g. "2024-03-21T14:30:00Z")
+        published_at_str = post.get("published_at", "")
+        try:
+            import datetime as _dt
+            pub_ts = _dt.datetime.fromisoformat(
+                published_at_str.replace("Z", "+00:00")
+            ).timestamp()
+        except Exception:
+            pub_ts = now  # fallback: treat as just published
+
+        title = post.get("title", "")
+
+        # Match post to symbols via CryptoPanic currency tags
+        currencies = post.get("currencies") or []
+        tagged_codes = {c.get("code", "").lower() for c in currencies}
+
+        for coin_lower, sym in coin_map.items():
+            matched = (
+                coin_lower in tagged_codes
+                or coin_lower.upper() in title.upper()
+            )
+            if matched:
+                _cp_article_buffer[sym].append((pub_ts, title[:100]))
+
+    return _detect_news_burst(symbols)
+
+
+def _detect_news_burst(symbols: list[str]) -> dict[str, Any]:
+    """Check each symbol's article buffer for bursts within the rolling window."""
+    now = time.time()
+    cutoff = now - _CP_BURST_WINDOW
+    result: dict[str, Any] = {}
+
+    for sym in symbols:
+        buf = _cp_article_buffer.get(sym, deque())
+        recent = [(ts, t) for ts, t in buf if ts >= cutoff]
+        count = len(recent)
+        burst = count >= _CP_BURST_THRESHOLD
+        result[sym] = {
+            "burst":      burst,
+            "count_30m":  count,
+            "articles":   [t for _, t in recent[-5:]],  # last 5 titles
+        }
+        if burst:
+            logger.info(
+                "News burst detected: %s — %d articles in 30min", sym, count
+            )
+
+    return result
 
 
 async def fetch_news_sentiment(symbols: list[str]) -> dict[str, Any]:
@@ -155,7 +261,7 @@ async def fetch_news_sentiment(symbols: list[str]) -> dict[str, Any]:
                     entry["headlines"].append(title[:120])
 
     # Compute aggregates
-    now = time.time()
+    now_ts = time.time()
     for sym in symbols:
         sents = sym_sentiments[sym]
         if sents:
@@ -166,7 +272,7 @@ async def fetch_news_sentiment(symbols: list[str]) -> dict[str, Any]:
             # Update time-series history
             if sym not in _sentiment_history:
                 _sentiment_history[sym] = []
-            _sentiment_history[sym].append((now, result[sym]["avg_sentiment"]))
+            _sentiment_history[sym].append((now_ts, result[sym]["avg_sentiment"]))
             if len(_sentiment_history[sym]) > _MAX_HISTORY:
                 _sentiment_history[sym] = _sentiment_history[sym][-_MAX_HISTORY:]
 
@@ -177,5 +283,24 @@ async def fetch_news_sentiment(symbols: list[str]) -> dict[str, Any]:
             ma = sum(recent) / len(recent)
             current = history[-1][1]
             result[sym]["sentiment_trend"] = round(current - ma, 3)
+
+    # ── CryptoPanic news burst enrichment ─────────────────────────────────────
+    # Run in background (non-blocking) — merges burst data into result dict
+    try:
+        import asyncio as _aio
+        burst_data = await _aio.wait_for(
+            fetch_cryptopanic_news(symbols), timeout=6.0
+        )
+        for sym in symbols:
+            bd = burst_data.get(sym, {})
+            result[sym]["news_burst"]    = bd.get("burst", False)
+            result[sym]["news_count_30m"] = bd.get("count_30m", 0)
+            result[sym]["burst_articles"] = bd.get("articles", [])
+    except Exception as exc:
+        logger.debug("CryptoPanic enrichment failed (non-fatal): %s", exc)
+        for sym in symbols:
+            result[sym].setdefault("news_burst", False)
+            result[sym].setdefault("news_count_30m", 0)
+            result[sym].setdefault("burst_articles", [])
 
     return result

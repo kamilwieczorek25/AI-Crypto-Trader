@@ -63,6 +63,13 @@ class BotRunner:
         self._banned_symbols: set[str] = set()
         # Low-funds notification: only send Discord alert once
         self._low_funds_notified: bool = False
+        # Express lane: symbols currently in a hot-candidate mini-cycle
+        self._express_tasks: set[str] = set()
+        # Per-symbol beta vs BTC: {symbol: {"beta": float, "correlation": float}}
+        # Computed from 1h OHLCV each cycle and passed to quant scorer
+        self._beta_data: dict[str, dict] = {}
+        # Last market_intel snapshot (for express lane access)
+        self._last_market_intel: dict = {}
 
     # ------------------------------------------------------------------ #
     # Control
@@ -144,6 +151,33 @@ class BotRunner:
                         raise
                     except Exception as exc:
                         logger.warning("Price tick error (non-fatal): %s", exc)
+
+                    # ── Express lane: hot-candidate mini-cycle ──────────────
+                    # If the fast scanner detects a score > 75 candidate that
+                    # we're not holding and don't already have an express task
+                    # for, spawn a lightweight focused analysis immediately —
+                    # without waiting for the full 5-min cycle to expire.
+                    try:
+                        held_now = {p.symbol for p in self._portfolio.all_positions()}
+                        for hc in fast_scanner.hot_candidates:
+                            if (
+                                hc.score >= 75
+                                and hc.symbol not in held_now
+                                and hc.symbol not in self._express_tasks
+                                and hc.symbol not in self._banned_symbols
+                                and self._portfolio.cash_usdt >= 10.0
+                            ):
+                                self._express_tasks.add(hc.symbol)
+                                asyncio.create_task(
+                                    self._express_cycle(hc.symbol, hc.score),
+                                    name=f"express_{hc.symbol}",
+                                )
+                                logger.info(
+                                    "Express lane triggered for %s (scanner_score=%.0f)",
+                                    hc.symbol, hc.score,
+                                )
+                    except Exception as exc:
+                        logger.debug("Express lane check failed (non-fatal): %s", exc)
 
     # ------------------------------------------------------------------ #
     # Single cycle
@@ -474,13 +508,29 @@ class BotRunner:
             except Exception as exc:
                 logger.warning("RAG query failed (non-fatal): %s", exc)
 
-            # 4d. Fetch additional market intelligence (funding, L/S, fear/greed)
+            # 4d. Fetch additional market intelligence (funding, L/S, fear/greed,
+            #     BTC dominance, short squeeze setups)
             market_intel: dict = {}
             try:
                 from app.services.market_intel import fetch_market_intelligence
                 market_intel = await fetch_market_intelligence(symbols)
+                self._last_market_intel = market_intel  # cache for express lane
             except Exception as exc:
                 logger.warning("Market intel fetch failed (non-fatal): %s", exc)
+
+            # 4d2. Compute per-symbol beta vs BTC from 1h OHLCV
+            # Beta scoring needs BTC closes alongside alt closes — use already-fetched data
+            try:
+                from app.services.technical import compute_beta_vs_btc
+                btc_1h = btc_ohlcv.get("1h", [])
+                if btc_1h:
+                    self._beta_data = {}
+                    for sym in symbols:
+                        alt_1h = all_ohlcv.get(sym, {}).get("1h", [])
+                        if len(alt_1h) >= 10:
+                            self._beta_data[sym] = compute_beta_vs_btc(alt_1h, btc_1h)
+            except Exception as exc:
+                logger.debug("Beta computation failed (non-fatal): %s", exc)
 
             # ── Low-funds guard: skip trading if cash below minimum trade size ──
             min_trade_usdt = 6.0  # Binance minimum notional
@@ -528,6 +578,7 @@ class BotRunner:
                 market_intel=market_intel,
                 momentum_ranks=self._momentum_ranks or None,
                 sector_heat=self._sector_heat or None,
+                beta_data=self._beta_data or None,
             )
 
             # 4e. Refine BUY candidates with GPU Monte Carlo simulation
@@ -1509,6 +1560,244 @@ class BotRunner:
         )
 
     # ------------------------------------------------------------------ #
+    # Express lane — hot-candidate single-symbol mini-cycle
+    # ------------------------------------------------------------------ #
+    async def _express_cycle(self, symbol: str, scanner_score: float) -> None:
+        """Run a focused, single-symbol analysis when the fast scanner fires score > 75.
+
+        This bypasses the full 5-min universe scan and goes straight to:
+        1. Fetch fresh 1h OHLCV for just this symbol
+        2. Re-score with all available signals
+        3. If still above threshold → direct Haiku validation → execute
+
+        The express lane is intentionally lightweight — it only confirms or
+        rejects a hot candidate; it does NOT replace the full cycle.
+        """
+        try:
+            logger.info(
+                "Express cycle: %s (scanner_score=%.0f) — starting focused analysis",
+                symbol, scanner_score,
+            )
+
+            # Guard: don't trade if circuit breaker is active or cash is low
+            if self._circuit_breaker_tripped or self._portfolio.cash_usdt < 10.0:
+                return
+
+            # Guard: don't open duplicate positions
+            if any(p.symbol == symbol for p in self._portfolio.all_positions()):
+                logger.debug("Express lane: %s already held — skipping", symbol)
+                return
+
+            # 1. Fetch fresh OHLCV for this symbol + BTC anchor
+            try:
+                sym_ohlcv = await self._market.get_multi_timeframe_ohlcv(symbol)
+                btc_sym = f"BTC/{settings.QUOTE_CURRENCY}"
+                btc_ohlcv = await self._market.get_multi_timeframe_ohlcv(btc_sym)
+            except Exception as exc:
+                logger.warning("Express lane: OHLCV fetch failed for %s: %s", symbol, exc)
+                return
+
+            # 2. Build indicators
+            from app.services.technical import compute_indicators, detect_support_resistance, compute_beta_vs_btc
+            indicators = {tf: compute_indicators(c) for tf, c in sym_ohlcv.items()}
+            price = indicators.get("1h", {}).get("close", 0)
+            if not price:
+                return
+
+            sr_candles = sym_ohlcv.get("4h", sym_ohlcv.get("1h", []))
+            sr_levels = detect_support_resistance(sr_candles)
+            symbol_data = {
+                "price":              price,
+                "indicators":         indicators,
+                "orderbook":          {},
+                "support_resistance": sr_levels,
+            }
+
+            # 3. BTC anchor
+            btc_anchor: dict = {}
+            for tf in ("1h", "4h"):
+                c = btc_ohlcv.get(tf, [])
+                if c:
+                    btc_anchor[tf] = compute_indicators(c)
+
+            # 4. Beta vs BTC
+            beta_info: dict = {}
+            try:
+                alt_1h = sym_ohlcv.get("1h", [])
+                btc_1h = btc_ohlcv.get("1h", [])
+                if alt_1h and btc_1h:
+                    beta_info = {symbol: compute_beta_vs_btc(alt_1h, btc_1h)}
+            except Exception:
+                pass
+
+            # 5. Score with all available cached context
+            from app.services.quant_scorer import score_symbol, compute_trade_levels
+            intel = self._last_market_intel
+            squeeze_map = intel.get("squeeze", {})
+            btc_dominance = intel.get("btc_dominance", {})
+            regime = self._last_regime.get("regime", "unknown")
+
+            result = score_symbol(
+                symbol, symbol_data,
+                news_data={},              # no news for express
+                btc_anchor=btc_anchor,
+                funding_data=intel.get("funding", {}).get(symbol),
+                ls_data=intel.get("long_short", {}).get(symbol),
+                oi_data=intel.get("open_interest", {}).get(symbol),
+                momentum_ranks=self._momentum_ranks or None,
+                sector_heat=self._sector_heat or None,
+                squeeze_data=squeeze_map,
+                beta_data=beta_info,
+                btc_dominance=btc_dominance,
+                market_regime=regime,
+            )
+
+            express_score = result["score"]
+            direction = result["direction"]
+
+            logger.info(
+                "Express lane: %s re-scored %.0f (direction=%+d, was %.0f from scanner)",
+                symbol, express_score, direction, scanner_score,
+            )
+
+            # 6. Only proceed if re-scored high enough
+            if direction <= 0 or express_score < 70:
+                logger.info(
+                    "Express lane: %s score %.0f below 70 or bearish — aborting",
+                    symbol, express_score,
+                )
+                return
+
+            # 7. Compute trade levels
+            levels = compute_trade_levels(symbol, symbol_data, "BUY", express_score)
+            if levels is None:
+                return
+
+            # 8. Quick validation via Haiku (express = direct validation, no full prompt)
+            from app.services.quant_scorer import TradeCandidate
+            candidate = TradeCandidate(
+                symbol=symbol,
+                action="BUY",
+                score=express_score,
+                timeframe="1h",
+                entry_price=price,
+                stop_loss_price=round(price * (1 - levels["sl_pct"] / 100), 6),
+                take_profit_price=round(price * (1 + levels["tp_pct"] / 100), 6),
+                stop_loss_pct=levels["sl_pct"],
+                take_profit_pct=levels["tp_pct"],
+                reward_risk_ratio=levels["rr_ratio"],
+                quantity_pct=levels["quantity_pct"],
+                signals=result["signals"],
+                factor_scores=result["factors"],
+            )
+
+            portfolio_state = self._portfolio.get_state()
+            prompt = claude_engine.build_validation_prompt(
+                candidates=[candidate],
+                portfolio=portfolio_state.model_dump(),
+                news={},
+                market_regime=self._last_regime,
+                btc_anchor=btc_anchor,
+                correlation_info={},
+                market_intel=intel,
+            )
+            # Prepend express context so Claude knows this is a hot fast-scanner signal
+            prompt = (
+                f"[EXPRESS LANE] Fast scanner score={scanner_score:.0f}, "
+                f"re-scored={express_score:.0f}. Evaluate quickly.\n\n{prompt}"
+            )
+
+            try:
+                decision, _ = await claude_engine.call_claude(
+                    prompt, use_haiku=True, validation_mode=True
+                )
+            except Exception as exc:
+                logger.warning("Express lane: Claude validation failed: %s", exc)
+                return
+
+            if decision.action != "BUY" or decision.symbol != symbol:
+                logger.info("Express lane: Claude rejected %s — aborting", symbol)
+                return
+
+            # Override with quant levels (same as main cycle)
+            decision.stop_loss_pct  = candidate.stop_loss_pct
+            decision.take_profit_pct = candidate.take_profit_pct
+            decision.quantity_pct   = min(decision.quantity_pct, candidate.quantity_pct)
+            decision.confidence     = candidate.score / 100.0
+
+            # Cooldown guard
+            if symbol in self._sl_cooldown:
+                from datetime import datetime, timezone
+                if datetime.now(timezone.utc) < self._sl_cooldown[symbol]:
+                    logger.info("Express lane: %s in cooldown — aborting", symbol)
+                    return
+
+            # 9. Execute
+            async with AsyncSessionLocal() as db:
+                from app.models.decision import ClaudeDecision
+                import json
+                db_decision = ClaudeDecision(
+                    raw_prompt=prompt[:10_000],
+                    raw_response="[express_lane]",
+                    action=decision.action,
+                    symbol=decision.symbol,
+                    timeframe="1h",
+                    quantity_pct=decision.quantity_pct,
+                    stop_loss_pct=decision.stop_loss_pct,
+                    take_profit_pct=decision.take_profit_pct,
+                    confidence=decision.confidence,
+                    primary_signals=json.dumps(decision.primary_signals),
+                    risk_factors=json.dumps(decision.risk_factors),
+                    reasoning=f"[EXPRESS LANE] scanner={scanner_score:.0f} quant={express_score:.0f}. "
+                               + decision.reasoning,
+                    risk_profile=settings.RISK_PROFILE,
+                    executed=False,
+                )
+                db.add(db_decision)
+                await db.commit()
+                await db.refresh(db_decision)
+
+                try:
+                    trade = await self._executor.execute(db, decision, db_decision.id)
+                except Exception as exec_err:
+                    err_msg = str(exec_err).lower()
+                    if "not permitted" in err_msg or "not allowed" in err_msg:
+                        self._banned_symbols.add(symbol)
+                    logger.warning("Express lane execute failed for %s: %s", symbol, exec_err)
+                    return
+
+                if trade:
+                    db_decision.executed = True
+                    db.add(db_decision)
+                    await db.commit()
+                    logger.info(
+                        "Express lane EXECUTED: BUY %s @ $%.6f (qty=%.6f)",
+                        symbol, trade.price, trade.quantity,
+                    )
+                    await self._broadcast("TRADE_EXECUTED", {
+                        "id": trade.id, "symbol": trade.symbol,
+                        "direction": trade.direction, "mode": trade.mode,
+                        "quantity": trade.quantity, "price": trade.price,
+                        "pnl_usdt": trade.pnl_usdt, "pnl_pct": trade.pnl_pct,
+                        "trigger": "express_lane",
+                    })
+                    await send_trade_notification(
+                        action="BUY", symbol=trade.symbol, price=trade.price,
+                        quantity=trade.quantity, pnl_usdt=None, pnl_pct=None,
+                        confidence=decision.confidence,
+                        reasoning=f"[EXPRESS LANE] {decision.reasoning}",
+                    )
+                    await self._portfolio.take_snapshot(db)
+                    await self._broadcast("PORTFOLIO_UPDATE", self._portfolio.get_state().model_dump())
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Express lane failed for %s (non-fatal): %s", symbol, exc)
+        finally:
+            self._express_tasks.discard(symbol)
+
+    # ------------------------------------------------------------------ #
     # Auto-backtest integration
     # ------------------------------------------------------------------ #
     async def _run_startup_backtest(self) -> None:
@@ -1532,6 +1821,17 @@ class BotRunner:
                 "sharpe_ratio": result.sharpe_ratio,
                 "tuning_applied": applied,
             })
+            # Analyse factor predictiveness and nudge live weights
+            try:
+                from app.services.backtester import analyse_factor_predictiveness
+                factor_analysis = analyse_factor_predictiveness(result)
+                if factor_analysis.get("weights_nudged"):
+                    logger.info(
+                        "Live weights nudged — top predictors: %s",
+                        [f["factor"] for f in factor_analysis.get("top_predictors", [])[:3]],
+                    )
+            except Exception as exc:
+                logger.warning("Factor analysis failed (non-fatal): %s", exc)
 
         # Schedule periodic re-runs
         if settings.BACKTEST_INTERVAL_HOURS > 0:

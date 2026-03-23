@@ -6,6 +6,8 @@ Provides:
 3. Binance funding rates (Binance public API)     — derivatives positioning
 4. Binance long/short ratio (Binance public API)  — crowd positioning
 5. Open interest       (Binance Futures API)      — OI trend for conviction
+6. BTC dominance       (CoinGecko global API)    — altseason detection
+7. Short squeeze setup (funding + OI + price)    — per-symbol squeeze potential
 """
 
 import logging
@@ -345,7 +347,157 @@ async def fetch_open_interest(symbols: list[str]) -> dict[str, dict[str, Any]]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 6. Aggregated market intelligence (single call)
+# 6. BTC Dominance / Altseason signal  (CoinGecko /global — free, no key)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def fetch_btc_dominance() -> dict[str, Any]:
+    """Fetch BTC market dominance from CoinGecko global endpoint.
+
+    BTC dominance falling = capital rotating into alts (altseason)
+    BTC dominance rising  = capital fleeing into BTC (risk-off)
+
+    Returns:
+        {
+            "btc_dominance":  42.5,       # percentage 0-100
+            "trend":          "falling",  # "rising" | "falling" | "flat"
+            "altseason":      True,       # dominance < 45% and falling
+            "signal":         "altseason" # "altseason" | "btc_dominance" | "neutral"
+        }
+    """
+    cached = _get_cached("btc_dominance")
+    if cached is not None:
+        return cached
+
+    default = {
+        "btc_dominance": 50.0,
+        "trend": "flat",
+        "altseason": False,
+        "signal": "neutral",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            resp = await client.get("https://api.coingecko.com/api/v3/global")
+            resp.raise_for_status()
+            data = resp.json().get("data", {})
+
+        market_cap_pct = data.get("market_cap_percentage", {})
+        btc_dom = float(market_cap_pct.get("btc", 50.0))
+
+        # Simple trend: compare against cached prior reading
+        prior = _get_cached("btc_dominance_prior")
+        if prior is not None:
+            delta = btc_dom - prior.get("btc_dominance", btc_dom)
+            trend = "rising" if delta > 0.5 else ("falling" if delta < -0.5 else "flat")
+        else:
+            trend = "flat"
+        _set_cached("btc_dominance_prior", {"btc_dominance": btc_dom}, ttl_seconds=3600)
+
+        altseason = btc_dom < 45.0 and trend in ("falling", "flat")
+
+        if btc_dom < 40.0:
+            signal = "altseason"      # strong altseason conditions
+        elif btc_dom < 45.0 and trend == "falling":
+            signal = "altseason"      # developing altseason
+        elif btc_dom > 58.0:
+            signal = "btc_dominance"  # BTC dominance — alts may lag
+        elif btc_dom > 52.0 and trend == "rising":
+            signal = "btc_dominance"  # BTC taking market share
+        else:
+            signal = "neutral"
+
+        result = {
+            "btc_dominance": round(btc_dom, 2),
+            "eth_dominance": round(float(market_cap_pct.get("eth", 0)), 2),
+            "trend": trend,
+            "altseason": altseason,
+            "signal": signal,
+        }
+        _set_cached("btc_dominance", result, ttl_seconds=900)  # 15 min cache
+        return result
+
+    except Exception as exc:
+        logger.warning("BTC dominance fetch failed: %s", exc)
+        return default
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 7. Short Squeeze Detector  (derived from existing funding + OI + price data)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def detect_squeeze_setups(
+    funding: dict[str, dict],
+    open_interest: dict[str, dict],
+    symbols_data: dict[str, Any] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Detect potential short squeeze setups per symbol.
+
+    A short squeeze requires:
+    1. Negative funding rate (shorts paying longs → heavy short crowd)
+    2. Rising OI (short positions being added, not closed)
+    3. Rising price (pressure building against shorts)
+
+    When all three align, the squeeze potential is high — forced short
+    covering can produce explosive upside moves.
+
+    Returns {symbol: {"squeeze_score": 0-1, "signal": str, "reasons": [str]}}
+    """
+    results: dict[str, dict] = {}
+
+    for sym in set(list(funding.keys()) + list(open_interest.keys())):
+        f = funding.get(sym, {})
+        oi = open_interest.get(sym, {})
+
+        reasons: list[str] = []
+        score = 0.0
+
+        # Component 1: Negative funding (shorts paying longs)
+        rate = f.get("rate", 0)
+        if rate < -0.0005:   # < -0.05%
+            score += 0.35
+            reasons.append(f"neg_funding({rate*100:.4f}%)")
+        elif rate < -0.0001:
+            score += 0.15
+            reasons.append(f"mild_neg_funding({rate*100:.4f}%)")
+
+        # Component 2: Rising OI (shorts accumulating, not fleeing)
+        oi_change = oi.get("change_pct", 0)
+        if oi_change > 5:
+            score += 0.35
+            reasons.append(f"oi_rising(+{oi_change:.1f}%)")
+        elif oi_change > 2:
+            score += 0.15
+            reasons.append(f"oi_mild_rising(+{oi_change:.1f}%)")
+
+        # Component 3: Price rising against shorts (price_trend from OI endpoint)
+        price_trend = oi.get("price_trend", 0)
+        if price_trend > 0:
+            score += 0.30
+            reasons.append("price_rising_vs_shorts")
+        elif price_trend == 0 and oi_change > 3:
+            # Flat price with rising OI = coiling spring
+            score += 0.15
+            reasons.append("coiling_spring")
+
+        if score >= 0.65:
+            signal = "high_squeeze_potential"
+        elif score >= 0.40:
+            signal = "moderate_squeeze_potential"
+        elif score > 0:
+            signal = "low_squeeze_potential"
+        else:
+            signal = "no_squeeze"
+
+        results[sym] = {
+            "squeeze_score": round(score, 3),
+            "signal": signal,
+            "reasons": reasons,
+        }
+
+    return results
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 8. Aggregated market intelligence (single call)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def fetch_market_intelligence(
@@ -355,42 +507,55 @@ async def fetch_market_intelligence(
 
     Returns:
     {
-        "fear_greed": {...},
-        "trending": [...],
-        "funding": {symbol: {...}},
-        "long_short": {symbol: {...}},
+        "fear_greed":    {...},
+        "trending":      [...],
+        "funding":       {symbol: {...}},
+        "long_short":    {symbol: {...}},
+        "open_interest": {symbol: {...}},
+        "btc_dominance": {...},
+        "squeeze":       {symbol: {...}},   # derived, no extra API call
     }
     """
     import asyncio
 
-    # Fire all requests concurrently
-    fg_task = asyncio.create_task(fetch_fear_greed())
+    # Fire all requests concurrently (including new BTC dominance call)
+    fg_task       = asyncio.create_task(fetch_fear_greed())
     trending_task = asyncio.create_task(fetch_trending_coins())
-    funding_task = asyncio.create_task(fetch_funding_rates(symbols))
-    ls_task = asyncio.create_task(fetch_long_short_ratios(symbols))
-    oi_task = asyncio.create_task(fetch_open_interest(symbols))
+    funding_task  = asyncio.create_task(fetch_funding_rates(symbols))
+    ls_task       = asyncio.create_task(fetch_long_short_ratios(symbols))
+    oi_task       = asyncio.create_task(fetch_open_interest(symbols))
+    btcd_task     = asyncio.create_task(fetch_btc_dominance())
 
     # Wait for all (each has its own error handling)
-    fear_greed, trending, funding, long_short, open_interest = await asyncio.gather(
-        fg_task, trending_task, funding_task, ls_task, oi_task,
+    fear_greed, trending, funding, long_short, open_interest, btc_dominance = (
+        await asyncio.gather(fg_task, trending_task, funding_task, ls_task, oi_task, btcd_task)
     )
 
+    # Derive squeeze setups from already-fetched funding + OI data (no extra API call)
+    squeeze = detect_squeeze_setups(funding, open_interest)
+
     # Log summary
-    trending_syms = [t["symbol"] for t in trending[:5]]
+    trending_syms   = [t["symbol"] for t in trending[:5]]
     extreme_funding = [s for s, d in funding.items() if d.get("extreme")]
-    oi_rising = [s for s, d in open_interest.items() if d.get("change_pct", 0) > 5]
+    oi_rising       = [s for s, d in open_interest.items() if d.get("change_pct", 0) > 5]
+    squeeze_hot     = [s for s, d in squeeze.items() if d.get("signal") == "high_squeeze_potential"]
     logger.info(
-        "Market intel: FG=%d(%s) trending=%s extreme_funding=%s oi_rising=%s",
+        "Market intel: FG=%d(%s) BTC.D=%.1f%%(%s) trending=%s extreme_funding=%s "
+        "oi_rising=%s squeeze=%s",
         fear_greed.get("value", 0), fear_greed.get("label", "?"),
+        btc_dominance.get("btc_dominance", 0), btc_dominance.get("signal", "?"),
         ",".join(trending_syms) or "none",
         ",".join(extreme_funding) or "none",
         ",".join(oi_rising) or "none",
+        ",".join(squeeze_hot) or "none",
     )
 
     return {
-        "fear_greed": fear_greed,
-        "trending": trending,
-        "funding": funding,
-        "long_short": long_short,
+        "fear_greed":    fear_greed,
+        "trending":      trending,
+        "funding":       funding,
+        "long_short":    long_short,
         "open_interest": open_interest,
+        "btc_dominance": btc_dominance,
+        "squeeze":       squeeze,
     }

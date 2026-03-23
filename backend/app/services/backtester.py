@@ -754,11 +754,16 @@ def _compute_results(
                 "trades": 0, "win_rate": 0, "avg_pnl": 0, "total_pnl_usdt": 0,
             }
 
-    # Factor analysis
+    # Factor analysis — all 26 signals tracked
     factor_keys = [
-        "rsi_signal", "macd_signal", "bb_signal", "volume_signal",
+        "rsi_signal", "macd_signal", "macd_div_signal", "bb_signal",
+        "bb_squeeze_signal", "volume_signal", "vol_zscore_signal",
         "obv_signal", "vwap_signal", "trend_signal", "sr_signal",
-        "btc_signal", "ml_signal", "orderbook_signal",
+        "breakout_signal", "momentum_accel_signal", "btc_signal",
+        "ml_signal", "orderbook_signal", "depth_signal", "whale_signal",
+        "funding_signal", "ls_ratio_signal", "oi_signal",
+        "gpu_momentum_signal", "sector_rotation_signal",
+        "squeeze_signal", "beta_signal", "news_burst_signal",
     ]
     factor_win: dict[str, list[float]] = {k: [] for k in factor_keys}
     factor_loss: dict[str, list[float]] = {k: [] for k in factor_keys}
@@ -816,6 +821,71 @@ def _compute_results(
         cycles_with_candidates=cycles_with_candidates,
         cycles_skipped=cycles_skipped,
     )
+
+
+# ── Factor predictiveness analysis ──────────────────────────────────────────
+
+def analyse_factor_predictiveness(result: "BacktestResult") -> dict:
+    """Analyse which factors best predict trade profitability.
+
+    Computes, for every factor tracked in BacktestTrade.factor_scores:
+    - win_avg    : mean value in winning trades
+    - loss_avg   : mean value in losing trades
+    - predictive_delta : win_avg - loss_avg (positive = bullish factor works)
+    - recommended_nudge: ±nudge_step to apply to quant_scorer weights
+
+    Also calls `quant_scorer.nudge_weights_from_backtest()` to update the
+    live weights so subsequent cycles immediately benefit.
+
+    Returns a summary dict with factor-level analysis.
+    """
+    from app.services.quant_scorer import nudge_weights_from_backtest
+
+    if not result.trades:
+        return {"status": "no_trades", "deltas": {}}
+
+    # Collect ALL factor keys present in any trade
+    all_keys: set[str] = set()
+    for t in result.trades:
+        all_keys.update(t.factor_scores.keys())
+
+    winners = [t for t in result.trades if t.pnl_pct > 0]
+    losers  = [t for t in result.trades if t.pnl_pct <= 0]
+
+    def _avg(trades: list, key: str) -> float:
+        vals = [t.factor_scores[key] for t in trades if key in t.factor_scores]
+        return sum(vals) / len(vals) if vals else 0.0
+
+    factor_win_avg  = {k: _avg(winners, k) for k in all_keys}
+    factor_loss_avg = {k: _avg(losers,  k) for k in all_keys}
+
+    predictive_deltas = {
+        k: round(factor_win_avg[k] - factor_loss_avg[k], 4)
+        for k in all_keys
+    }
+
+    # Sort by absolute predictive power
+    ranked = sorted(predictive_deltas.items(), key=lambda x: abs(x[1]), reverse=True)
+
+    # Apply live weight nudging
+    nudge_weights_from_backtest(factor_win_avg, factor_loss_avg, nudge_step=0.005)
+
+    logger.info(
+        "Factor predictiveness (top 5): %s",
+        ", ".join(f"{k}={v:+.4f}" for k, v in ranked[:5]),
+    )
+
+    return {
+        "status":             "ok",
+        "total_trades":       len(result.trades),
+        "winning_trades":     len(winners),
+        "losing_trades":      len(losers),
+        "factor_win_avg":     {k: round(v, 4) for k, v in factor_win_avg.items()},
+        "factor_loss_avg":    {k: round(v, 4) for k, v in factor_loss_avg.items()},
+        "predictive_deltas":  predictive_deltas,
+        "top_predictors":     [{"factor": k, "delta": v} for k, v in ranked[:10]],
+        "weights_nudged":     True,
+    }
 
 
 # ── Report printer ───────────────────────────────────────────────────────────

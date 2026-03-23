@@ -5,13 +5,21 @@ Computes ATR-based stop-loss/take-profit levels with enforced minimum
 reward-to-risk ratio. Produces structured trade candidates for Claude
 to validate (not originate).
 
-New factors added:
-- breakout_signal      : price breaking above N-period high (strong momentum)
-- vol_zscore_signal    : statistically unusual volume for THIS symbol
-- macd_div_signal      : swing-based MACD divergence
-- momentum_accel_signal: 2nd derivative of price (is momentum accelerating?)
-- gpu_momentum_signal  : cross-sectional rank across 100+ symbols (GPU)
+Factor set (26 total):
+- breakout_signal       : price breaking above N-period high (strong momentum)
+- vol_zscore_signal     : statistically unusual volume for THIS symbol
+- macd_div_signal       : swing-based MACD divergence
+- momentum_accel_signal : 2nd derivative of price (is momentum accelerating?)
+- gpu_momentum_signal   : cross-sectional rank across 100+ symbols (GPU)
 - sector_rotation_signal: sector-hot bonus from GPU clustering
+- squeeze_signal        : short squeeze potential (neg funding + rising OI + rising price)
+- beta_signal           : high-beta alts preferred when altseason detected
+- news_burst_signal     : CryptoPanic catalyst velocity (N articles in 30min)
+
+Runtime features:
+- Regime-adaptive weight overrides (trending/ranging/choppy)
+- Backtest-driven live weight nudging (±0.005 per factor per run)
+- Session-aware threshold adjustment (Asian/US/dead-zone)
 """
 
 import logging
@@ -24,34 +32,112 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-# ── Scoring weights (sum to 1.0) ─────────────────────────────────────────────
-# Weights reduced slightly on existing factors to make room for four new ones.
+# ── Base scoring weights (sum to 1.0, 26 factors) ────────────────────────────
+# Existing factors trimmed slightly to make room for 3 new ones:
+#   squeeze_signal (+0.03), beta_signal (+0.02), news_burst_signal (+0.03)
+# Reductions: obv -0.01, vwap -0.01, depth -0.01, orderbook -0.01,
+#             oi -0.01, ls_ratio -0.01, momentum_accel -0.01, sr -0.01
 _WEIGHTS: dict[str, float] = {
-    "rsi_signal":           0.06,   # RSI oversold/overbought
-    "macd_signal":          0.05,   # MACD histogram direction + magnitude
-    "macd_div_signal":      0.04,   # MACD divergence (new)
-    "bb_signal":            0.04,   # Bollinger Band position
-    "bb_squeeze_signal":    0.04,   # Bollinger squeeze (breakout detector)
-    "volume_signal":        0.05,   # Volume ratio (activity)
-    "vol_zscore_signal":    0.05,   # Volume Z-score — statistically unusual (new)
-    "obv_signal":           0.03,   # On-Balance Volume trend
-    "vwap_signal":          0.02,   # Price vs VWAP
-    "trend_signal":         0.05,   # Multi-timeframe trend alignment
-    "sr_signal":            0.03,   # Support/resistance proximity
-    "breakout_signal":      0.06,   # N-period high/low breakout (new)
-    "momentum_accel_signal":0.04,   # Momentum acceleration 2nd derivative (new)
-    "btc_signal":           0.05,   # BTC anchor trend (critical for alts)
-    "ml_signal":            0.08,   # LSTM + RL + GPU ensemble + MTF + anomaly
-    "orderbook_signal":     0.02,   # Bid/ask pressure ratio
-    "depth_signal":         0.03,   # Orderbook depth imbalance within 2%
-    "whale_signal":         0.05,   # Whale trade flow (WebSocket real-time)
-    "funding_signal":       0.04,   # Binance funding rate (contrarian)
-    "ls_ratio_signal":      0.04,   # Long/short ratio (contrarian)
-    "oi_signal":            0.04,   # Open interest trend
-    "gpu_momentum_signal":  0.04,   # Cross-sectional GPU momentum rank (new)
-    "sector_rotation_signal":0.05,  # Sector rotation hot-bonus (new)
+    "rsi_signal":            0.06,   # RSI oversold/overbought
+    "macd_signal":           0.05,   # MACD histogram direction + magnitude
+    "macd_div_signal":       0.04,   # Swing-based MACD divergence
+    "bb_signal":             0.04,   # Bollinger Band position
+    "bb_squeeze_signal":     0.04,   # Bollinger squeeze (volatility contraction)
+    "volume_signal":         0.05,   # Volume ratio (activity vs average)
+    "vol_zscore_signal":     0.05,   # Volume Z-score — statistically unusual
+    "obv_signal":            0.02,   # On-Balance Volume trend
+    "vwap_signal":           0.01,   # Price vs VWAP
+    "trend_signal":          0.05,   # Multi-timeframe trend alignment
+    "sr_signal":             0.02,   # Support/resistance proximity
+    "breakout_signal":       0.06,   # N-period high/low breakout
+    "momentum_accel_signal": 0.03,   # Momentum acceleration 2nd derivative
+    "btc_signal":            0.05,   # BTC anchor trend (critical for alts)
+    "ml_signal":             0.08,   # LSTM + RL + GPU ensemble + MTF + anomaly
+    "orderbook_signal":      0.01,   # Bid/ask pressure ratio
+    "depth_signal":          0.02,   # Orderbook depth imbalance within 2%
+    "whale_signal":          0.05,   # Whale trade flow (WebSocket real-time)
+    "funding_signal":        0.04,   # Binance funding rate (contrarian)
+    "ls_ratio_signal":       0.03,   # Long/short ratio (contrarian)
+    "oi_signal":             0.03,   # Open interest trend
+    "gpu_momentum_signal":   0.04,   # Cross-sectional GPU momentum rank
+    "sector_rotation_signal":0.05,   # Sector rotation hot-bonus (GPU clusters)
+    "squeeze_signal":        0.03,   # Short squeeze potential (new)
+    "beta_signal":           0.02,   # Altcoin beta vs BTC (new)
+    "news_burst_signal":     0.03,   # CryptoPanic catalyst velocity (new)
 }
-# Verify: sum(_WEIGHTS.values()) == 1.00
+# Verify: sum(_WEIGHTS.values()) == 1.00  →  checked via test below
+
+# ── Live weights (start as copy of _WEIGHTS; nudged by backtest analysis) ─────
+# These are what `score_symbol` actually uses at runtime.
+_live_weights: dict[str, float] = dict(_WEIGHTS)
+
+# ── Regime-adaptive weight multipliers ───────────────────────────────────────
+# Applied on top of _live_weights when a specific market regime is active.
+# Values are multipliers (1.0 = unchanged).  Re-normalised to sum=1 at use time.
+_REGIME_WEIGHT_OVERRIDES: dict[str, dict[str, float]] = {
+    "strong_uptrend": {
+        # Trending up: favour momentum / breakout / GPU ranking
+        "breakout_signal":       2.0,
+        "momentum_accel_signal": 1.8,
+        "gpu_momentum_signal":   1.7,
+        "trend_signal":          1.5,
+        "sector_rotation_signal":1.5,
+        "macd_signal":           1.4,
+        # Dampen mean-reversion signals
+        "bb_signal":             0.5,
+        "rsi_signal":            0.6,
+        "vwap_signal":           0.5,
+        "sr_signal":             0.6,
+    },
+    "uptrend": {
+        "breakout_signal":       1.5,
+        "momentum_accel_signal": 1.4,
+        "gpu_momentum_signal":   1.3,
+        "trend_signal":          1.3,
+    },
+    "ranging": {
+        # Range-bound: favour mean-reversion and support/resistance
+        "rsi_signal":            1.8,
+        "bb_signal":             1.8,
+        "sr_signal":             1.6,
+        "vwap_signal":           1.5,
+        "macd_div_signal":       1.4,
+        # Dampen momentum signals
+        "breakout_signal":       0.5,
+        "momentum_accel_signal": 0.5,
+        "gpu_momentum_signal":   0.7,
+    },
+    "choppy": {
+        # High volatility: trust volume/whale/squeeze above everything else
+        "vol_zscore_signal":     2.0,
+        "volume_signal":         1.7,
+        "whale_signal":          1.8,
+        "funding_signal":        1.5,
+        "squeeze_signal":        1.8,
+        # Penalise directional signals
+        "breakout_signal":       0.3,
+        "trend_signal":          0.4,
+        "momentum_accel_signal": 0.4,
+    },
+    "downtrend": {
+        # Falling market: only take very high-conviction setups
+        "squeeze_signal":        1.8,   # squeezes still fire in downtrends
+        "news_burst_signal":     1.4,   # catalyst breaks beat the trend
+        "ml_signal":             1.3,
+        # Dampen weak momentum signals
+        "breakout_signal":       0.6,
+        "trend_signal":          0.5,
+    },
+    "strong_downtrend": {
+        "squeeze_signal":        2.0,
+        "ml_signal":             1.5,
+        "whale_signal":          1.4,
+        # Strongly dampen momentum
+        "breakout_signal":       0.2,
+        "trend_signal":          0.2,
+        "gpu_momentum_signal":   0.4,
+    },
+}
 
 
 @dataclass
@@ -399,6 +485,154 @@ def _score_sector_rotation(symbol: str, sector_heat: dict | None) -> float:
     return 0.0
 
 
+def _score_squeeze(symbol: str, squeeze_data: dict | None) -> float:
+    """Short squeeze potential from combined funding + OI + price trend.
+
+    High squeeze potential = crowd is heavily short AND price is rising AND
+    open interest is building → forced covering can produce rapid spikes.
+    """
+    if not squeeze_data:
+        return 0.0
+    sq = squeeze_data.get(symbol, {})
+    score = sq.get("squeeze_score", 0.0)
+    # Map 0-1 squeeze score to -1..+1 signal (pure bullish — squeezes are upside)
+    if score >= 0.65:   return 0.9
+    elif score >= 0.40: return 0.6
+    elif score >= 0.20: return 0.3
+    return 0.0
+
+
+def _score_beta(symbol: str, beta_data: dict | None, btc_dominance: dict | None) -> float:
+    """Beta vs BTC signal — context-dependent.
+
+    During altseason (BTC.D falling): prefer HIGH beta alts (amplified upside)
+    During BTC dominance (BTC.D rising): prefer LOW beta alts (defensive)
+    In neutral conditions: slight preference for moderate beta (1.0–1.8)
+    """
+    if not beta_data:
+        return 0.0
+
+    beta_info = beta_data.get(symbol, {})
+    beta = beta_info.get("beta", 1.0)
+    corr  = beta_info.get("correlation", 0.5)
+
+    # Low correlation = idiosyncratic mover (could be good or bad — neutral)
+    if abs(corr) < 0.3:
+        return 0.1  # slight bonus for decorrelated assets
+
+    dom = btc_dominance or {}
+    dom_signal = dom.get("signal", "neutral")
+
+    if dom_signal == "altseason":
+        # Want high-beta alts for maximum alt upside
+        if beta >= 2.0:   return 0.8
+        elif beta >= 1.5: return 0.6
+        elif beta >= 1.0: return 0.3
+        elif beta < 0.5:  return -0.3
+    elif dom_signal == "btc_dominance":
+        # BTC taking market share — prefer low-beta (defensive) or short high-beta
+        if beta >= 2.0:   return -0.6
+        elif beta >= 1.5: return -0.3
+        elif beta <= 0.7: return 0.4  # defensive, low corr
+        elif beta <= 1.0: return 0.2
+    else:
+        # Neutral: moderate beta is fine
+        if 0.8 <= beta <= 1.8:   return 0.2
+        elif beta > 2.5:         return -0.2  # too volatile
+    return 0.0
+
+
+def _score_news_burst(symbol: str, news_data: dict | None) -> float:
+    """CryptoPanic news burst signal — catalyst velocity detector.
+
+    A sudden spike in article count (N articles in 30 min) often precedes
+    a significant price move as retail and bots react to the news.
+
+    Uses news_data already augmented by fetch_cryptopanic_news().
+    """
+    if not news_data:
+        return 0.0
+    nd = news_data.get(symbol, {})
+    burst = nd.get("news_burst", False)
+    count = nd.get("news_count_30m", 0)
+    # Also factor in existing average sentiment for direction
+    avg_sent = nd.get("avg_sentiment", 0.0)
+
+    if burst and count >= 6:
+        # Very high velocity — something significant is happening
+        direction = 1.0 if avg_sent >= 0 else -0.5
+        return 0.9 * direction
+    elif burst and count >= 3:
+        direction = 1.0 if avg_sent >= 0 else -0.4
+        return 0.6 * direction
+    elif count == 2:
+        # Building — not quite a burst yet
+        return 0.2 if avg_sent > 0 else 0.0
+    return 0.0
+
+
+def _get_regime_weights(regime: str) -> dict[str, float]:
+    """Return live weights adjusted for current market regime.
+
+    Applies _REGIME_WEIGHT_OVERRIDES multipliers on top of _live_weights,
+    then re-normalises so the result still sums to 1.0.
+    """
+    overrides = _REGIME_WEIGHT_OVERRIDES.get(regime, {})
+    if not overrides:
+        return dict(_live_weights)
+
+    adjusted = {
+        k: v * overrides.get(k, 1.0)
+        for k, v in _live_weights.items()
+    }
+    total = sum(adjusted.values())
+    if total <= 0:
+        return dict(_live_weights)
+    return {k: v / total for k, v in adjusted.items()}
+
+
+def nudge_weights_from_backtest(factor_win_avg: dict[str, float],
+                                factor_loss_avg: dict[str, float],
+                                nudge_step: float = 0.005) -> None:
+    """Adjust _live_weights based on backtest factor predictiveness.
+
+    For each factor, computes (win_avg - loss_avg).  If a factor is
+    consistently higher in winning trades, increase its weight.  If it's
+    higher in losing trades, decrease it.  Changes are capped at ±nudge_step
+    per call and the result is re-normalised so weights still sum to 1.0.
+
+    Called by `_run_startup_backtest` in bot_runner.py after each backtest.
+    """
+    if not factor_win_avg or not factor_loss_avg:
+        return
+
+    deltas: dict[str, float] = {}
+    for k in _live_weights:
+        win_val  = factor_win_avg.get(k, 0.0)
+        loss_val = factor_loss_avg.get(k, 0.0)
+        diff = win_val - loss_val
+        # Positive diff = factor was higher in wins → increase weight
+        # Use tanh to smooth large outliers
+        import math
+        delta = math.tanh(diff * 5) * nudge_step
+        deltas[k] = delta
+
+    # Apply deltas and clamp each weight to [0.005, 0.20]
+    for k in _live_weights:
+        _live_weights[k] = max(0.005, min(0.20, _live_weights[k] + deltas.get(k, 0)))
+
+    # Re-normalise
+    total = sum(_live_weights.values())
+    if total > 0:
+        for k in _live_weights:
+            _live_weights[k] = round(_live_weights[k] / total, 5)
+
+    logger.info(
+        "Weights nudged from backtest: top movers=%s",
+        sorted(deltas.items(), key=lambda x: abs(x[1]), reverse=True)[:4],
+    )
+
+
 # ── Composite scoring ─────────────────────────────────────────────────────────
 
 def score_symbol(
@@ -414,6 +648,11 @@ def score_symbol(
     whale_data: dict | None = None,
     momentum_ranks: dict | None = None,
     sector_heat: dict | None = None,
+    # New parameters for workstream-3 signals:
+    squeeze_data: dict | None = None,     # {symbol: {squeeze_score, signal, reasons}}
+    beta_data: dict | None = None,        # {symbol: {beta, correlation, r_squared}}
+    btc_dominance: dict | None = None,    # {"btc_dominance": float, "signal": str, ...}
+    market_regime: str = "unknown",       # regime string for weight selection
 ) -> dict[str, Any]:
     """Score a symbol and return detailed factor breakdown.
 
@@ -425,6 +664,9 @@ def score_symbol(
     ob = symbol_data.get("orderbook", {})
     sr = symbol_data.get("support_resistance", {})
     price = symbol_data.get("price", 0)
+
+    # Select regime-adjusted weights (re-normalised to sum=1 inside _get_regime_weights)
+    weights = _get_regime_weights(market_regime)
 
     # Compute each factor
     factors: dict[str, float] = {
@@ -451,6 +693,10 @@ def score_symbol(
         "oi_signal":             _score_oi(oi_data),
         "gpu_momentum_signal":   _score_gpu_momentum(symbol, momentum_ranks),
         "sector_rotation_signal":_score_sector_rotation(symbol, sector_heat),
+        # New signals (workstream 3)
+        "squeeze_signal":        _score_squeeze(symbol, squeeze_data),
+        "beta_signal":           _score_beta(symbol, beta_data, btc_dominance),
+        "news_burst_signal":     _score_news_burst(symbol, news_data),
     }
 
     # RSI divergence adds bonus to RSI score
@@ -460,8 +706,8 @@ def score_symbol(
     elif rsi_div < 0:
         factors["rsi_signal"] = max(-1.0, factors["rsi_signal"] - 0.3)
 
-    # Weighted composite: sum(factor * weight) → range [-1, +1]
-    composite = sum(factors[k] * _WEIGHTS[k] for k in _WEIGHTS)
+    # Weighted composite using regime-adjusted weights: sum(factor * weight) → [-1, +1]
+    composite = sum(factors[k] * weights.get(k, 0.0) for k in factors)
 
     # Normalize to 0–100 scale (50 = neutral)
     score = max(0, min(100, 50 + composite * 50))
@@ -471,7 +717,7 @@ def score_symbol(
     # Build signal descriptions for the top contributing factors
     signals: list[str] = []
     sorted_factors = sorted(factors.items(), key=lambda x: abs(x[1]), reverse=True)
-    for fname, fval in sorted_factors[:5]:  # show top 5 (was 4)
+    for fname, fval in sorted_factors[:6]:  # show top 6 for 26-factor model
         if abs(fval) < 0.1:
             continue
         label = fname.replace("_signal", "").upper()
@@ -479,11 +725,12 @@ def score_symbol(
         signals.append(f"{label}={fval:+.2f}({direction_str})")
 
     return {
-        "score": round(score, 1),
+        "score":     round(score, 1),
         "composite": round(composite, 4),
         "direction": direction,
-        "factors": {k: round(v, 3) for k, v in factors.items()},
-        "signals": signals,
+        "factors":   {k: round(v, 3) for k, v in factors.items()},
+        "signals":   signals,
+        "regime_weights_used": market_regime,
     }
 
 
@@ -635,6 +882,7 @@ def rank_symbols(
     market_intel: dict | None = None,
     momentum_ranks: dict | None = None,
     sector_heat: dict | None = None,
+    beta_data: dict | None = None,
 ) -> list[TradeCandidate]:
     """Score all symbols and return ranked trade candidates.
 
@@ -647,7 +895,8 @@ def rank_symbols(
     Also includes SELL candidates for held positions with bearish scores.
     """
     held = held_symbols or set()
-    regime = (market_regime or {}).get("regime", "unknown")
+    regime_dict = market_regime or {}
+    regime = regime_dict.get("regime", "unknown")
     min_score = settings.MIN_QUANT_SCORE
 
     # Regime-aware threshold adjustment
@@ -681,10 +930,23 @@ def rank_symbols(
         adjusted_min = min(adjusted_min, 45)
         logger.info("Less-fear mode: threshold capped at %.0f", adjusted_min)
 
-    # Extract per-symbol derivatives data
-    funding_map = intel.get("funding", {})
-    ls_map = intel.get("long_short", {})
-    oi_map = intel.get("open_interest", {})
+    # Extract per-symbol derivatives data (including new squeeze + dominance)
+    funding_map   = intel.get("funding", {})
+    ls_map        = intel.get("long_short", {})
+    oi_map        = intel.get("open_interest", {})
+    squeeze_map   = intel.get("squeeze", {})
+    btc_dominance = intel.get("btc_dominance", {})
+
+    # BTC dominance adjustment to threshold:
+    # Altseason = lower threshold (more alt opportunities worth chasing)
+    # BTC dominance = raise threshold (alts underperform, be selective)
+    dom_signal = btc_dominance.get("signal", "neutral")
+    if dom_signal == "altseason":
+        adjusted_min -= 2
+        logger.debug("Altseason detected (BTC.D=%.1f%%) — threshold -2", btc_dominance.get("btc_dominance", 0))
+    elif dom_signal == "btc_dominance":
+        adjusted_min += 3
+        logger.debug("BTC dominance (BTC.D=%.1f%%) — threshold +3", btc_dominance.get("btc_dominance", 0))
 
     from app.services.whale_detector import whale_detector
     whale_map = whale_detector.get_all_whale_data()
@@ -704,6 +966,10 @@ def rank_symbols(
             whale_data=whale_map.get(sym),
             momentum_ranks=momentum_ranks,
             sector_heat=sector_heat,
+            squeeze_data=squeeze_map or None,
+            beta_data=beta_data,
+            btc_dominance=btc_dominance,
+            market_regime=regime,
         )
 
         score = result["score"]

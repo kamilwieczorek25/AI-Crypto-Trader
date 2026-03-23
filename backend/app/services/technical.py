@@ -450,6 +450,73 @@ def _empty_indicators(status: str = "ok") -> dict[str, float]:
     }
 
 
+def compute_beta_vs_btc(
+    altcoin_ohlcv: list[list[float]],
+    btc_ohlcv: list[list[float]],
+    lookback: int = 48,
+) -> dict[str, float]:
+    """Compute the altcoin's beta relative to BTC using 1h OHLCV data.
+
+    Beta measures how much the altcoin moves per 1% BTC move.
+    - beta > 1.5  : high-beta alt — amplifies BTC moves (volatile, high upside)
+    - beta ~1.0   : tracks BTC closely
+    - beta < 0.5  : low-beta or decorrelated
+    - beta < 0    : negative correlation (rare, unusual)
+
+    Returns:
+        {
+            "beta":        1.35,    # regression coefficient vs BTC
+            "correlation": 0.82,    # Pearson r with BTC returns
+            "r_squared":   0.67,    # R² of the OLS fit
+        }
+    """
+    default = {"beta": 1.0, "correlation": 0.5, "r_squared": 0.25}
+    if not altcoin_ohlcv or not btc_ohlcv or len(altcoin_ohlcv) < 10 or len(btc_ohlcv) < 10:
+        return default
+
+    try:
+        alt_closes = np.array([c[4] for c in altcoin_ohlcv[-lookback:]], dtype=float)
+        btc_closes  = np.array([c[4] for c in btc_ohlcv[-lookback:]], dtype=float)
+
+        min_len = min(len(alt_closes), len(btc_closes))
+        if min_len < 5:
+            return default
+        alt_closes = alt_closes[-min_len:]
+        btc_closes  = btc_closes[-min_len:]
+
+        # Log returns
+        alt_rets = np.diff(np.log(alt_closes + 1e-12))
+        btc_rets = np.diff(np.log(btc_closes + 1e-12))
+
+        if len(alt_rets) < 4:
+            return default
+
+        # OLS beta: cov(alt, btc) / var(btc)
+        btc_var = float(np.var(btc_rets, ddof=1))
+        if btc_var <= 0:
+            return default
+
+        cov  = float(np.cov(alt_rets, btc_rets, ddof=1)[0, 1])
+        beta = cov / btc_var
+
+        # Pearson correlation + R²
+        corr_mat = np.corrcoef(alt_rets, btc_rets)
+        corr = float(corr_mat[0, 1]) if not np.isnan(corr_mat[0, 1]) else 0.0
+        r_sq = corr ** 2
+
+        beta = float(np.clip(beta, -2.0, 4.0))
+
+        return {
+            "beta":        round(beta, 3),
+            "correlation": round(corr, 3),
+            "r_squared":   round(r_sq, 3),
+        }
+
+    except Exception as exc:
+        logger.debug("compute_beta_vs_btc failed: %s", exc)
+        return default
+
+
 def detect_support_resistance(ohlcv: list[list[float]], num_levels: int = 3) -> dict:
     """Detect key support and resistance levels using swing highs/lows.
 
