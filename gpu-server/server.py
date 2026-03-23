@@ -19,9 +19,11 @@ Usage:
 """
 
 import asyncio
+import ctypes
 import logging
 import math
 import os
+import platform
 import time
 from pathlib import Path
 
@@ -2038,7 +2040,34 @@ def compute_correlations(req: CorrelationRequest):
     }
 
 
+# ── Windows keep-awake ────────────────────────────────────────────────────────
+def _prevent_sleep():
+    """Prevent Windows from sleeping while the GPU server is running."""
+    if platform.system() != "Windows":
+        return
+    ES_CONTINUOUS = 0x80000000
+    ES_SYSTEM_REQUIRED = 0x00000001
+    ES_DISPLAY_REQUIRED = 0x00000002
+    ctypes.windll.kernel32.SetThreadExecutionState(
+        ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
+    )
+    logger.info("Windows sleep prevention ENABLED")
+
+
+def _allow_sleep():
+    """Restore normal Windows sleep behaviour."""
+    if platform.system() != "Windows":
+        return
+    ES_CONTINUOUS = 0x80000000
+    ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+    logger.info("Windows sleep prevention DISABLED")
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("GPU_SERVER_PORT", "9090"))
     logger.info("Starting GPU server on port %d (device=%s)", port, DEVICE)
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    _prevent_sleep()
+    try:
+        uvicorn.run(app, host="0.0.0.0", port=port)
+    finally:
+        _allow_sleep()
