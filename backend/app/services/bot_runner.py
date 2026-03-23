@@ -44,6 +44,10 @@ class BotRunner:
         self._exit_states: dict[str, list[float]] = {}
         # Cache of last cycle's ml_signals for use in _build_exit_state()
         self._ml_signals_cache: dict = {}
+        # GPU cross-sectional momentum ranks: {symbol: percentile_0_to_1}
+        self._momentum_ranks: dict[str, float] = {}
+        # GPU sector rotation heat: {symbol: heat_-1_to_1}
+        self._sector_heat: dict[str, float] = {}
         # Dynamic sizing: recent trade streak tracking
         self._recent_results: list[bool] = []  # True=win, False=loss (last 10)
         # Kelly criterion: cached fraction from backtest results
@@ -395,17 +399,45 @@ class BotRunner:
                     if len(corr_candles) >= 3:
                         gpu_corr = await gpu_client.compute_correlations(corr_candles)
                         if gpu_corr:
-                            # Merge GPU divergence signals into ml_signals
                             for div_sig in gpu_corr.get("divergence_signals", []):
                                 laggard = div_sig.get("laggard", "")
                                 if laggard in ml_signals:
                                     ml_signals[laggard]["corr_divergence"] = div_sig
-                            # Update correlation_info with GPU-computed data
                             if gpu_corr.get("high_corr_pairs"):
                                 correlation_info["gpu_high_corr_pairs"] = gpu_corr["high_corr_pairs"]
 
                 # Cache ml_signals for next-cycle exit state building
                 self._ml_signals_cache = dict(ml_signals)
+
+                # GPU cross-sectional momentum ranking + sector rotation
+                # Both calls are cheap (pure matrix ops) and run in parallel
+                if gpu_client.is_enabled() and len(symbols_data) >= 4:
+                    all_1h_candles = {
+                        sym: all_ohlcv.get(sym, {}).get("1h", [])
+                        for sym in symbols_data
+                    }
+                    all_1h_candles = {s: c for s, c in all_1h_candles.items() if c}
+                    if len(all_1h_candles) >= 4:
+                        _mom_task = asyncio.ensure_future(
+                            gpu_client.rank_momentum(all_1h_candles)
+                        )
+                        _rot_task = asyncio.ensure_future(
+                            gpu_client.cluster_rotation(all_1h_candles)
+                        )
+                        _mom_result, _rot_result = await asyncio.gather(
+                            _mom_task, _rot_task, return_exceptions=True
+                        )
+                        self._momentum_ranks = (
+                            _mom_result if isinstance(_mom_result, dict) else {}
+                        )
+                        _rot_data = _rot_result if isinstance(_rot_result, dict) else {}
+                        self._sector_heat = _rot_data.get("sector_heat", {})
+                        if _rot_data.get("hot_sectors"):
+                            logger.info(
+                                "GPU sectors: hot=%s cold=%s",
+                                [s["label"] for s in _rot_data["hot_sectors"][:2]],
+                                [s["label"] for s in _rot_data.get("cold_sectors", [])[:2]],
+                            )
 
                 # Exit RL: for each open position, predict optimal exit action
                 if gpu_client.is_enabled():
@@ -494,6 +526,8 @@ class BotRunner:
                 held_symbols=bot_held,
                 market_regime=market_regime,
                 market_intel=market_intel,
+                momentum_ranks=self._momentum_ranks or None,
+                sector_heat=self._sector_heat or None,
             )
 
             # 4e. Refine BUY candidates with GPU Monte Carlo simulation

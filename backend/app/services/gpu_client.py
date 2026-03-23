@@ -290,3 +290,46 @@ async def compute_correlations(candles: dict[str, list]) -> dict | None:
     except Exception as e:
         logger.warning("GPU correlations failed: %s", e)
         return None
+
+
+async def rank_momentum(candles: dict[str, list]) -> dict | None:
+    """Cross-sectional momentum ranking across all symbols.
+
+    Accepts {symbol: [ohlcv_candles]} for all symbols in the universe.
+    Returns {symbol: percentile_0_to_1} — e.g. 0.95 = top 5% by risk-adj momentum.
+
+    Uses multi-horizon returns (1h, 4h, 24h) normalised by realised volatility.
+    """
+    c = _get_client()
+    if c is None:
+        return None
+    try:
+        r = await c.post("/rank/momentum", json={"candles": candles})
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        logger.warning("GPU momentum ranking failed: %s", e)
+        return None
+
+
+async def cluster_rotation(candles: dict[str, list]) -> dict | None:
+    """Sector rotation clustering via GPU spectral analysis.
+
+    Groups all symbols into 6–8 sectors by price correlation, then scores
+    each sector's recent momentum.  Returns:
+    {
+      "sector_heat":  {symbol: heat_-1_to_1},   # per-symbol sector score
+      "hot_sectors":  [{label, symbols, heat}],  # ranked sector list
+      "cold_sectors": [{label, symbols, heat}],
+    }
+    """
+    c = _get_client()
+    if c is None:
+        return None
+    try:
+        r = await c.post("/cluster/rotation", json={"candles": candles})
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        logger.warning("GPU sector rotation failed: %s", e)
+        return None
