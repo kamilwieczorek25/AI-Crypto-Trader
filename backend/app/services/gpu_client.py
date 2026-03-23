@@ -170,3 +170,123 @@ async def monte_carlo(
     except Exception as e:
         logger.warning("GPU Monte Carlo failed: %s", e)
         return None
+
+
+# ── New GPU model endpoints ──────────────────────────────────────────────────
+
+
+async def train_mtf(candles: dict[str, dict[str, list]]) -> dict | None:
+    """Train Multi-Timeframe Fusion model on cross-TF data."""
+    c = _get_client()
+    if c is None:
+        return None
+    try:
+        r = await c.post("/train/mtf", json={"candles": candles})
+        r.raise_for_status()
+        data = r.json()
+        logger.info("GPU MTF train: %s", data)
+        return data
+    except Exception as e:
+        logger.warning("GPU MTF train failed: %s", e)
+        return None
+
+
+async def predict_mtf(candles: dict[str, list]) -> dict | None:
+    """Predict using Multi-Timeframe Fusion (all TFs at once)."""
+    c = _get_client()
+    if c is None:
+        return None
+    try:
+        r = await c.post("/predict/mtf", json={"candles": candles})
+        r.raise_for_status()
+        data = r.json()
+        return data if data.get("status") == "ok" else None
+    except Exception as e:
+        logger.warning("GPU MTF predict failed: %s", e)
+        return None
+
+
+async def predict_volatility(candles: list) -> dict | None:
+    """Predict future volatility for better SL/TP & Monte Carlo σ."""
+    c = _get_client()
+    if c is None:
+        return None
+    try:
+        r = await c.post("/predict/volatility", json={"candles": candles})
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        logger.warning("GPU volatility predict failed: %s", e)
+        return None
+
+
+async def detect_anomaly(candles: list) -> dict | None:
+    """Detect anomalous price/volume patterns (pumps, flash crashes)."""
+    c = _get_client()
+    if c is None:
+        return None
+    try:
+        r = await c.post("/detect/anomaly", json={"candles": candles})
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        logger.warning("GPU anomaly detection failed: %s", e)
+        return None
+
+
+async def predict_exit(state: list[float]) -> dict | None:
+    """Get optimal exit action for an open position."""
+    c = _get_client()
+    if c is None:
+        return None
+    try:
+        r = await c.post("/predict/exit", json={"state": state})
+        r.raise_for_status()
+        data = r.json()
+        return data if data.get("trained") else None
+    except Exception as e:
+        logger.warning("GPU exit predict failed: %s", e)
+        return None
+
+
+async def train_exit(experiences: list[dict]) -> dict | None:
+    """Train Exit RL from position outcome experiences."""
+    c = _get_client()
+    if c is None:
+        return None
+    try:
+        r = await c.post("/train/exit", json={"experiences": experiences})
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        logger.warning("GPU exit train failed: %s", e)
+        return None
+
+
+async def explain_attention(candles: list) -> dict | None:
+    """Extract attention weights showing which candles/features drove prediction."""
+    c = _get_client()
+    if c is None:
+        return None
+    try:
+        r = await c.post("/explain/attention", json={"candles": candles})
+        r.raise_for_status()
+        data = r.json()
+        return data if data.get("status") == "ok" else None
+    except Exception as e:
+        logger.warning("GPU attention explain failed: %s", e)
+        return None
+
+
+async def compute_correlations(candles: dict[str, list]) -> dict | None:
+    """GPU-accelerated cross-symbol correlation matrix."""
+    c = _get_client()
+    if c is None:
+        return None
+    try:
+        r = await c.post("/correlations", json={"candles": candles})
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        logger.warning("GPU correlations failed: %s", e)
+        return None

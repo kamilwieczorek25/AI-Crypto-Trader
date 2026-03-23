@@ -1,10 +1,16 @@
 """GPU Inference Server — runs on Windows/Linux machine with NVIDIA GPU.
 
 Quality-focused upgrades over CPU versions:
-1. Transformer model (multi-head attention) replaces basic LSTM
-2. Dueling Double DQN with prioritized replay replaces vanilla DQN
-3. Sentence-transformer news sentiment (semantic understanding vs keywords)
-4. Ensemble endpoint combining all models for higher-confidence signals
+1.  Transformer model (multi-head attention) replaces basic LSTM
+2.  Dueling Double DQN with prioritized replay replaces vanilla DQN
+3.  Sentence-transformer news sentiment (semantic understanding vs keywords)
+4.  Ensemble endpoint combining all models for higher-confidence signals
+5.  Multi-Timeframe Fusion — single Transformer sees 15m+1h+4h+1d simultaneously
+6.  Volatility Forecasting — predicts future σ for better SL/TP & Monte Carlo
+7.  Anomaly Detection Autoencoder — flags pump-and-dumps, flash crashes
+8.  Optimal Exit RL — dedicated agent for position exit timing
+9.  Attention Explainability — extracts which candles/features matter most
+10. Cross-Symbol Correlation Tracker — real-time GPU correlation matrix
 
 Usage:
     pip install torch fastapi uvicorn numpy sentence-transformers
@@ -54,6 +60,22 @@ ACTIONS = {0: "SELL", 1: "HOLD", 2: "BUY"}
 
 STATE_SIZE = 14        # expanded RL state (was 12)
 ACTION_SIZE = 3
+
+# Multi-Timeframe Fusion constants
+MTF_TIMEFRAMES = ["15m", "1h", "4h", "1d"]
+MTF_MAX_LEN = 30   # candles per timeframe
+MTF_N_TF = len(MTF_TIMEFRAMES)
+
+# Volatility Forecasting
+VOL_HORIZON = 24    # predict next 24 candles of volatility
+
+# Anomaly Detection
+ANOMALY_LATENT_DIM = 16
+ANOMALY_THRESHOLD = 2.0  # z-score above mean reconstruction error
+
+# Exit RL
+EXIT_STATE_SIZE = 18   # position-aware state (price, pnl, hold_time, indicators...)
+EXIT_ACTIONS = {0: "HOLD_POS", 1: "PARTIAL_25", 2: "PARTIAL_50", 3: "CLOSE"}
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 1. TRANSFORMER MODEL — replaces basic LSTM
@@ -196,6 +218,220 @@ class PrioritizedReplayBuffer:
 
     def __len__(self):
         return len(self.buffer)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 2b. MULTI-TIMEFRAME FUSION TRANSFORMER
+#     Sees 15m+1h+4h+1d candles simultaneously — learns cross-TF patterns
+#     like "15m reversal while 4h trends up" that single-TF models miss.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TimeframeEmbedding(nn.Module):
+    """Learnable embedding to distinguish which timeframe each token comes from."""
+    def __init__(self, n_timeframes: int, d_model: int):
+        super().__init__()
+        self.embedding = nn.Embedding(n_timeframes, d_model)
+
+    def forward(self, tf_indices: torch.Tensor) -> torch.Tensor:
+        return self.embedding(tf_indices)
+
+
+class MultiTimeframeFusion(nn.Module):
+    """Transformer that processes concatenated multi-TF sequences.
+
+    Input: (batch, n_tf * seq_len, n_features) with timeframe IDs
+    The model learns cross-timeframe attention — e.g. a 15m candle can attend
+    to the 4h trend context directly.
+    """
+    def __init__(self, n_features=N_FEATURES, d_model=128, nhead=4,
+                 num_layers=3, n_timeframes=MTF_N_TF, n_classes=N_CLASSES, dropout=0.2):
+        super().__init__()
+        self.input_proj = nn.Linear(n_features, d_model)
+        self.pos_enc = PositionalEncoding(d_model, max_len=MTF_MAX_LEN * n_timeframes + 10)
+        self.tf_embed = TimeframeEmbedding(n_timeframes, d_model)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead, dim_feedforward=256,
+            dropout=dropout, batch_first=True, activation="gelu",
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.head = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, 64),
+            nn.GELU(),
+            nn.Linear(64, n_classes),
+        )
+
+    def forward(self, x: torch.Tensor, tf_ids: torch.Tensor) -> torch.Tensor:
+        # x: (batch, total_seq, n_features), tf_ids: (batch, total_seq)
+        h = self.input_proj(x)
+        h = self.pos_enc(h)
+        h = h + self.tf_embed(tf_ids)  # add timeframe embedding
+        h = self.encoder(h)
+        h = h[:, -1, :]  # last token
+        return self.head(h)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 2c. VOLATILITY FORECASTING MODEL
+#     Predicts future realized volatility — better SL/TP placement and
+#     feeds accurate σ into Monte Carlo instead of backward-looking ATR.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class VolatilityForecaster(nn.Module):
+    """LSTM-based model predicting future N-period realized volatility."""
+    def __init__(self, n_features=N_FEATURES, hidden=64, num_layers=2):
+        super().__init__()
+        self.lstm = nn.LSTM(n_features, hidden, num_layers=num_layers,
+                            batch_first=True, dropout=0.2)
+        self.head = nn.Sequential(
+            nn.Linear(hidden, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+            nn.Softplus(),  # volatility must be positive
+        )
+
+    def forward(self, x):
+        _, (h, _) = self.lstm(x)
+        return self.head(h[-1]).squeeze(-1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 2d. ANOMALY DETECTION AUTOENCODER
+#     Trained on normal price/volume patterns. High reconstruction error
+#     = anomaly (pump-and-dump, flash crash, unusual whale activity).
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class AnomalyAutoencoder(nn.Module):
+    """Convolutional autoencoder for time-series anomaly detection."""
+    def __init__(self, seq_len=SEQ_LEN, n_features=N_FEATURES, latent_dim=ANOMALY_LATENT_DIM):
+        super().__init__()
+        flat_dim = seq_len * n_features
+        self.seq_len = seq_len
+        self.n_features = n_features
+        # Encoder
+        self.encoder = nn.Sequential(
+            nn.Linear(flat_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, latent_dim),
+        )
+        # Decoder
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 128),
+            nn.ReLU(),
+            nn.Linear(128, flat_dim),
+        )
+
+    def forward(self, x):
+        # x: (batch, seq_len, n_features)
+        batch = x.size(0)
+        flat = x.view(batch, -1)
+        z = self.encoder(flat)
+        recon = self.decoder(z)
+        return recon.view(batch, self.seq_len, self.n_features)
+
+    def reconstruction_error(self, x):
+        """Per-sample MSE reconstruction error."""
+        recon = self.forward(x)
+        return ((x - recon) ** 2).mean(dim=(1, 2))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 2e. OPTIMAL EXIT RL — dedicated agent for position exit timing
+#     Trained only on "when to close an open position" — learns to ride
+#     runners and cut losers faster than generic BUY/HOLD/SELL DQN.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class ExitDQN(nn.Module):
+    """Dueling DQN specialized for exit decisions.
+
+    State includes position-specific info: current PnL, hold duration,
+    trailing high, distance to SL/TP, plus recent indicators.
+    Actions: HOLD_POS, PARTIAL_25%, PARTIAL_50%, CLOSE.
+    """
+    def __init__(self, state_size=EXIT_STATE_SIZE, action_size=4):
+        super().__init__()
+        self.feature = nn.Sequential(
+            nn.Linear(state_size, 128), nn.ReLU(),
+            nn.Linear(128, 64), nn.ReLU(),
+        )
+        self.value = nn.Sequential(nn.Linear(64, 32), nn.ReLU(), nn.Linear(32, 1))
+        self.advantage = nn.Sequential(nn.Linear(64, 32), nn.ReLU(), nn.Linear(32, action_size))
+
+    def forward(self, x):
+        f = self.feature(x)
+        v = self.value(f)
+        a = self.advantage(f)
+        return v + a - a.mean(dim=1, keepdim=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 2f. ATTENTION EXPLAINABILITY
+#     Extracts attention weights from the Transformer to tell Claude
+#     which candles/features the model was focusing on.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _extract_attention_weights(model: TransformerPredictor, tensor: torch.Tensor) -> dict:
+    """Hook into transformer encoder layers to capture attention maps."""
+    attn_weights = []
+
+    def _hook(module, input, output):
+        # TransformerEncoderLayer stores self-attention internally
+        # We run the self-attention manually to get weights
+        pass
+
+    # Use the model in eval mode with manual attention extraction
+    model.eval()
+    with torch.no_grad():
+        x = model.input_proj(tensor)
+        x = model.pos_enc(x)
+
+        for layer in model.encoder.layers:
+            # Get attention weights from multi-head attention
+            x_norm = layer.norm1(x)
+            attn_out, weights = layer.self_attn(
+                x_norm, x_norm, x_norm, need_weights=True, average_attn_heads=True
+            )
+            attn_weights.append(weights.cpu().numpy()[0])  # (seq_len, seq_len)
+            # Continue forward pass
+            x = x + layer.dropout1(attn_out)
+            x = x + layer._ff_block(layer.norm2(x))
+
+    # Average across layers → (seq_len, seq_len)
+    avg_attn = np.mean(attn_weights, axis=0)
+
+    # Last token's attention over all positions (what the prediction attends to)
+    last_attn = avg_attn[-1]  # (seq_len,)
+
+    # Top-5 most attended candle positions
+    top_positions = np.argsort(last_attn)[::-1][:5].tolist()
+    top_weights = [round(float(last_attn[p]), 4) for p in top_positions]
+
+    # Feature importance: average attention per feature across attended candles
+    # Approximate via gradient-weighted attention (input × attention)
+    input_np = tensor.cpu().numpy()[0]  # (seq_len, n_features)
+    feature_importance = {}
+    feature_names = ["returns", "vol_ratio", "rsi", "macd", "bb_pctb",
+                     "atr_pct", "stoch_k", "obv_trend", "vwap_dev", "hl_range"]
+    weighted_input = input_np * last_attn[:, np.newaxis]
+    feat_scores = np.abs(weighted_input).mean(axis=0)
+    for i, name in enumerate(feature_names):
+        if i < len(feat_scores):
+            feature_importance[name] = round(float(feat_scores[i]), 4)
+
+    # Sort by importance
+    feature_importance = dict(sorted(feature_importance.items(), key=lambda x: -x[1]))
+
+    return {
+        "top_candle_positions": top_positions,
+        "top_candle_weights": top_weights,
+        "feature_importance": feature_importance,
+        "attention_entropy": round(float(-np.sum(last_attn * np.log(last_attn + 1e-10))), 4),
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -415,9 +651,32 @@ rl_target: DuelingDQN | None = None
 rl_buffer: PrioritizedReplayBuffer | None = None
 rl_trained = False
 
+# New model state
+mtf_model: MultiTimeframeFusion | None = None
+mtf_trained = False
+
+vol_model: VolatilityForecaster | None = None
+vol_trained = False
+
+anomaly_model: AnomalyAutoencoder | None = None
+anomaly_trained = False
+_anomaly_mean_error: float = 0.0
+_anomaly_std_error: float = 1.0
+
+exit_policy: ExitDQN | None = None
+exit_target: ExitDQN | None = None
+exit_buffer: PrioritizedReplayBuffer | None = None
+exit_trained = False
+
+# Cross-symbol correlation storage
+_correlation_matrix: dict = {}
+_correlation_updated_at: float = 0.0
+
 
 def _load_models():
     global transformer_model, transformer_trained, lstm_model, lstm_trained
+    global mtf_model, mtf_trained, vol_model, vol_trained
+    global anomaly_model, anomaly_trained, _anomaly_mean_error, _anomaly_std_error
     # Transformer
     path = DATA_DIR / "transformer_model.pt"
     if path.exists():
@@ -442,10 +701,50 @@ def _load_models():
             logger.info("LSTM loaded from %s", path)
         except Exception as e:
             logger.warning("LSTM load failed: %s", e)
+    # Multi-Timeframe Fusion
+    path = DATA_DIR / "mtf_model.pt"
+    if path.exists():
+        try:
+            m = MultiTimeframeFusion().to(DEVICE)
+            m.load_state_dict(torch.load(path, map_location=DEVICE, weights_only=True))
+            m.eval()
+            mtf_model = m
+            mtf_trained = True
+            logger.info("MTF Fusion loaded from %s", path)
+        except Exception as e:
+            logger.warning("MTF Fusion load failed: %s", e)
+    # Volatility Forecaster
+    path = DATA_DIR / "vol_model.pt"
+    if path.exists():
+        try:
+            m = VolatilityForecaster().to(DEVICE)
+            m.load_state_dict(torch.load(path, map_location=DEVICE, weights_only=True))
+            m.eval()
+            vol_model = m
+            vol_trained = True
+            logger.info("Volatility Forecaster loaded from %s", path)
+        except Exception as e:
+            logger.warning("Volatility Forecaster load failed: %s", e)
+    # Anomaly Autoencoder
+    path = DATA_DIR / "anomaly_model.pt"
+    if path.exists():
+        try:
+            ckpt = torch.load(path, map_location=DEVICE, weights_only=True)
+            m = AnomalyAutoencoder().to(DEVICE)
+            m.load_state_dict(ckpt["model"])
+            m.eval()
+            anomaly_model = m
+            anomaly_trained = True
+            _anomaly_mean_error = ckpt.get("mean_error", 0.0)
+            _anomaly_std_error = ckpt.get("std_error", 1.0)
+            logger.info("Anomaly Autoencoder loaded from %s", path)
+        except Exception as e:
+            logger.warning("Anomaly Autoencoder load failed: %s", e)
 
 
 def _load_rl():
     global rl_policy, rl_target, rl_buffer, rl_trained
+    global exit_policy, exit_target, exit_buffer, exit_trained
     rl_buffer = PrioritizedReplayBuffer()
     path = DATA_DIR / "rl_agent.pt"
     if path.exists():
@@ -459,6 +758,20 @@ def _load_rl():
             logger.info("Dueling DQN loaded from %s", path)
         except Exception as e:
             logger.warning("RL load failed: %s", e)
+    # Exit RL
+    exit_buffer = PrioritizedReplayBuffer()
+    path = DATA_DIR / "exit_agent.pt"
+    if path.exists():
+        try:
+            ckpt = torch.load(path, map_location=DEVICE, weights_only=True)
+            exit_policy = ExitDQN().to(DEVICE)
+            exit_target = ExitDQN().to(DEVICE)
+            exit_policy.load_state_dict(ckpt["policy"])
+            exit_target.load_state_dict(ckpt["target"])
+            exit_trained = True
+            logger.info("Exit DQN loaded from %s", path)
+        except Exception as e:
+            logger.warning("Exit RL load failed: %s", e)
 
 
 # ── API schemas ───────────────────────────────────────────────────────────────
@@ -488,6 +801,39 @@ class EnsembleRequest(BaseModel):
     candles: list
     state: list[float]
     headlines: list[str] = []
+
+
+class MTFTrainRequest(BaseModel):
+    candles: dict[str, dict[str, list]]  # {symbol: {timeframe: candles}}
+    epochs: int = 40
+
+
+class MTFPredictRequest(BaseModel):
+    candles: dict[str, list]  # {timeframe: candles}
+
+
+class VolatilityPredictRequest(BaseModel):
+    candles: list
+
+
+class AnomalyDetectRequest(BaseModel):
+    candles: list
+
+
+class ExitPredictRequest(BaseModel):
+    state: list[float]  # EXIT_STATE_SIZE elements
+
+
+class ExitTrainRequest(BaseModel):
+    experiences: list[dict]  # list of {state, action, reward, next_state, done}
+
+
+class CorrelationRequest(BaseModel):
+    candles: dict[str, list]  # {symbol: candles_1h}
+
+
+class ExplainRequest(BaseModel):
+    candles: list
 
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
@@ -544,9 +890,19 @@ def health():
         "lstm_trained": lstm_trained,
         "rl_trained": rl_trained,
         "sentiment_loaded": _sentiment_model is not None,
+        "mtf_trained": mtf_trained,
+        "vol_trained": vol_trained,
+        "anomaly_trained": anomaly_trained,
+        "exit_rl_trained": exit_trained,
         "bg_training_active": _bg_training_active,
         "bg_training_cycles": _bg_epoch_count,
         "stored_symbols": len(_stored_candles),
+        "correlation_symbols": len(_correlation_matrix),
+        "models_loaded": sum([
+            transformer_trained, lstm_trained, rl_trained,
+            _sentiment_model is not None, mtf_trained, vol_trained,
+            anomaly_trained, exit_trained,
+        ]),
     }
 
 
@@ -824,6 +1180,7 @@ def sentiment(req: SentimentRequest):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _stored_candles: dict[str, list] = {}   # cached training data from last /train call
+_stored_mtf_candles: dict[str, dict[str, list]] = {}  # {symbol: {tf: candles}}
 _bg_training_active = False
 _bg_epoch_count = 0
 
@@ -837,9 +1194,12 @@ def _augment_features(X_batch: torch.Tensor) -> torch.Tensor:
 
 
 async def _background_training_loop():
-    """Runs forever in background — retrains Transformer + DQN on augmented data."""
+    """Runs forever in background — retrains Transformer + DQN + new models on augmented data."""
     global _bg_training_active, _bg_epoch_count
     global transformer_model, transformer_trained, rl_policy, rl_target, rl_trained
+    global vol_model, vol_trained, anomaly_model, anomaly_trained
+    global _anomaly_mean_error, _anomaly_std_error
+    global exit_policy, exit_target, exit_trained
 
     _bg_training_active = True
     logger.info("Background training loop started")
@@ -872,6 +1232,9 @@ async def _background_training_loop():
             def _bg_train():
                 global transformer_model, transformer_trained, _bg_epoch_count
                 global rl_policy, rl_target, rl_trained
+                global vol_model, vol_trained
+                global anomaly_model, anomaly_trained, _anomaly_mean_error, _anomaly_std_error
+                global exit_policy, exit_target, exit_trained
 
                 loader = DataLoader(TensorDataset(X, y), batch_size=64, shuffle=True, drop_last=True)
                 counts = torch.bincount(y, minlength=N_CLASSES).float()
@@ -923,8 +1286,80 @@ async def _background_training_loop():
                     torch.save({"policy": policy.state_dict(), "target": target.state_dict()},
                                DATA_DIR / "rl_agent.pt")
 
+                # --- Volatility Forecaster fine-tune (5 epochs) ---
+                if vol_model is not None and len(X_all) > SEQ_LEN + VOL_HORIZON + 10:
+                    vm = vol_model
+                    vm.train()
+                    opt = optim.Adam(vm.parameters(), lr=5e-5)
+                    # Build vol targets from stored features
+                    vol_X, vol_y = [], []
+                    for x_seq in X_all[:500]:  # limit to avoid memory issues
+                        vol_y.append(float(np.std(x_seq[:, 0])))  # std of returns
+                        vol_X.append(x_seq)
+                    if len(vol_X) > 32:
+                        vX = torch.tensor(np.array(vol_X), dtype=torch.float32).to(DEVICE)
+                        vy = torch.tensor(vol_y, dtype=torch.float32).to(DEVICE)
+                        for _ in range(5):
+                            opt.zero_grad()
+                            loss = F.mse_loss(vm(vX), vy)
+                            loss.backward()
+                            opt.step()
+                        vm.eval()
+                        torch.save(vm.state_dict(), DATA_DIR / "vol_model.pt")
+
+                # --- Anomaly Autoencoder fine-tune (5 epochs) ---
+                if anomaly_model is not None:
+                    am = anomaly_model
+                    am.train()
+                    opt = optim.Adam(am.parameters(), lr=5e-5)
+                    aX = X[:min(500, len(X))].to(DEVICE)
+                    for _ in range(5):
+                        opt.zero_grad()
+                        recon = am(aX)
+                        loss = F.mse_loss(recon, aX)
+                        loss.backward()
+                        opt.step()
+                    am.eval()
+                    with torch.no_grad():
+                        errors = am.reconstruction_error(aX).cpu().numpy()
+                    _anomaly_mean_error = float(errors.mean())
+                    _anomaly_std_error = float(errors.std())
+                    torch.save({
+                        "model": am.state_dict(),
+                        "mean_error": _anomaly_mean_error,
+                        "std_error": _anomaly_std_error,
+                    }, DATA_DIR / "anomaly_model.pt")
+
+                # --- Exit RL continued training ---
+                if exit_policy is not None and exit_buffer is not None and len(exit_buffer) >= 64:
+                    ep = exit_policy
+                    et = exit_target
+                    opt = optim.Adam(ep.parameters(), lr=1e-5)
+                    ep.train()
+                    for step in range(100):
+                        beta = min(1.0, 0.4 + step * 0.006)
+                        s, a, r, s2, d, w, idx = exit_buffer.sample(min(64, len(exit_buffer)), beta=beta)
+                        s, a, r, s2, d, w = (t.to(DEVICE) for t in [s, a, r, s2, d, w])
+                        q = ep(s).gather(1, a.unsqueeze(1)).squeeze()
+                        with torch.no_grad():
+                            next_a = ep(s2).argmax(1)
+                            q_next = et(s2).gather(1, next_a.unsqueeze(1)).squeeze()
+                            q_targ = r + 0.99 * q_next * (1 - d)
+                        td = (q - q_targ).detach().cpu().numpy()
+                        exit_buffer.update_priorities(idx, td)
+                        loss = (w.to(DEVICE) * F.smooth_l1_loss(q, q_targ, reduction='none')).mean()
+                        opt.zero_grad()
+                        loss.backward()
+                        nn.utils.clip_grad_norm_(ep.parameters(), 1.0)
+                        opt.step()
+                        if step % 25 == 0:
+                            et.load_state_dict(ep.state_dict())
+                    ep.eval()
+                    torch.save({"policy": ep.state_dict(), "target": et.state_dict()},
+                               DATA_DIR / "exit_agent.pt")
+
                 _bg_epoch_count += 1
-                logger.info("Background training cycle #%d complete (%d samples)", _bg_epoch_count, len(X_all))
+                logger.info("Background training cycle #%d complete (%d samples, 6 models)", _bg_epoch_count, len(X_all))
 
             await asyncio.to_thread(_bg_train)
 
@@ -1089,6 +1524,514 @@ def monte_carlo(req: MonteCarloRequest):
         }
 
     return _simulate()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 7. MULTI-TIMEFRAME FUSION — train & predict
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _build_mtf_features(candles_by_tf: dict[str, list]) -> tuple[np.ndarray, np.ndarray] | None:
+    """Build concatenated multi-TF feature matrix + timeframe IDs.
+
+    Returns (features, tf_ids) or None if insufficient data.
+    features: (total_seq, N_FEATURES)
+    tf_ids:   (total_seq,) integer TF index
+    """
+    all_feats = []
+    all_tf_ids = []
+    tf_map = {tf: i for i, tf in enumerate(MTF_TIMEFRAMES)}
+
+    for tf in MTF_TIMEFRAMES:
+        candles = candles_by_tf.get(tf, [])
+        if not candles:
+            continue
+        feat = build_features(candles)
+        if feat is None:
+            continue
+        # Take last MTF_MAX_LEN candles
+        seq = feat[-MTF_MAX_LEN:]
+        all_feats.append(seq)
+        all_tf_ids.extend([tf_map[tf]] * len(seq))
+
+    if not all_feats or len(all_feats) < 2:
+        return None
+
+    features = np.concatenate(all_feats, axis=0).astype(np.float32)
+    tf_ids = np.array(all_tf_ids, dtype=np.int64)
+    return features, tf_ids
+
+
+@app.post("/train/mtf")
+async def train_mtf(req: MTFTrainRequest):
+    """Train Multi-Timeframe Fusion Transformer on cross-TF data."""
+    global mtf_model, mtf_trained
+    _stored_mtf_candles.update(req.candles)
+
+    def _train():
+        global mtf_model, mtf_trained
+        X_all, tf_all, y_all = [], [], []
+
+        for sym, tf_candles in req.candles.items():
+            result = _build_mtf_features(tf_candles)
+            if result is None:
+                continue
+            features, tf_ids = result
+            # Use 1h candles for labels
+            candles_1h = tf_candles.get("1h", [])
+            if not candles_1h:
+                continue
+            labels = build_labels(candles_1h)
+
+            # Sliding window over the concatenated sequence
+            total_len = len(features)
+            if total_len < 20:
+                continue
+            # Single sample per symbol (full multi-TF context → one label)
+            label = int(labels[-LOOKAHEAD - 1]) if len(labels) > LOOKAHEAD else 1
+            X_all.append(features)
+            tf_all.append(tf_ids)
+            y_all.append(label)
+
+        if len(X_all) < 16:
+            return {"status": "skipped", "reason": f"only {len(X_all)} MTF samples"}
+
+        # Pad to max length
+        max_len = max(len(x) for x in X_all)
+        X_padded = np.zeros((len(X_all), max_len, N_FEATURES), dtype=np.float32)
+        TF_padded = np.zeros((len(X_all), max_len), dtype=np.int64)
+        for i, (x, tf) in enumerate(zip(X_all, tf_all)):
+            X_padded[i, :len(x)] = x
+            TF_padded[i, :len(tf)] = tf
+
+        X = torch.tensor(X_padded).to(DEVICE)
+        TF = torch.tensor(TF_padded).to(DEVICE)
+        y = torch.tensor(y_all, dtype=torch.long).to(DEVICE)
+        counts = torch.bincount(y.cpu(), minlength=N_CLASSES).float()
+        weights = (counts.sum() / (N_CLASSES * counts.clamp(min=1))).to(DEVICE)
+
+        t0 = time.time()
+        model = MultiTimeframeFusion().to(DEVICE)
+        opt = optim.AdamW(model.parameters(), lr=5e-4, weight_decay=1e-3)
+        crit = nn.CrossEntropyLoss(weight=weights, label_smoothing=0.05)
+
+        model.train()
+        best_loss = float("inf")
+        for epoch in range(req.epochs):
+            opt.zero_grad()
+            logits = model(X, TF)
+            loss = crit(logits, y)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            if loss.item() < best_loss:
+                best_loss = loss.item()
+
+        model.eval()
+        mtf_model = model
+        mtf_trained = True
+        torch.save(model.state_dict(), DATA_DIR / "mtf_model.pt")
+        elapsed = time.time() - t0
+        return {
+            "status": "ok", "samples": len(X_all),
+            "loss": round(best_loss, 4), "elapsed_seconds": round(elapsed, 2),
+        }
+
+    return await asyncio.to_thread(_train)
+
+
+@app.post("/predict/mtf")
+def predict_mtf(req: MTFPredictRequest):
+    """Predict using Multi-Timeframe Fusion — cross-TF context."""
+    if not mtf_trained or mtf_model is None:
+        return {"signal": "HOLD", "confidence": 0.34, "status": "untrained"}
+
+    result = _build_mtf_features(req.candles)
+    if result is None:
+        return {"signal": "HOLD", "confidence": 0.34, "status": "insufficient_data"}
+
+    features, tf_ids = result
+    X = torch.tensor(features, dtype=torch.float32).unsqueeze(0).to(DEVICE)
+    TF = torch.tensor(tf_ids, dtype=torch.int64).unsqueeze(0).to(DEVICE)
+
+    with torch.no_grad():
+        probs = torch.softmax(mtf_model(X, TF), dim=1).cpu().numpy()[0]
+
+    top_idx = int(np.argmax(probs))
+    return {
+        "BUY": float(probs[2]), "HOLD": float(probs[1]), "SELL": float(probs[0]),
+        "signal": ACTIONS[top_idx],
+        "confidence": float(probs[top_idx]),
+        "status": "ok",
+        "timeframes_used": [tf for tf in MTF_TIMEFRAMES if tf in req.candles],
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 8. VOLATILITY FORECASTING
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/predict/volatility")
+def predict_volatility(req: VolatilityPredictRequest):
+    """Predict future realized volatility for better SL/TP & MC σ."""
+    global vol_model, vol_trained
+
+    feat = build_features(req.candles)
+    if feat is None or len(feat) < SEQ_LEN:
+        # Fallback: historical volatility
+        closes = np.array([c[4] for c in req.candles[-50:]], dtype=np.float64)
+        if len(closes) > 2:
+            hist_vol = float(np.std(np.diff(np.log(closes))))
+        else:
+            hist_vol = 0.02
+        return {"predicted_vol": round(hist_vol, 6), "source": "historical"}
+
+    # Auto-train on first call if not trained
+    if not vol_trained or vol_model is None:
+        _train_vol_inline(feat)
+
+    if vol_model is None:
+        closes = np.array([c[4] for c in req.candles[-50:]], dtype=np.float64)
+        hist_vol = float(np.std(np.diff(np.log(closes)))) if len(closes) > 2 else 0.02
+        return {"predicted_vol": round(hist_vol, 6), "source": "historical"}
+
+    seq = feat[-SEQ_LEN:]
+    tensor = torch.tensor(seq, dtype=torch.float32).unsqueeze(0).to(DEVICE)
+    with torch.no_grad():
+        predicted = vol_model(tensor).item()
+
+    return {
+        "predicted_vol": round(predicted, 6),
+        "predicted_vol_pct": round(predicted * 100, 4),
+        "source": "model",
+    }
+
+
+def _train_vol_inline(feat: np.ndarray):
+    """Quick inline training for volatility model when first called."""
+    global vol_model, vol_trained
+    if len(feat) < SEQ_LEN + VOL_HORIZON + 10:
+        return
+
+    # Build training data: input=features, target=future realized vol
+    X_all, y_all = [], []
+    for i in range(len(feat) - SEQ_LEN - VOL_HORIZON):
+        X_all.append(feat[i: i + SEQ_LEN])
+        # Target: std of returns over next VOL_HORIZON candles
+        # Use return feature (index 0) as proxy
+        future_returns = feat[i + SEQ_LEN: i + SEQ_LEN + VOL_HORIZON, 0]
+        y_all.append(float(np.std(future_returns)))
+
+    if len(X_all) < 32:
+        return
+
+    X = torch.tensor(np.array(X_all), dtype=torch.float32).to(DEVICE)
+    y = torch.tensor(y_all, dtype=torch.float32).to(DEVICE)
+
+    model = VolatilityForecaster().to(DEVICE)
+    opt = optim.Adam(model.parameters(), lr=1e-3)
+    model.train()
+    for _ in range(30):
+        opt.zero_grad()
+        pred = model(X)
+        loss = F.mse_loss(pred, y)
+        loss.backward()
+        opt.step()
+    model.eval()
+    vol_model = model
+    vol_trained = True
+    torch.save(model.state_dict(), DATA_DIR / "vol_model.pt")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 9. ANOMALY DETECTION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/detect/anomaly")
+def detect_anomaly(req: AnomalyDetectRequest):
+    """Detect anomalous price/volume patterns (pumps, flash crashes, etc.)."""
+    global anomaly_model, anomaly_trained, _anomaly_mean_error, _anomaly_std_error
+
+    feat = build_features(req.candles)
+    if feat is None or len(feat) < SEQ_LEN:
+        return {"is_anomaly": False, "anomaly_score": 0.0, "status": "insufficient_data"}
+
+    seq = feat[-SEQ_LEN:]
+    tensor = torch.tensor(seq, dtype=torch.float32).unsqueeze(0).to(DEVICE)
+
+    # Auto-train if not trained
+    if not anomaly_trained or anomaly_model is None:
+        _train_anomaly_inline(feat)
+
+    if anomaly_model is None:
+        return {"is_anomaly": False, "anomaly_score": 0.0, "status": "untrained"}
+
+    with torch.no_grad():
+        error = anomaly_model.reconstruction_error(tensor).item()
+
+    # Z-score relative to training distribution
+    z_score = (error - _anomaly_mean_error) / (_anomaly_std_error + 1e-10)
+    is_anomaly = z_score > ANOMALY_THRESHOLD
+
+    return {
+        "is_anomaly": is_anomaly,
+        "anomaly_score": round(z_score, 4),
+        "reconstruction_error": round(error, 6),
+        "threshold": ANOMALY_THRESHOLD,
+        "status": "ok",
+    }
+
+
+def _train_anomaly_inline(feat: np.ndarray):
+    """Quick inline training for anomaly autoencoder."""
+    global anomaly_model, anomaly_trained, _anomaly_mean_error, _anomaly_std_error
+    X_all = []
+    for i in range(len(feat) - SEQ_LEN):
+        X_all.append(feat[i: i + SEQ_LEN])
+
+    if len(X_all) < 32:
+        return
+
+    X = torch.tensor(np.array(X_all), dtype=torch.float32).to(DEVICE)
+
+    model = AnomalyAutoencoder().to(DEVICE)
+    opt = optim.Adam(model.parameters(), lr=1e-3)
+    model.train()
+    for _ in range(50):
+        opt.zero_grad()
+        recon = model(X)
+        loss = F.mse_loss(recon, X)
+        loss.backward()
+        opt.step()
+
+    model.eval()
+    with torch.no_grad():
+        errors = model.reconstruction_error(X).cpu().numpy()
+    _anomaly_mean_error = float(errors.mean())
+    _anomaly_std_error = float(errors.std())
+
+    anomaly_model = model
+    anomaly_trained = True
+    torch.save({
+        "model": model.state_dict(),
+        "mean_error": _anomaly_mean_error,
+        "std_error": _anomaly_std_error,
+    }, DATA_DIR / "anomaly_model.pt")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 10. OPTIMAL EXIT RL — train & predict
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/predict/exit")
+def predict_exit(req: ExitPredictRequest):
+    """Get optimal exit action for an open position."""
+    if not exit_trained or exit_policy is None:
+        return {"action": "HOLD_POS", "q_values": {}, "trained": False}
+
+    state = req.state
+    if len(state) < EXIT_STATE_SIZE:
+        state = state + [0.0] * (EXIT_STATE_SIZE - len(state))
+
+    tensor = torch.FloatTensor(state[:EXIT_STATE_SIZE]).unsqueeze(0).to(DEVICE)
+    with torch.no_grad():
+        q = exit_policy(tensor).cpu().numpy()[0]
+
+    return {
+        "action": EXIT_ACTIONS[int(np.argmax(q))],
+        "q_values": {EXIT_ACTIONS[i]: round(float(q[i]), 4) for i in range(4)},
+        "trained": True,
+    }
+
+
+@app.post("/train/exit")
+async def train_exit(req: ExitTrainRequest):
+    """Train Exit RL from position outcome experiences."""
+    global exit_policy, exit_target, exit_buffer, exit_trained
+
+    def _train():
+        global exit_policy, exit_target, exit_buffer, exit_trained
+        if not exit_buffer:
+            exit_buffer = PrioritizedReplayBuffer(capacity=10000)
+
+        for exp in req.experiences:
+            s = exp.get("state", [0] * EXIT_STATE_SIZE)
+            a = exp.get("action", 0)
+            r = exp.get("reward", 0)
+            ns = exp.get("next_state", s)
+            d = exp.get("done", 0)
+            if len(s) < EXIT_STATE_SIZE:
+                s = s + [0.0] * (EXIT_STATE_SIZE - len(s))
+            if len(ns) < EXIT_STATE_SIZE:
+                ns = ns + [0.0] * (EXIT_STATE_SIZE - len(ns))
+            exit_buffer.push(s[:EXIT_STATE_SIZE], a, r, ns[:EXIT_STATE_SIZE], d)
+
+        if len(exit_buffer) < 64:
+            return {"status": "buffering", "experiences": len(exit_buffer)}
+
+        policy = ExitDQN().to(DEVICE)
+        target = ExitDQN().to(DEVICE)
+        if exit_policy is not None:
+            policy.load_state_dict(exit_policy.state_dict())
+            target.load_state_dict(exit_policy.state_dict())
+        else:
+            target.load_state_dict(policy.state_dict())
+
+        opt = optim.Adam(policy.parameters(), lr=5e-5)
+        t0 = time.time()
+
+        for step in range(min(300, len(exit_buffer))):
+            beta = min(1.0, 0.4 + step * 0.002)
+            s, a, r, s2, d, w, idx = exit_buffer.sample(min(64, len(exit_buffer)), beta=beta)
+            s, a, r, s2, d, w = (t.to(DEVICE) for t in [s, a, r, s2, d, w])
+
+            q = policy(s).gather(1, a.unsqueeze(1)).squeeze()
+            with torch.no_grad():
+                next_a = policy(s2).argmax(1)
+                q_next = target(s2).gather(1, next_a.unsqueeze(1)).squeeze()
+                q_targ = r + 0.99 * q_next * (1 - d)
+
+            td = (q - q_targ).detach().cpu().numpy()
+            exit_buffer.update_priorities(idx, td)
+            loss = (w.to(DEVICE) * F.smooth_l1_loss(q, q_targ, reduction='none')).mean()
+            opt.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
+            opt.step()
+            if step % 50 == 0:
+                target.load_state_dict(policy.state_dict())
+
+        policy.eval()
+        exit_policy = policy
+        exit_target = target
+        exit_trained = True
+        torch.save({"policy": policy.state_dict(), "target": target.state_dict()},
+                    DATA_DIR / "exit_agent.pt")
+        return {
+            "status": "ok", "experiences": len(exit_buffer),
+            "elapsed_seconds": round(time.time() - t0, 2),
+        }
+
+    return await asyncio.to_thread(_train)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 11. ATTENTION EXPLAINABILITY ENDPOINT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/explain/attention")
+def explain_attention(req: ExplainRequest):
+    """Extract attention weights showing which candles/features influenced prediction."""
+    if not transformer_trained or transformer_model is None:
+        return {"status": "untrained", "explanation": None}
+
+    feat = build_features(req.candles)
+    if feat is None or len(feat) < SEQ_LEN:
+        return {"status": "insufficient_data", "explanation": None}
+
+    seq = feat[-SEQ_LEN:]
+    tensor = torch.tensor(seq, dtype=torch.float32).unsqueeze(0).to(DEVICE)
+
+    explanation = _extract_attention_weights(transformer_model, tensor)
+
+    # Also include the prediction for context
+    with torch.no_grad():
+        probs = torch.softmax(transformer_model(tensor), dim=1).cpu().numpy()[0]
+    explanation["prediction"] = {
+        "signal": ACTIONS[int(np.argmax(probs))],
+        "confidence": float(probs[int(np.argmax(probs))]),
+        "BUY": float(probs[2]), "HOLD": float(probs[1]), "SELL": float(probs[0]),
+    }
+    explanation["status"] = "ok"
+    return explanation
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 12. CROSS-SYMBOL CORRELATION TRACKER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/correlations")
+def compute_correlations(req: CorrelationRequest):
+    """GPU-accelerated correlation matrix across symbols.
+
+    Returns pairwise Pearson correlations from recent returns.
+    High correlations during a cycle = risk concentration.
+    Divergence between correlated pairs = mean-reversion signal.
+    """
+    global _correlation_matrix, _correlation_updated_at
+
+    symbols = list(req.candles.keys())
+    if len(symbols) < 2:
+        return {"correlations": {}, "signals": []}
+
+    # Extract returns for each symbol
+    returns_dict = {}
+    for sym, candles in req.candles.items():
+        closes = np.array([c[4] for c in candles[-60:]], dtype=np.float64)
+        if len(closes) < 10:
+            continue
+        rets = np.diff(np.log(closes))
+        returns_dict[sym] = rets
+
+    # Build returns matrix on GPU for fast correlation
+    syms = list(returns_dict.keys())
+    if len(syms) < 2:
+        return {"correlations": {}, "signals": []}
+
+    min_len = min(len(r) for r in returns_dict.values())
+    mat = torch.tensor(
+        np.array([returns_dict[s][-min_len:] for s in syms]),
+        dtype=torch.float32, device=DEVICE,
+    )  # (n_symbols, n_periods)
+
+    # Pearson correlation on GPU
+    mat_centered = mat - mat.mean(dim=1, keepdim=True)
+    norms = mat_centered.norm(dim=1, keepdim=True).clamp(min=1e-10)
+    mat_normed = mat_centered / norms
+    corr = (mat_normed @ mat_normed.T).cpu().numpy()
+
+    # Build result
+    high_corr_pairs = []
+    divergence_signals = []
+    corr_dict = {}
+
+    for i in range(len(syms)):
+        for j in range(i + 1, len(syms)):
+            r = float(corr[i, j])
+            pair_key = f"{syms[i]}|{syms[j]}"
+            corr_dict[pair_key] = round(r, 4)
+
+            if abs(r) > 0.7:
+                high_corr_pairs.append({
+                    "pair": [syms[i], syms[j]],
+                    "correlation": round(r, 4),
+                })
+
+                # Divergence detection: if normally correlated but recent returns diverge
+                ret_i = float(returns_dict[syms[i]][-5:].sum())
+                ret_j = float(returns_dict[syms[j]][-5:].sum())
+                if r > 0.7 and abs(ret_i - ret_j) > 0.03:
+                    # Positive correlation but diverging → mean-reversion opportunity
+                    laggard = syms[i] if ret_i < ret_j else syms[j]
+                    leader = syms[j] if ret_i < ret_j else syms[i]
+                    divergence_signals.append({
+                        "type": "corr_divergence",
+                        "leader": leader,
+                        "laggard": laggard,
+                        "correlation": round(r, 4),
+                        "return_gap_pct": round(abs(ret_i - ret_j) * 100, 2),
+                        "signal": f"BUY {laggard} (lagging correlated pair)",
+                    })
+
+    _correlation_matrix = corr_dict
+    _correlation_updated_at = time.time()
+
+    return {
+        "correlations": corr_dict,
+        "high_corr_pairs": high_corr_pairs,
+        "divergence_signals": divergence_signals,
+        "n_symbols": len(syms),
+        "n_periods": min_len,
+    }
 
 
 if __name__ == "__main__":
