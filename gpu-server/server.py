@@ -37,8 +37,9 @@ logger = logging.getLogger("gpu-server")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 logger.info("GPU Server starting on device: %s", DEVICE)
 if torch.cuda.is_available():
-    logger.info("GPU: %s (VRAM: %.1f GB)", torch.cuda.get_device_name(0),
-                torch.cuda.get_device_properties(0).total_mem / 1e9)
+    _props = torch.cuda.get_device_properties(0)
+    _vram = getattr(_props, 'total_memory', None) or getattr(_props, 'total_mem', 0)
+    logger.info("GPU: %s (VRAM: %.1f GB)", torch.cuda.get_device_name(0), _vram / 1e9)
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "./data"))
 DATA_DIR.mkdir(exist_ok=True)
@@ -528,7 +529,8 @@ def startup():
 @app.get("/health")
 def health():
     gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
-    vram_gb = torch.cuda.get_device_properties(0).total_mem / 1e9 if torch.cuda.is_available() else 0
+    _p = torch.cuda.get_device_properties(0) if torch.cuda.is_available() else None
+    vram_gb = (getattr(_p, 'total_memory', None) or getattr(_p, 'total_mem', 0)) / 1e9 if _p else 0
     return {
         "status": "ok",
         "device": str(DEVICE),
