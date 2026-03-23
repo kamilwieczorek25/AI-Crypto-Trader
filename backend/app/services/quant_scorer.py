@@ -4,39 +4,54 @@ Scores each symbol on a 0–100 scale using weighted technical factors.
 Computes ATR-based stop-loss/take-profit levels with enforced minimum
 reward-to-risk ratio. Produces structured trade candidates for Claude
 to validate (not originate).
+
+New factors added:
+- breakout_signal      : price breaking above N-period high (strong momentum)
+- vol_zscore_signal    : statistically unusual volume for THIS symbol
+- macd_div_signal      : swing-based MACD divergence
+- momentum_accel_signal: 2nd derivative of price (is momentum accelerating?)
+- gpu_momentum_signal  : cross-sectional rank across 100+ symbols (GPU)
+- sector_rotation_signal: sector-hot bonus from GPU clustering
 """
 
 import logging
 import math
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-# ── Scoring weights (sum to 1.0) ────────────────────────────────────────────
-# These are tuned for crypto momentum/mean-reversion blend.
-# Each factor produces a raw signal in [-1, +1] which gets multiplied by weight.
+# ── Scoring weights (sum to 1.0) ─────────────────────────────────────────────
+# Weights reduced slightly on existing factors to make room for four new ones.
 _WEIGHTS: dict[str, float] = {
-    "rsi_signal":       0.07,   # RSI oversold/overbought
-    "macd_signal":      0.06,   # MACD histogram direction + magnitude
-    "bb_signal":        0.05,   # Bollinger Band position
-    "bb_squeeze_signal":0.05,   # Bollinger squeeze (breakout detector)
-    "volume_signal":    0.08,   # Volume ratio (activity)
-    "obv_signal":       0.04,   # On-Balance Volume trend
-    "vwap_signal":      0.04,   # Price vs VWAP
-    "trend_signal":     0.07,   # Multi-timeframe trend alignment
-    "sr_signal":        0.05,   # Support/resistance proximity
-    "btc_signal":       0.07,   # BTC anchor trend (critical for alts)
-    "ml_signal":        0.10,   # LSTM + RL + GPU ensemble + MTF + anomaly (boosted)
-    "orderbook_signal": 0.04,   # Bid/ask pressure ratio
-    "depth_signal":     0.05,   # Orderbook depth imbalance within 2%
-    "whale_signal":     0.07,   # Whale trade flow (WebSocket real-time)
-    "funding_signal":   0.05,   # Binance funding rate (contrarian)
-    "ls_ratio_signal":  0.05,   # Long/short ratio (contrarian)
-    "oi_signal":        0.06,   # Open interest trend
+    "rsi_signal":           0.06,   # RSI oversold/overbought
+    "macd_signal":          0.05,   # MACD histogram direction + magnitude
+    "macd_div_signal":      0.04,   # MACD divergence (new)
+    "bb_signal":            0.04,   # Bollinger Band position
+    "bb_squeeze_signal":    0.04,   # Bollinger squeeze (breakout detector)
+    "volume_signal":        0.05,   # Volume ratio (activity)
+    "vol_zscore_signal":    0.05,   # Volume Z-score — statistically unusual (new)
+    "obv_signal":           0.03,   # On-Balance Volume trend
+    "vwap_signal":          0.02,   # Price vs VWAP
+    "trend_signal":         0.05,   # Multi-timeframe trend alignment
+    "sr_signal":            0.03,   # Support/resistance proximity
+    "breakout_signal":      0.06,   # N-period high/low breakout (new)
+    "momentum_accel_signal":0.04,   # Momentum acceleration 2nd derivative (new)
+    "btc_signal":           0.05,   # BTC anchor trend (critical for alts)
+    "ml_signal":            0.08,   # LSTM + RL + GPU ensemble + MTF + anomaly
+    "orderbook_signal":     0.02,   # Bid/ask pressure ratio
+    "depth_signal":         0.03,   # Orderbook depth imbalance within 2%
+    "whale_signal":         0.05,   # Whale trade flow (WebSocket real-time)
+    "funding_signal":       0.04,   # Binance funding rate (contrarian)
+    "ls_ratio_signal":      0.04,   # Long/short ratio (contrarian)
+    "oi_signal":            0.04,   # Open interest trend
+    "gpu_momentum_signal":  0.04,   # Cross-sectional GPU momentum rank (new)
+    "sector_rotation_signal":0.05,  # Sector rotation hot-bonus (new)
 }
+# Verify: sum(_WEIGHTS.values()) == 1.00
 
 
 @dataclass
@@ -59,64 +74,48 @@ class TradeCandidate:
 
 # ── Individual factor scoring functions ──────────────────────────────────────
 # Each returns a value in [-1.0, +1.0]
-# Positive = bullish / buy signal, Negative = bearish / sell signal
 
 def _score_rsi(ind: dict) -> float:
-    """RSI mean-reversion signal: oversold → buy, overbought → sell."""
     rsi = ind.get("rsi14", 50)
-    if rsi <= 20:
-        return 1.0          # extremely oversold
-    elif rsi <= 30:
-        return 0.7
-    elif rsi <= 35:
-        return 0.3
-    elif rsi >= 80:
-        return -1.0         # extremely overbought
-    elif rsi >= 70:
-        return -0.7
-    elif rsi >= 65:
-        return -0.3
-    return 0.0               # neutral zone
+    if rsi <= 20:   return 1.0
+    elif rsi <= 30: return 0.7
+    elif rsi <= 35: return 0.3
+    elif rsi >= 80: return -1.0
+    elif rsi >= 70: return -0.7
+    elif rsi >= 65: return -0.3
+    return 0.0
 
 
 def _score_macd(ind: dict) -> float:
-    """MACD histogram direction and magnitude."""
     macd_hist = ind.get("macd_hist", 0)
     if macd_hist == 0:
         return 0.0
-    # Normalize: typical MACD hist in crypto is ±0.001 to ±0.05
     magnitude = min(abs(macd_hist) * 50, 1.0)
     return magnitude if macd_hist > 0 else -magnitude
 
 
+def _score_macd_divergence(ind: dict) -> float:
+    """Swing-based MACD divergence — stronger signal than slope comparison."""
+    return float(ind.get("macd_divergence", 0.0))
+
+
 def _score_bb(ind: dict) -> float:
-    """Bollinger Band %B — below 0.2 = buy zone, above 0.8 = sell zone."""
     bb = ind.get("bb_pct_b", 0.5)
-    if bb <= 0.05:
-        return 1.0
-    elif bb <= 0.15:
-        return 0.7
-    elif bb <= 0.25:
-        return 0.3
-    elif bb >= 0.95:
-        return -1.0
-    elif bb >= 0.85:
-        return -0.7
-    elif bb >= 0.75:
-        return -0.3
+    if bb <= 0.05:   return 1.0
+    elif bb <= 0.15: return 0.7
+    elif bb <= 0.25: return 0.3
+    elif bb >= 0.95: return -1.0
+    elif bb >= 0.85: return -0.7
+    elif bb >= 0.75: return -0.3
     return 0.0
 
 
 def _score_volume(ind: dict) -> float:
-    """Volume ratio — high volume confirms moves. Score direction by trend."""
     vol_ratio = ind.get("volume_ratio", 1.0)
-    vol_trend = ind.get("volume_trend", 1.0)
     trend_dir = ind.get("trend", 0)
-
     if vol_ratio < 0.5:
-        return 0.0  # dead volume, no signal
+        return 0.0
     if vol_ratio > 2.0:
-        # Big volume — direction depends on trend
         return 0.8 * (1.0 if trend_dir > 0 else -0.5)
     elif vol_ratio > 1.5:
         return 0.5 * (1.0 if trend_dir > 0 else -0.3)
@@ -125,95 +124,112 @@ def _score_volume(ind: dict) -> float:
     return 0.0
 
 
+def _score_vol_zscore(ind: dict) -> float:
+    """Volume Z-score — statistically unusual volume for THIS symbol.
+
+    A Z-score of 2.5 means volume is 2.5 standard deviations above its
+    own recent mean, regardless of absolute size.  Much more reliable
+    than comparing to a fixed floor.
+    """
+    z = ind.get("volume_zscore", 0.0)
+    trend_dir = ind.get("trend", 0)
+    if z >= 3.0:
+        # Extreme — very likely driven by a catalyst
+        return 0.9 * (1.0 if trend_dir >= 0 else -0.6)
+    elif z >= 2.5:
+        return 0.7 * (1.0 if trend_dir >= 0 else -0.4)
+    elif z >= 1.5:
+        return 0.4 * (1.0 if trend_dir >= 0 else -0.2)
+    elif z <= -1.5:
+        return -0.2  # volume drying up = be cautious
+    return 0.0
+
+
 def _score_obv(ind: dict) -> float:
-    """OBV trend: confirms or diverges from price trend."""
     obv = ind.get("obv_trend", 0)
     trend = ind.get("trend", 0)
-    if obv > 0 and trend > 0:
-        return 0.6    # OBV confirms uptrend
-    elif obv > 0 and trend <= 0:
-        return 0.4    # bullish divergence (OBV up, price down)
-    elif obv < 0 and trend < 0:
-        return -0.6   # OBV confirms downtrend
-    elif obv < 0 and trend >= 0:
-        return -0.4   # bearish divergence (OBV down, price up)
+    if obv > 0 and trend > 0:   return 0.6
+    elif obv > 0 and trend <= 0: return 0.4
+    elif obv < 0 and trend < 0:  return -0.6
+    elif obv < 0 and trend >= 0: return -0.4
     return 0.0
 
 
 def _score_vwap(ind: dict) -> float:
-    """Price vs VWAP: below VWAP = potential buy, above = potential sell."""
     pv = ind.get("price_vs_vwap", 0)
-    if pv < -2.0:
-        return 0.7     # well below VWAP
-    elif pv < -0.5:
-        return 0.3
-    elif pv > 2.0:
-        return -0.7    # well above VWAP
-    elif pv > 0.5:
-        return -0.3
+    if pv < -2.0:   return 0.7
+    elif pv < -0.5: return 0.3
+    elif pv > 2.0:  return -0.7
+    elif pv > 0.5:  return -0.3
     return 0.0
 
 
 def _score_trend(indicators_all_tf: dict[str, dict]) -> float:
-    """Multi-timeframe trend alignment. More TFs aligned = stronger signal."""
     if not indicators_all_tf:
         return 0.0
-
-    bullish_count = 0
-    total = 0
-    # Weight higher timeframes more
     tf_weights = {"15m": 0.5, "1h": 1.0, "4h": 1.5, "1d": 2.0}
     weighted_sum = 0.0
     weight_total = 0.0
-
     for tf, ind in indicators_all_tf.items():
         w = tf_weights.get(tf, 1.0)
         trend = ind.get("trend", 0)
         weighted_sum += trend * w
         weight_total += w
-        total += 1
-        if trend > 0:
-            bullish_count += 1
-
     if weight_total == 0:
         return 0.0
-
-    # Normalize to [-1, 1]
     return max(-1.0, min(1.0, weighted_sum / weight_total))
 
 
+def _score_breakout(ind: dict) -> float:
+    """Price breaking above N-period high = strong momentum signal.
+
+    breakout_48h = +1 (above 48-bar high), -1 (below 48-bar low), 0 (inside).
+    Combine with momentum acceleration for a stronger confirmation.
+    """
+    bo = ind.get("breakout_48h", 0.0)
+    accel = ind.get("momentum_accel", 0.0)
+    if bo > 0:
+        # Breakout above prior range + accelerating momentum = very bullish
+        return min(1.0, 0.7 + accel * 0.3)
+    elif bo < 0:
+        return max(-1.0, -0.7 + accel * 0.3)
+    return 0.0
+
+
+def _score_momentum_accel(ind: dict) -> float:
+    """2nd derivative of price — is momentum speeding up or slowing down?
+
+    Used to distinguish genuine breakouts from exhausted moves.
+    """
+    accel = ind.get("momentum_accel", 0.0)
+    if accel > 0.5:   return 0.7
+    elif accel > 0.2: return 0.4
+    elif accel > 0.0: return 0.1
+    elif accel < -0.5: return -0.5   # slight asymmetry: decelerating bear < accel bull
+    elif accel < -0.2: return -0.3
+    return 0.0
+
+
 def _score_sr(sr: dict, price: float) -> float:
-    """Support/resistance proximity: near support = buy, near resistance = sell."""
     if not sr or not price or price <= 0:
         return 0.0
-
     support = sr.get("nearest_support")
     resistance = sr.get("nearest_resistance")
-
     score = 0.0
     if support and support > 0:
-        dist_to_support = (price - support) / price * 100
-        if 0 < dist_to_support < 1.5:
-            score += 0.8  # very near support — buy zone
-        elif 0 < dist_to_support < 3.0:
-            score += 0.4
-
+        dist = (price - support) / price * 100
+        if 0 < dist < 1.5:  score += 0.8
+        elif 0 < dist < 3.0: score += 0.4
     if resistance and resistance > 0:
-        dist_to_resistance = (resistance - price) / price * 100
-        if 0 < dist_to_resistance < 1.5:
-            score -= 0.8  # very near resistance — sell zone
-        elif 0 < dist_to_resistance < 3.0:
-            score -= 0.4
-
+        dist = (resistance - price) / price * 100
+        if 0 < dist < 1.5:  score -= 0.8
+        elif 0 < dist < 3.0: score -= 0.4
     return max(-1.0, min(1.0, score))
 
 
 def _score_btc(btc_anchor: dict | None) -> float:
-    """BTC trend: if BTC is bearish, penalize all altcoin buys."""
     if not btc_anchor:
         return 0.0
-
-    # Combine 1h and 4h BTC signals
     signals = []
     for tf in ("1h", "4h"):
         ind = btc_anchor.get(tf, {})
@@ -221,239 +237,169 @@ def _score_btc(btc_anchor: dict | None) -> float:
             continue
         trend = ind.get("trend", 0)
         rsi = ind.get("rsi14", 50)
-        # BTC bullish: trend up + RSI not overbought
-        if trend > 0 and rsi < 70:
-            signals.append(0.5)
-        elif trend > 0:
-            signals.append(0.2)
-        # BTC bearish: trend down + RSI not oversold
-        elif trend < 0 and rsi > 30:
-            signals.append(-0.7)
-        elif trend < 0:
-            signals.append(-0.3)
-        else:
-            signals.append(0.0)
-
+        if trend > 0 and rsi < 70:   signals.append(0.5)
+        elif trend > 0:               signals.append(0.2)
+        elif trend < 0 and rsi > 30:  signals.append(-0.7)
+        elif trend < 0:               signals.append(-0.3)
+        else:                         signals.append(0.0)
     return sum(signals) / len(signals) if signals else 0.0
 
 
 def _score_ml(ml_signal: dict | None) -> float:
-    """LSTM + RL + GPU ensemble + MTF consensus. Weighted by model diversity."""
     if not ml_signal:
         return 0.0
-
     lstm = ml_signal.get("lstm", {})
     rl = ml_signal.get("rl", {})
     lstm_sig = lstm.get("signal", "HOLD")
     lstm_conf = lstm.get("confidence", 0)
     rl_sig = rl.get("action", "HOLD")
-
     score = 0.0
-
-    # LSTM + RL agreement
     if lstm_sig == rl_sig:
-        if lstm_sig == "BUY":
-            score += min(lstm_conf, 1.0) * 0.4
-        elif lstm_sig == "SELL":
-            score -= min(lstm_conf, 1.0) * 0.4
-    elif lstm_sig == "BUY" and lstm_conf > 0.6:
-        score += 0.1
-    elif lstm_sig == "SELL" and lstm_conf > 0.6:
-        score -= 0.1
+        if lstm_sig == "BUY":    score += min(lstm_conf, 1.0) * 0.4
+        elif lstm_sig == "SELL": score -= min(lstm_conf, 1.0) * 0.4
+    elif lstm_sig == "BUY" and lstm_conf > 0.6:  score += 0.1
+    elif lstm_sig == "SELL" and lstm_conf > 0.6: score -= 0.1
 
-    # GPU ensemble bonus
     ens = ml_signal.get("ensemble", {})
-    ens_sig = ens.get("signal", "HOLD")
-    ens_conf = ens.get("confidence", 0)
-    ens_agree = ens.get("agreement", 0)
-    if ens_sig == "BUY" and ens_agree >= 0.75:
-        score += min(ens_conf, 1.0) * 0.3
-    elif ens_sig == "SELL" and ens_agree >= 0.75:
-        score -= min(ens_conf, 1.0) * 0.3
+    ens_sig, ens_conf, ens_agree = ens.get("signal", "HOLD"), ens.get("confidence", 0), ens.get("agreement", 0)
+    if ens_sig == "BUY" and ens_agree >= 0.75:    score += min(ens_conf, 1.0) * 0.3
+    elif ens_sig == "SELL" and ens_agree >= 0.75: score -= min(ens_conf, 1.0) * 0.3
 
-    # MTF fusion bonus (strongest cross-TF signal)
     mtf = ml_signal.get("mtf", {})
-    mtf_sig = mtf.get("signal", "HOLD")
-    mtf_conf = mtf.get("confidence", 0)
-    if mtf_sig == "BUY" and mtf_conf >= 0.6:
-        score += min(mtf_conf, 1.0) * 0.2
-    elif mtf_sig == "SELL" and mtf_conf >= 0.6:
-        score -= min(mtf_conf, 1.0) * 0.2
+    mtf_sig, mtf_conf = mtf.get("signal", "HOLD"), mtf.get("confidence", 0)
+    if mtf_sig == "BUY" and mtf_conf >= 0.6:    score += min(mtf_conf, 1.0) * 0.2
+    elif mtf_sig == "SELL" and mtf_conf >= 0.6: score -= min(mtf_conf, 1.0) * 0.2
 
-    # Anomaly penalty
-    anom = ml_signal.get("anomaly", {})
-    if anom.get("is_anomaly"):
-        score -= 0.5  # strong bearish penalty for anomalous patterns
+    if ml_signal.get("anomaly", {}).get("is_anomaly"):
+        score -= 0.5
 
-    # Correlation divergence bonus
-    corr_div = ml_signal.get("corr_divergence")
-    if corr_div:
-        score += 0.15  # mean-reversion opportunity for laggard
+    if ml_signal.get("corr_divergence"):
+        score += 0.15
 
     return max(-1.0, min(1.0, score))
 
 
 def _score_orderbook(ob: dict) -> float:
-    """Order book pressure ratio: high buy pressure = bullish."""
     pressure = ob.get("pressure_ratio", 1.0)
-    if pressure > 2.0:
-        return 0.7
-    elif pressure > 1.5:
-        return 0.4
-    elif pressure > 1.2:
-        return 0.2
-    elif pressure < 0.5:
-        return -0.7
-    elif pressure < 0.67:
-        return -0.4
-    elif pressure < 0.83:
-        return -0.2
+    if pressure > 2.0:   return 0.7
+    elif pressure > 1.5: return 0.4
+    elif pressure > 1.2: return 0.2
+    elif pressure < 0.5:  return -0.7
+    elif pressure < 0.67: return -0.4
+    elif pressure < 0.83: return -0.2
     return 0.0
 
 
 def _score_depth(ob: dict) -> float:
-    """Orderbook depth imbalance within 2% of price.
-
-    Strong bid depth = buyers waiting = bullish support.
-    Strong ask depth = sellers stacked = resistance.
-    """
     imbalance = ob.get("depth_imbalance", 0.0)
-    if imbalance > 0.5:
-        return 0.7    # 3:1 bid vs ask ratio within 2%
-    elif imbalance > 0.3:
-        return 0.4
-    elif imbalance > 0.15:
-        return 0.2
-    elif imbalance < -0.5:
-        return -0.7
-    elif imbalance < -0.3:
-        return -0.4
-    elif imbalance < -0.15:
-        return -0.2
+    if imbalance > 0.5:   return 0.7
+    elif imbalance > 0.3: return 0.4
+    elif imbalance > 0.15: return 0.2
+    elif imbalance < -0.5:  return -0.7
+    elif imbalance < -0.3:  return -0.4
+    elif imbalance < -0.15: return -0.2
     return 0.0
 
 
 def _score_whale(whale_data: dict | None) -> float:
-    """Whale trade activity — large trades signal institutional interest.
-
-    Net buy flow = bullish (smart money accumulating).
-    Net sell flow = bearish (smart money distributing).
-    """
     if not whale_data:
         return 0.0
     net_flow = whale_data.get("whale_net_flow", 0)
     total_vol = whale_data.get("whale_total_volume", 0)
     if total_vol <= 0:
         return 0.0
-
-    # Normalize: what fraction of total whale volume is directional?
-    bias = net_flow / total_vol  # [-1, +1]
-
-    if bias > 0.5:
-        return 0.7    # strong whale buying
-    elif bias > 0.2:
-        return 0.4
-    elif bias > 0:
-        return 0.2
-    elif bias < -0.5:
-        return -0.7   # strong whale selling
-    elif bias < -0.2:
-        return -0.4
-    elif bias < 0:
-        return -0.2
+    bias = net_flow / total_vol
+    if bias > 0.5:    return 0.7
+    elif bias > 0.2:  return 0.4
+    elif bias > 0:    return 0.2
+    elif bias < -0.5: return -0.7
+    elif bias < -0.2: return -0.4
+    elif bias < 0:    return -0.2
     return 0.0
 
 
 def _score_bb_squeeze(ind: dict) -> float:
-    """Bollinger squeeze — low volatility compression precedes breakout.
-
-    Squeeze + bullish trend = strong buy signal.
-    Squeeze + bearish trend = strong sell signal.
-    No squeeze = neutral (handled by bb_signal).
-    """
     squeeze = ind.get("bb_squeeze", 0)
     if not squeeze:
         return 0.0
-    # Squeeze detected — direction from trend
     trend = ind.get("trend", 0)
-    if trend > 0:
-        return 0.7    # squeeze + uptrend = breakout buy
-    elif trend < 0:
-        return -0.7   # squeeze + downtrend = breakdown sell
-    return 0.3        # squeeze + neutral = slight bullish bias (breakout up is more common)
+    if trend > 0:   return 0.7
+    elif trend < 0: return -0.7
+    return 0.3
 
 
 def _score_oi(oi_data: dict | None) -> float:
-    """Open Interest — rising OI + rising price = real trend.
-
-    Rising OI + rising price = strong continuation signal.
-    Rising OI + falling price = bearish (shorts entering).
-    Falling OI = positions closing, trend weakening.
-    """
     if not oi_data:
         return 0.0
     oi_change = oi_data.get("change_pct", 0)
     price_trend = oi_data.get("price_trend", 0)
-
     if oi_change > 5:
-        # OI rising significantly
-        if price_trend > 0:
-            return 0.6    # rising OI + rising price = real buying
-        else:
-            return -0.5   # rising OI + falling price = shorts entering
+        return 0.6 if price_trend > 0 else -0.5
     elif oi_change < -5:
-        # OI falling significantly
-        if price_trend > 0:
-            return 0.2    # short squeeze (OI falling + price rising)
-        else:
-            return -0.2   # long liquidation
+        return 0.2 if price_trend > 0 else -0.2
     return 0.0
 
-def _score_funding(funding_data: dict | None) -> float:
-    """Funding rate — contrarian signal.
 
-    High positive rate = crowd is long (longs pay shorts) → contrarian bearish
-    High negative rate = crowd is short → contrarian bullish
-    Extreme rates often precede reversals.
-    """
+def _score_funding(funding_data: dict | None) -> float:
     if not funding_data:
         return 0.0
     rate = funding_data.get("rate", 0)
-    if rate > 0.001:       # extreme positive → contrarian sell
-        return -0.7
-    elif rate > 0.0005:
-        return -0.3
-    elif rate < -0.001:    # extreme negative → contrarian buy
-        return 0.7
-    elif rate < -0.0005:
-        return 0.3
+    if rate > 0.001:       return -0.7
+    elif rate > 0.0005:    return -0.3
+    elif rate < -0.001:    return 0.7
+    elif rate < -0.0005:   return 0.3
     return 0.0
 
 
 def _score_ls_ratio(ls_data: dict | None) -> float:
-    """Long/short ratio — contrarian signal.
-
-    Crowd heavily long (ratio > 1.5) = contrarian bearish
-    Crowd heavily short (ratio < 0.67) = contrarian bullish
-    """
     if not ls_data:
         return 0.0
     ratio = ls_data.get("ratio", 1.0)
-    if ratio > 2.0:
-        return -0.7      # extreme crowd long → contrarian sell
-    elif ratio > 1.5:
-        return -0.4
-    elif ratio > 1.2:
-        return -0.15
-    elif ratio < 0.5:
-        return 0.7        # extreme crowd short → contrarian buy
-    elif ratio < 0.67:
-        return 0.4
-    elif ratio < 0.83:
-        return 0.15
+    if ratio > 2.0:    return -0.7
+    elif ratio > 1.5:  return -0.4
+    elif ratio > 1.2:  return -0.15
+    elif ratio < 0.5:  return 0.7
+    elif ratio < 0.67: return 0.4
+    elif ratio < 0.83: return 0.15
     return 0.0
 
-# ── Composite scoring ────────────────────────────────────────────────────────
+
+def _score_gpu_momentum(symbol: str, momentum_ranks: dict | None) -> float:
+    """Cross-sectional GPU momentum rank.
+
+    momentum_ranks is a dict {symbol: percentile_0_to_1} computed by the
+    /rank/momentum endpoint on the GPU server.  Top decile = +1, bottom = -1.
+    """
+    if not momentum_ranks:
+        return 0.0
+    pct = momentum_ranks.get(symbol, 0.5)
+    if pct >= 0.90:   return 0.9    # top 10% of all symbols
+    elif pct >= 0.80: return 0.6
+    elif pct >= 0.70: return 0.3
+    elif pct <= 0.10: return -0.9   # bottom 10%
+    elif pct <= 0.20: return -0.5
+    elif pct <= 0.30: return -0.2
+    return 0.0
+
+
+def _score_sector_rotation(symbol: str, sector_heat: dict | None) -> float:
+    """Sector rotation bonus — is this coin's sector currently hot?
+
+    sector_heat: {symbol: heat_score_-1_to_1} from /cluster/rotation.
+    Heat = weighted average momentum of all symbols in the same GPU cluster.
+    """
+    if not sector_heat:
+        return 0.0
+    heat = sector_heat.get(symbol, 0.0)
+    if heat >= 0.6:   return 0.8
+    elif heat >= 0.4: return 0.5
+    elif heat >= 0.2: return 0.2
+    elif heat <= -0.6: return -0.6
+    elif heat <= -0.4: return -0.3
+    return 0.0
+
+
+# ── Composite scoring ─────────────────────────────────────────────────────────
 
 def score_symbol(
     symbol: str,
@@ -466,6 +412,8 @@ def score_symbol(
     ls_data: dict | None = None,
     oi_data: dict | None = None,
     whale_data: dict | None = None,
+    momentum_ranks: dict | None = None,
+    sector_heat: dict | None = None,
 ) -> dict[str, Any]:
     """Score a symbol and return detailed factor breakdown.
 
@@ -480,26 +428,32 @@ def score_symbol(
 
     # Compute each factor
     factors: dict[str, float] = {
-        "rsi_signal":       _score_rsi(ind_1h),
-        "macd_signal":      _score_macd(ind_1h),
-        "bb_signal":        _score_bb(ind_1h),
-        "bb_squeeze_signal":_score_bb_squeeze(ind_1h),
-        "volume_signal":    _score_volume(ind_1h),
-        "obv_signal":       _score_obv(ind_1h),
-        "vwap_signal":      _score_vwap(ind_1h),
-        "trend_signal":     _score_trend(indicators),
-        "sr_signal":        _score_sr(sr, price),
-        "btc_signal":       _score_btc(btc_anchor),
-        "ml_signal":        _score_ml(ml_signal),
-        "orderbook_signal": _score_orderbook(ob),
-        "depth_signal":     _score_depth(ob),
-        "whale_signal":     _score_whale(whale_data),
-        "funding_signal":   _score_funding(funding_data),
-        "ls_ratio_signal":  _score_ls_ratio(ls_data),
-        "oi_signal":        _score_oi(oi_data),
+        "rsi_signal":            _score_rsi(ind_1h),
+        "macd_signal":           _score_macd(ind_1h),
+        "macd_div_signal":       _score_macd_divergence(ind_1h),
+        "bb_signal":             _score_bb(ind_1h),
+        "bb_squeeze_signal":     _score_bb_squeeze(ind_1h),
+        "volume_signal":         _score_volume(ind_1h),
+        "vol_zscore_signal":     _score_vol_zscore(ind_1h),
+        "obv_signal":            _score_obv(ind_1h),
+        "vwap_signal":           _score_vwap(ind_1h),
+        "trend_signal":          _score_trend(indicators),
+        "sr_signal":             _score_sr(sr, price),
+        "breakout_signal":       _score_breakout(ind_1h),
+        "momentum_accel_signal": _score_momentum_accel(ind_1h),
+        "btc_signal":            _score_btc(btc_anchor),
+        "ml_signal":             _score_ml(ml_signal),
+        "orderbook_signal":      _score_orderbook(ob),
+        "depth_signal":          _score_depth(ob),
+        "whale_signal":          _score_whale(whale_data),
+        "funding_signal":        _score_funding(funding_data),
+        "ls_ratio_signal":       _score_ls_ratio(ls_data),
+        "oi_signal":             _score_oi(oi_data),
+        "gpu_momentum_signal":   _score_gpu_momentum(symbol, momentum_ranks),
+        "sector_rotation_signal":_score_sector_rotation(symbol, sector_heat),
     }
 
-    # RSI divergence adds bonus
+    # RSI divergence adds bonus to RSI score
     rsi_div = ind_1h.get("rsi_divergence", 0)
     if rsi_div > 0:
         factors["rsi_signal"] = min(1.0, factors["rsi_signal"] + 0.3)
@@ -512,13 +466,12 @@ def score_symbol(
     # Normalize to 0–100 scale (50 = neutral)
     score = max(0, min(100, 50 + composite * 50))
 
-    # Direction: positive composite = buy, negative = sell
     direction = 1 if composite > 0 else (-1 if composite < 0 else 0)
 
     # Build signal descriptions for the top contributing factors
     signals: list[str] = []
     sorted_factors = sorted(factors.items(), key=lambda x: abs(x[1]), reverse=True)
-    for fname, fval in sorted_factors[:4]:
+    for fname, fval in sorted_factors[:5]:  # show top 5 (was 4)
         if abs(fval) < 0.1:
             continue
         label = fname.replace("_signal", "").upper()
@@ -534,7 +487,7 @@ def score_symbol(
     }
 
 
-# ── ATR-based SL/TP computation ─────────────────────────────────────────────
+# ── ATR-based SL/TP computation ──────────────────────────────────────────────
 
 def compute_trade_levels(
     symbol: str,
@@ -542,54 +495,40 @@ def compute_trade_levels(
     action: str,
     score: float,
 ) -> dict[str, float] | None:
-    """Compute stop-loss and take-profit using ATR, enforcing min R:R ratio.
-
-    Returns dict with sl_pct, tp_pct, rr_ratio, quantity_pct or None if
-    the setup doesn't meet minimum R:R requirements.
-    """
+    """Compute stop-loss and take-profit using ATR, enforcing min R:R ratio."""
     indicators = symbol_data.get("indicators", {})
     price = symbol_data.get("price", 0)
     if not price or price <= 0:
         return None
 
-    # Use 1h ATR as base, 4h ATR as confirmation
     atr_1h = indicators.get("1h", {}).get("atr", 0)
     atr_4h = indicators.get("4h", {}).get("atr", 0)
 
-    # If no ATR available, use a conservative default
     if atr_1h <= 0:
-        atr_1h = price * 0.02  # 2% default
+        atr_1h = price * 0.02
 
-    atr_pct = (atr_1h / price) * 100  # ATR as % of price
+    atr_pct = (atr_1h / price) * 100
 
-    # Stop-loss: 1.5x ATR (gives room for normal volatility)
     sl_multiplier = settings.SL_ATR_MULTIPLIER
     sl_pct = round(atr_pct * sl_multiplier, 2)
-
-    # Clamp SL to reasonable range
     sl_pct = max(settings.MIN_SL_PCT, min(settings.MAX_SL_PCT, sl_pct))
 
-    # Take-profit: enforce minimum R:R ratio
     min_rr = settings.MIN_REWARD_RISK_RATIO
     tp_pct = round(sl_pct * min_rr, 2)
 
-    # Boost TP for high-score setups (score 80+ gets extra upside)
     if score >= 80:
         tp_pct = round(tp_pct * 1.5, 2)
     elif score >= 70:
         tp_pct = round(tp_pct * 1.2, 2)
 
-    # Clamp TP
-    tp_pct = max(tp_pct, sl_pct * min_rr)  # always enforce min R:R
-    tp_pct = min(tp_pct, 30.0)  # cap at 30%
+    tp_pct = max(tp_pct, sl_pct * min_rr)
+    tp_pct = min(tp_pct, 30.0)
 
     rr_ratio = round(tp_pct / sl_pct, 2) if sl_pct > 0 else 0
 
-    # Reject if R:R is below minimum
     if rr_ratio < min_rr:
         return None
 
-    # Position size: scale with score (higher score → bigger position)
     base_pct = settings.MAX_POSITION_PCT
     if score >= 80:
         qty_pct = base_pct * 0.9
@@ -616,11 +555,7 @@ async def refine_with_monte_carlo(
     candles_1h: list,
     price: float,
 ) -> dict:
-    """Refine SL/TP levels using GPU Monte Carlo simulation.
-
-    Returns the original dict enriched with MC probability estimates,
-    or the original dict unchanged if GPU is unavailable.
-    """
+    """Refine SL/TP levels using GPU Monte Carlo simulation."""
     from app.services import gpu_client
 
     if not gpu_client.is_enabled() or not candles_1h or price <= 0:
@@ -642,10 +577,8 @@ async def refine_with_monte_carlo(
     sl_tp["mc_edge"] = mc.get("edge", 0)
     sl_tp["mc_rr"] = mc.get("reward_risk_ratio", 0)
 
-    # If MC shows negative edge, tighten TP or widen SL
     edge = mc.get("edge", 0)
     if edge < -0.5 and sl_tp["tp_pct"] > sl_tp["sl_pct"] * 1.5:
-        # Reduce TP to improve hit probability
         sl_tp["tp_pct"] = round(sl_tp["sl_pct"] * settings.MIN_REWARD_RISK_RATIO, 2)
         sl_tp["rr_ratio"] = round(sl_tp["tp_pct"] / sl_tp["sl_pct"], 2)
         sl_tp["mc_adjusted"] = True
@@ -653,7 +586,44 @@ async def refine_with_monte_carlo(
     return sl_tp
 
 
-# ── Main entry point: rank & build candidates ───────────────────────────────
+# ── Session-aware threshold helpers ──────────────────────────────────────────
+
+def _session_adjustment() -> float:
+    """Return a score threshold delta based on current UTC hour.
+
+    Altcoin behaviour varies significantly by session:
+    - Asian session (00:00–08:00 UTC): alts decouple from BTC, more pump activity
+      → lower threshold (more opportunities)
+    - London/EU open (07:00–10:00 UTC): overlap creates volatility → neutral
+    - US session (13:00–22:00 UTC): narrative-driven, high liquidity → neutral
+    - Dead zone (22:00–00:00 UTC): thin liquidity, false signals more common
+      → higher threshold (be more selective)
+    - Weekends: thin markets, higher chance of fake breakouts → +3 adjustment
+    """
+    now = datetime.now(timezone.utc)
+    hour = now.hour
+    weekday = now.weekday()  # 0=Mon, 6=Sun
+
+    adjustment = 0.0
+
+    # Weekend premium: thin liquidity = more false signals
+    if weekday >= 5:
+        adjustment += 3.0
+
+    # Dead-zone penalty: very thin market
+    if 22 <= hour or hour < 1:
+        adjustment += 2.0
+    # Asian session bonus: alts are more active
+    elif 1 <= hour < 8:
+        adjustment -= 3.0
+    # US open overlap with EU close (high volume)
+    elif 13 <= hour < 17:
+        adjustment -= 1.0
+
+    return adjustment
+
+
+# ── Main entry point: rank & build candidates ────────────────────────────────
 
 def rank_symbols(
     symbols_data: dict[str, Any],
@@ -663,11 +633,13 @@ def rank_symbols(
     held_symbols: set[str] | None = None,
     market_regime: dict | None = None,
     market_intel: dict | None = None,
+    momentum_ranks: dict | None = None,
+    sector_heat: dict | None = None,
 ) -> list[TradeCandidate]:
     """Score all symbols and return ranked trade candidates.
 
     Only returns candidates that:
-    1. Score >= MIN_QUANT_SCORE (configurable)
+    1. Score >= MIN_QUANT_SCORE (configurable, regime + session adjusted)
     2. Have valid ATR-based SL/TP
     3. Meet minimum R:R ratio
     4. Pass regime-aware filtering
@@ -678,27 +650,33 @@ def rank_symbols(
     regime = (market_regime or {}).get("regime", "unknown")
     min_score = settings.MIN_QUANT_SCORE
 
-    # Adjust threshold based on regime
+    # Regime-aware threshold adjustment
     regime_adjustments = {
-        "strong_uptrend":   -8,   # lower threshold = more trades
+        "strong_uptrend":   -8,
         "uptrend":          -4,
         "ranging":           0,
-        "downtrend":        +5,   # higher threshold = fewer trades
+        "downtrend":        +5,
         "strong_downtrend": +10,
         "choppy":           +8,
     }
     adjusted_min = min_score + regime_adjustments.get(regime, 0)
 
-    # Fear & Greed adjustment: extreme greed → tighten, extreme fear → loosen
+    # Fear & Greed adjustment
     intel = market_intel or {}
     fg = intel.get("fear_greed", {})
     fg_value = fg.get("value", 50)
     if fg_value >= 80:
-        adjusted_min += 5    # extreme greed → be more selective
+        adjusted_min += 5
     elif fg_value <= 20:
-        adjusted_min -= 5    # extreme fear → allow more trades (contrarian)
+        adjusted_min -= 5
 
-    # Less-fear mode: significantly lower threshold
+    # Session-aware adjustment (new)
+    session_delta = _session_adjustment()
+    adjusted_min += session_delta
+    if session_delta != 0:
+        logger.debug("Session adjustment: %+.0f pts (threshold now %.0f)", session_delta, adjusted_min)
+
+    # Less-fear mode override
     if settings.LESS_FEAR:
         adjusted_min = min(adjusted_min, 45)
         logger.info("Less-fear mode: threshold capped at %.0f", adjusted_min)
@@ -708,7 +686,6 @@ def rank_symbols(
     ls_map = intel.get("long_short", {})
     oi_map = intel.get("open_interest", {})
 
-    # Whale data from real-time WebSocket detector
     from app.services.whale_detector import whale_detector
     whale_map = whale_detector.get_all_whale_data()
 
@@ -725,13 +702,14 @@ def rank_symbols(
             ls_data=ls_map.get(sym),
             oi_data=oi_map.get(sym),
             whale_data=whale_map.get(sym),
+            momentum_ranks=momentum_ranks,
+            sector_heat=sector_heat,
         )
 
         score = result["score"]
         direction = result["direction"]
         signals = result["signals"]
 
-        # BUY candidates: score must be above threshold
         if direction > 0 and score >= adjusted_min and sym not in held:
             levels = compute_trade_levels(sym, data, "BUY", score)
             if levels:
@@ -752,13 +730,11 @@ def rank_symbols(
                     factor_scores=result["factors"],
                 ))
 
-        # SELL candidates: held positions with bearish score
         elif sym in held and score < 45:
-            # For sells, we don't need SL/TP (position is being closed)
             candidates.append(TradeCandidate(
                 symbol=sym,
                 action="SELL",
-                score=100 - score,  # invert: lower score → better sell signal
+                score=100 - score,
                 timeframe="1h",
                 entry_price=data.get("price", 0),
                 stop_loss_price=0,
@@ -766,25 +742,24 @@ def rank_symbols(
                 stop_loss_pct=0,
                 take_profit_pct=0,
                 reward_risk_ratio=0,
-                quantity_pct=100,  # full close by default (Claude can partial)
+                quantity_pct=100,
                 signals=signals,
                 factor_scores=result["factors"],
             ))
 
-    # Sort by score descending
     candidates.sort(key=lambda c: c.score, reverse=True)
 
     if candidates:
         logger.info(
-            "Quant scorer: %d candidates (min_score=%.0f, regime=%s) — top: %s",
-            len(candidates), adjusted_min, regime,
+            "Quant scorer: %d candidates (min_score=%.0f, regime=%s, session_adj=%+.0f) — top: %s",
+            len(candidates), adjusted_min, regime, session_delta,
             " | ".join(f"{c.symbol} {c.action} score={c.score:.0f} R:R={c.reward_risk_ratio:.1f}"
                        for c in candidates[:3]),
         )
     else:
         logger.info(
-            "Quant scorer: 0 candidates (min_score=%.0f, regime=%s) — HOLD cycle",
-            adjusted_min, regime,
+            "Quant scorer: 0 candidates (min_score=%.0f, regime=%s, session_adj=%+.0f) — HOLD cycle",
+            adjusted_min, regime, session_delta,
         )
 
     return candidates

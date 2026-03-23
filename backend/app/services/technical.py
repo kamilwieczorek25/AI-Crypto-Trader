@@ -138,8 +138,96 @@ def compute_correlation_matrix(ohlcv_data: dict[str, dict[str, list]], top_n: in
     }
 
 
+# ── Divergence detection helpers ─────────────────────────────────────────────
+
+def _find_swing_highs(arr: np.ndarray, lookback: int = 3) -> list[int]:
+    """Return indices of swing high points (local maxima)."""
+    highs = []
+    for i in range(lookback, len(arr) - lookback):
+        window = arr[i - lookback: i + lookback + 1]
+        if arr[i] == window.max():
+            highs.append(i)
+    return highs
+
+
+def _find_swing_lows(arr: np.ndarray, lookback: int = 3) -> list[int]:
+    """Return indices of swing low points (local minima)."""
+    lows = []
+    for i in range(lookback, len(arr) - lookback):
+        window = arr[i - lookback: i + lookback + 1]
+        if arr[i] == window.min():
+            lows.append(i)
+    return lows
+
+
+def detect_divergences(close: np.ndarray, rsi: np.ndarray, macd_hist: np.ndarray) -> dict:
+    """Detect RSI and MACD divergences using swing-point comparison.
+
+    Bullish RSI divergence  : price makes lower low, RSI makes higher low  → buy signal
+    Bearish RSI divergence  : price makes higher high, RSI makes lower high → sell signal
+    Bullish MACD divergence : price makes lower low, MACD hist makes higher low
+    Bearish MACD divergence : price makes higher high, MACD hist makes lower high
+
+    Returns dict with 'rsi_divergence' and 'macd_divergence', each in [-1, 0, 1].
+    """
+    results = {"rsi_divergence": 0.0, "macd_divergence": 0.0}
+
+    if len(close) < 20:
+        return results
+
+    close_arr = np.array(close)
+    rsi_arr   = np.array(rsi)
+    macd_arr  = np.array(macd_hist)
+
+    # Use last 40 bars for swing detection
+    window = min(40, len(close_arr))
+    c   = close_arr[-window:]
+    r   = rsi_arr[-window:]
+    m   = macd_arr[-window:]
+
+    price_lows  = _find_swing_lows(c)
+    price_highs = _find_swing_highs(c)
+
+    # ── RSI divergence ────────────────────────────────────────────────
+    if len(price_lows) >= 2 and len(r) == len(c):
+        i1, i2 = price_lows[-2], price_lows[-1]
+        if c[i2] < c[i1] and r[i2] > r[i1]:
+            # Bullish: price lower low, RSI higher low
+            results["rsi_divergence"] = 1.0
+        elif c[i2] < c[i1] and r[i2] < r[i1] - 5:
+            # Confirmed downtrend: price AND RSI both lower
+            pass
+
+    if len(price_highs) >= 2 and len(r) == len(c):
+        i1, i2 = price_highs[-2], price_highs[-1]
+        if c[i2] > c[i1] and r[i2] < r[i1]:
+            # Bearish: price higher high, RSI lower high
+            results["rsi_divergence"] = -1.0
+
+    # ── MACD divergence ───────────────────────────────────────────────
+    if len(price_lows) >= 2 and len(m) == len(c):
+        i1, i2 = price_lows[-2], price_lows[-1]
+        if c[i2] < c[i1] and m[i2] > m[i1]:
+            results["macd_divergence"] = 1.0   # bullish
+
+    if len(price_highs) >= 2 and len(m) == len(c):
+        i1, i2 = price_highs[-2], price_highs[-1]
+        if c[i2] > c[i1] and m[i2] < m[i1]:
+            results["macd_divergence"] = -1.0  # bearish
+
+    return results
+
+
 def compute_indicators(ohlcv: list[list[float]]) -> dict[str, float]:
-    """Return a dict of TA indicators for a single timeframe's OHLCV data."""
+    """Return a dict of TA indicators for a single timeframe's OHLCV data.
+
+    New fields added:
+    - volume_zscore      : Z-score of current volume vs its own 20-bar mean
+    - breakout_48h       : +1 if price broke above 48-bar high, -1 if broke below low, 0 otherwise
+    - momentum_accel     : 2nd derivative of close price (normalised)
+    - macd_divergence    : swing-based MACD divergence (-1/0/+1)
+    - rsi_divergence     : swing-based RSI divergence (-1/0/+1) [improved from slope-based]
+    """
     df = _ohlcv_to_df(ohlcv)
     if df.empty or len(df) < 30:
         return _empty_indicators(status="insufficient_data")
@@ -163,8 +251,11 @@ def compute_indicators(ohlcv: list[list[float]]) -> dict[str, float]:
             indicators["macd_hist"] = _safe_float(
                 macd_df[hist_col[0]].iloc[-1] if hist_col else None
             )
+            # Full MACD histogram series for divergence calculation
+            _macd_hist_series = macd_df[hist_col[0]].fillna(0).values if hist_col else np.zeros(len(close))
         else:
             indicators["macd_hist"] = 0.0
+            _macd_hist_series = np.zeros(len(close))
 
         # Bollinger Bands %B + Squeeze detection
         bb = ta.bbands(close, length=20, std=2)
@@ -173,7 +264,6 @@ def compute_indicators(ohlcv: list[list[float]]) -> dict[str, float]:
             indicators["bb_pct_b"] = _safe_float(
                 bb[pct_col[0]].iloc[-1] if pct_col else None
             )
-            # BB Squeeze: bandwidth = (upper - lower) / middle
             upper_col = [c for c in bb.columns if "u" in c.lower()]
             lower_col = [c for c in bb.columns if "l" in c.lower() and "p" not in c.lower()]
             mid_col = [c for c in bb.columns if "m" in c.lower()]
@@ -185,7 +275,6 @@ def compute_indicators(ohlcv: list[list[float]]) -> dict[str, float]:
                 if len(bw) >= 20:
                     current_bw = _safe_float(bw.iloc[-1])
                     avg_bw = _safe_float(bw.rolling(20).mean().iloc[-1])
-                    # Squeeze = bandwidth is <60% of its 20-period average
                     indicators["bb_squeeze"] = 1.0 if (avg_bw > 0 and current_bw < avg_bw * 0.6) else 0.0
                     indicators["bb_bandwidth"] = current_bw
                 else:
@@ -206,6 +295,20 @@ def compute_indicators(ohlcv: list[list[float]]) -> dict[str, float]:
         # ATR 14
         atr = ta.atr(high, low, close, length=14)
         indicators["atr"] = _safe_float(atr.iloc[-1] if atr is not None else None)
+
+        # ── Swing-based RSI + MACD divergence ────────────────────────
+        rsi_full = ta.rsi(close, length=14)
+        if rsi_full is not None and len(rsi_full.dropna()) >= 20:
+            rsi_vals  = rsi_full.fillna(50).values
+            div = detect_divergences(
+                close.values, rsi_vals, _macd_hist_series
+            )
+            indicators["rsi_divergence"]  = div["rsi_divergence"]
+            indicators["macd_divergence"] = div["macd_divergence"]
+        else:
+            indicators["rsi_divergence"]  = 0.0
+            indicators["macd_divergence"] = 0.0
+
     else:
         # Fallback: basic RSI via pure pandas
         delta = close.diff()
@@ -222,14 +325,31 @@ def compute_indicators(ohlcv: list[list[float]]) -> dict[str, float]:
         indicators["atr"] = _safe_float(
             (high - low).rolling(14).mean().iloc[-1]
         )
+        indicators["rsi_divergence"]  = 0.0
+        indicators["macd_divergence"] = 0.0
 
-    # Volume ratio (current vs 20-bar average)
+    # ── Volume ratio (current vs 20-bar average) ──────────────────────
     vol_avg = volume.rolling(20).mean().iloc[-1]
+    current_vol = volume.iloc[-1]
     indicators["volume_ratio"] = _safe_float(
-        volume.iloc[-1] / vol_avg if vol_avg and vol_avg != 0 else 1.0
+        current_vol / vol_avg if vol_avg and vol_avg != 0 else 1.0
     )
 
-    # Volume trend (is volume increasing over last 5 bars?)
+    # ── Volume Z-score — statistically unusual for THIS symbol ────────
+    if len(volume) >= 10:
+        vol_window = volume.iloc[-20:] if len(volume) >= 20 else volume
+        v_mean = float(vol_window.mean())
+        v_std  = float(vol_window.std())
+        if v_std > 0:
+            indicators["volume_zscore"] = _safe_float(
+                (current_vol - v_mean) / v_std
+            )
+        else:
+            indicators["volume_zscore"] = 0.0
+    else:
+        indicators["volume_zscore"] = 0.0
+
+    # ── Volume trend (is volume increasing over last 5 bars?) ─────────
     if len(volume) >= 10:
         vol_recent = volume.iloc[-5:].mean()
         vol_prior = volume.iloc[-10:-5].mean()
@@ -239,7 +359,7 @@ def compute_indicators(ohlcv: list[list[float]]) -> dict[str, float]:
     else:
         indicators["volume_trend"] = 1.0
 
-    # OBV (On-Balance Volume) — normalised: direction of cumulative volume pressure
+    # ── OBV trend ─────────────────────────────────────────────────────
     obv = (np.sign(close.diff()) * volume).cumsum()
     if len(obv) >= 20:
         obv_ema = obv.ewm(span=20).mean()
@@ -247,13 +367,12 @@ def compute_indicators(ohlcv: list[list[float]]) -> dict[str, float]:
     else:
         indicators["obv_trend"] = 0.0
 
-    # VWAP (Volume Weighted Average Price) — intraday anchor
+    # ── VWAP ──────────────────────────────────────────────────────────
     typical_price = (high + low + close) / 3
     cum_tp_vol = (typical_price * volume).cumsum()
     cum_vol = volume.cumsum()
     vwap = cum_tp_vol / cum_vol.replace(0, np.nan)
     indicators["vwap"] = _safe_float(vwap.iloc[-1])
-    # Price vs VWAP: >0 means above VWAP (bullish), <0 means below (bearish)
     current_close = _safe_float(close.iloc[-1])
     if indicators["vwap"] > 0 and current_close:
         indicators["price_vs_vwap"] = round(
@@ -262,7 +381,7 @@ def compute_indicators(ohlcv: list[list[float]]) -> dict[str, float]:
     else:
         indicators["price_vs_vwap"] = 0.0
 
-    # Current price and trend label (multi-candle: 3 of last 5 closes above EMA20)
+    # ── Trend label ───────────────────────────────────────────────────
     indicators["close"] = current_close
     ema20_val = indicators.get("ema20", 0.0)
 
@@ -272,26 +391,37 @@ def compute_indicators(ohlcv: list[list[float]]) -> dict[str, float]:
     else:
         indicators["trend"] = 1.0 if current_close > ema20_val else -1.0
 
-    # RSI divergence detection (price vs RSI direction over last 10 bars)
-    if _HAS_PANDAS_TA and len(close) >= 14:
-        rsi_series = ta.rsi(close, length=14)
-        if rsi_series is not None and len(rsi_series) >= 10:
-            price_slope = close.iloc[-1] - close.iloc[-10]
-            rsi_slope = rsi_series.iloc[-1] - rsi_series.iloc[-10]
-            # Bullish divergence: price down but RSI up
-            if price_slope < 0 and rsi_slope > 0:
-                indicators["rsi_divergence"] = 1.0  # bullish
-            # Bearish divergence: price up but RSI down
-            elif price_slope > 0 and rsi_slope < 0:
-                indicators["rsi_divergence"] = -1.0  # bearish
-            else:
-                indicators["rsi_divergence"] = 0.0
+    # ── Breakout from 48-bar high/low ────────────────────────────────
+    # Compares current close to the max high and min low of the prior N bars.
+    # Breakout above N-bar high = strong momentum continuation signal.
+    breakout_window = min(48, len(close) - 1)
+    if breakout_window >= 10:
+        prior_highs = high.iloc[-breakout_window - 1:-1]
+        prior_lows  = low.iloc[-breakout_window - 1:-1]
+        period_high = float(prior_highs.max())
+        period_low  = float(prior_lows.min())
+        if period_high > 0 and current_close > period_high:
+            indicators["breakout_48h"] = 1.0   # price broke above prior high
+        elif period_low > 0 and current_close < period_low:
+            indicators["breakout_48h"] = -1.0  # price broke below prior low
         else:
-            indicators["rsi_divergence"] = 0.0
+            indicators["breakout_48h"] = 0.0
     else:
-        indicators["rsi_divergence"] = 0.0
+        indicators["breakout_48h"] = 0.0
 
-    indicators["data_status"] = 1.0  # signals valid data
+    # ── Momentum acceleration (2nd derivative of close) ───────────────
+    # Measures whether momentum is speeding up or slowing down.
+    # Uses 3-bar returns to reduce noise: (last 3 - prior 3) vs (prior 3 - before that)
+    if len(close) >= 9:
+        r_recent = float((close.iloc[-1] - close.iloc[-4]) / (close.iloc[-4] + 1e-10))
+        r_prior  = float((close.iloc[-4] - close.iloc[-7]) / (close.iloc[-7] + 1e-10))
+        accel = r_recent - r_prior
+        # Normalise: ±5% change in 3-bar return = full signal
+        indicators["momentum_accel"] = float(np.clip(accel / 0.05, -1.0, 1.0))
+    else:
+        indicators["momentum_accel"] = 0.0
+
+    indicators["data_status"] = 1.0
     return indicators
 
 
@@ -305,13 +435,17 @@ def _empty_indicators(status: str = "ok") -> dict[str, float]:
         "ema20": 0.0,
         "atr": 0.0,
         "volume_ratio": 1.0,
+        "volume_zscore": 0.0,
         "volume_trend": 1.0,
         "obv_trend": 0.0,
         "vwap": 0.0,
         "price_vs_vwap": 0.0,
         "close": 0.0,
         "trend": 0.0,
+        "breakout_48h": 0.0,
+        "momentum_accel": 0.0,
         "rsi_divergence": 0.0,
+        "macd_divergence": 0.0,
         "data_status": 0.0 if status == "insufficient_data" else 1.0,
     }
 
@@ -331,7 +465,6 @@ def detect_support_resistance(ohlcv: list[list[float]], num_levels: int = 3) -> 
     closes = np.array([c[4] for c in ohlcv])
     current = closes[-1]
 
-    # Find swing highs and lows (pivot points with lookback=5)
     swing_highs = []
     swing_lows = []
     lookback = 5
@@ -341,7 +474,6 @@ def detect_support_resistance(ohlcv: list[list[float]], num_levels: int = 3) -> 
         if lows[i] == min(lows[i - lookback:i + lookback + 1]):
             swing_lows.append(lows[i])
 
-    # Cluster nearby levels (within 1% of each other)
     def _cluster(levels: list[float], pct: float = 0.01) -> list[float]:
         if not levels:
             return []
@@ -352,7 +484,6 @@ def detect_support_resistance(ohlcv: list[list[float]], num_levels: int = 3) -> 
                 clusters[-1].append(lvl)
             else:
                 clusters.append([lvl])
-        # Return average of each cluster, sorted by frequency (most-tested first)
         result = sorted(clusters, key=len, reverse=True)
         return [round(sum(c) / len(c), 6) for c in result[:num_levels]]
 
@@ -362,14 +493,13 @@ def detect_support_resistance(ohlcv: list[list[float]], num_levels: int = 3) -> 
     nearest_sup = max(support) if support else 0.0
     nearest_res = min(resistance) if resistance else 0.0
 
-    # Classify position relative to S/R
     if nearest_sup > 0 and nearest_res > 0:
         range_size = nearest_res - nearest_sup
         pos_in_range = (current - nearest_sup) / range_size if range_size > 0 else 0.5
         if pos_in_range < 0.25:
-            sr_label = "near_support"  # close to support → potential bounce
+            sr_label = "near_support"
         elif pos_in_range > 0.75:
-            sr_label = "near_resistance"  # close to resistance → potential rejection
+            sr_label = "near_resistance"
         else:
             sr_label = "mid_range"
     elif nearest_sup > 0:

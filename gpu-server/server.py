@@ -838,6 +838,14 @@ class CorrelationRequest(BaseModel):
     candles: dict[str, list]  # {symbol: candles_1h}
 
 
+class MomentumRankRequest(BaseModel):
+    candles: dict[str, list]  # {symbol: candles_1h}
+
+
+class SectorRotationRequest(BaseModel):
+    candles: dict[str, list]  # {symbol: candles_1h}
+
+
 class ExplainRequest(BaseModel):
     candles: list
 
@@ -2037,6 +2045,202 @@ def compute_correlations(req: CorrelationRequest):
         "divergence_signals": divergence_signals,
         "n_symbols": len(syms),
         "n_periods": min_len,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 13. CROSS-SECTIONAL MOMENTUM RANKING
+#     Ranks every symbol by risk-adjusted momentum simultaneously on GPU.
+#     Multi-horizon: combines 1h, 4h, and 24h normalised returns so that
+#     short-term bursts AND sustained trends both score highly.
+#     Returns a percentile rank (0–1) for each symbol.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@app.post("/rank/momentum")
+def rank_momentum(req: MomentumRankRequest):
+    """Cross-sectional risk-adjusted momentum ranking.
+
+    Computes Sharpe-like momentum scores over three horizons and returns
+    a percentile rank per symbol so that callers can identify the top decile.
+    """
+    if len(req.candles) < 2:
+        return {}
+
+    # Extract close prices for each symbol
+    close_map: dict[str, np.ndarray] = {}
+    for sym, candles in req.candles.items():
+        if len(candles) < 25:
+            continue
+        closes = np.array([c[4] for c in candles], dtype=np.float32)
+        if closes[-1] > 0:
+            close_map[sym] = closes
+
+    if len(close_map) < 2:
+        return {}
+
+    syms = list(close_map.keys())
+    # Pad/trim to common length
+    min_len = min(len(v) for v in close_map.values())
+    closes_matrix = np.array([v[-min_len:] for v in close_map.values()], dtype=np.float32)
+
+    # GPU tensor: (n_symbols, n_candles)
+    mat = torch.tensor(closes_matrix, device=DEVICE)
+
+    # Log returns
+    log_ret = torch.log(mat[:, 1:] / (mat[:, :-1] + 1e-10))  # (n, n_candles-1)
+
+    def _momentum_score(log_ret_tensor, horizon: int) -> torch.Tensor:
+        """Risk-adjusted return = cumulative return / std over last `horizon` bars."""
+        r = log_ret_tensor[:, -horizon:]
+        cum = r.sum(dim=1)
+        std = r.std(dim=1).clamp(min=1e-6)
+        return cum / std
+
+    n_candles = log_ret.shape[1]
+    h1  = min(4,  n_candles)   # ~1h of 15m candles or 4× 1h
+    h4  = min(16, n_candles)   # ~4h
+    h24 = min(96, n_candles)   # ~24h
+
+    score_1h  = _momentum_score(log_ret, h1)
+    score_4h  = _momentum_score(log_ret, h4)
+    score_24h = _momentum_score(log_ret, h24)
+
+    # Weighted composite: recent momentum counts more
+    composite = (score_1h * 0.5 + score_4h * 0.3 + score_24h * 0.2).cpu().numpy()
+
+    # Convert to percentile ranks (0 = worst, 1 = best)
+    n = len(composite)
+    ranks = np.argsort(np.argsort(composite)).astype(float) / max(n - 1, 1)
+
+    return {sym: round(float(ranks[i]), 4) for i, sym in enumerate(syms)}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 14. SECTOR ROTATION CLUSTERING
+#     Groups symbols into sectors via correlation-based spectral clustering,
+#     then scores each sector's recent momentum.  When an entire sector rotates
+#     hot, every coin in it gets a bonus — catching moves before individual
+#     signals fire.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@app.post("/cluster/rotation")
+def cluster_rotation(req: SectorRotationRequest):
+    """Spectral sector clustering + rotation heat scoring.
+
+    Returns per-symbol heat scores and ranked sector lists so the backend
+    can boost scores for coins in hot sectors and penalise cold ones.
+    """
+    if len(req.candles) < 6:
+        return {"sector_heat": {}, "hot_sectors": [], "cold_sectors": []}
+
+    # Build log-return matrix
+    close_map: dict[str, np.ndarray] = {}
+    for sym, candles in req.candles.items():
+        if len(candles) < 20:
+            continue
+        closes = np.array([c[4] for c in candles[-60:]], dtype=np.float32)
+        if closes[-1] > 0:
+            close_map[sym] = closes
+
+    syms = list(close_map.keys())
+    if len(syms) < 4:
+        return {"sector_heat": {}, "hot_sectors": [], "cold_sectors": []}
+
+    min_len = min(len(v) for v in close_map.values())
+    closes_mat = np.array([v[-min_len:] for v in close_map.values()], dtype=np.float32)
+
+    mat = torch.tensor(closes_mat, device=DEVICE)
+    log_ret = torch.log(mat[:, 1:] / (mat[:, :-1] + 1e-10))
+
+    # Pearson correlation matrix on GPU
+    r = log_ret - log_ret.mean(dim=1, keepdim=True)
+    norms = r.norm(dim=1, keepdim=True).clamp(min=1e-10)
+    corr = (r / norms) @ (r / norms).T  # (n, n) on GPU
+
+    # Affinity matrix: shift correlation to [0,1] range
+    affinity = ((corr + 1.0) / 2.0).cpu().numpy()
+    np.fill_diagonal(affinity, 1.0)
+
+    # Spectral clustering (pure numpy — lightweight, no sklearn needed)
+    n_clusters = min(8, max(4, len(syms) // 6))
+
+    # Normalised Laplacian
+    degree = affinity.sum(axis=1)
+    d_inv_sqrt = np.diag(1.0 / np.sqrt(np.maximum(degree, 1e-10)))
+    L_sym = np.eye(len(syms)) - d_inv_sqrt @ affinity @ d_inv_sqrt
+
+    # Top eigenvectors of Laplacian
+    try:
+        eigenvalues, eigenvectors = np.linalg.eigh(L_sym)
+        embedding = eigenvectors[:, :n_clusters]  # (n_syms, n_clusters)
+        # Normalise rows
+        norms_emb = np.linalg.norm(embedding, axis=1, keepdims=True)
+        embedding = embedding / np.maximum(norms_emb, 1e-10)
+    except np.linalg.LinAlgError:
+        # Fallback: random clusters if eigendecomposition fails
+        embedding = np.random.randn(len(syms), n_clusters)
+
+    # K-means style assignment (simple nearest-centroid, 20 iterations)
+    rng = np.random.default_rng(seed=42)
+    centroids = embedding[rng.choice(len(syms), n_clusters, replace=False)]
+    labels = np.zeros(len(syms), dtype=int)
+    for _ in range(20):
+        dists = np.linalg.norm(embedding[:, None] - centroids[None], axis=2)
+        labels = dists.argmin(axis=1)
+        for k in range(n_clusters):
+            members = embedding[labels == k]
+            if len(members):
+                centroids[k] = members.mean(axis=0)
+
+    # Compute sector momentum (24h risk-adjusted return per cluster)
+    n_ret = log_ret.shape[1]
+    h24 = min(96, n_ret)
+    recent_returns = log_ret[:, -h24:].cpu().numpy()
+    cum_ret  = recent_returns.sum(axis=1)
+    std_ret  = recent_returns.std(axis=1).clip(min=1e-6)
+    mom_scores = cum_ret / std_ret  # per-symbol momentum score
+
+    sector_momentum: dict[int, float] = {}
+    sector_members:  dict[int, list[str]] = {}
+    for k in range(n_clusters):
+        members_idx = np.where(labels == k)[0]
+        if len(members_idx) == 0:
+            continue
+        sector_members[k] = [syms[i] for i in members_idx]
+        sector_momentum[k] = float(np.mean(mom_scores[members_idx]))
+
+    # Normalise sector momentum to [-1, +1] via tanh
+    raw_vals = np.array(list(sector_momentum.values()), dtype=float)
+    std_s = raw_vals.std() if len(raw_vals) > 1 else 1.0
+    std_s = max(std_s, 1e-6)
+
+    sector_heat_norm: dict[int, float] = {
+        k: float(np.tanh(v / (std_s * 1.5)))
+        for k, v in sector_momentum.items()
+    }
+
+    # Build per-symbol heat map
+    symbol_heat: dict[str, float] = {}
+    for k, members in sector_members.items():
+        heat = sector_heat_norm.get(k, 0.0)
+        for sym in members:
+            symbol_heat[sym] = round(heat, 4)
+
+    # Ranked sector lists
+    ranked_sectors = sorted(sector_heat_norm.items(), key=lambda x: x[1], reverse=True)
+    hot_sectors  = [{"label": f"sector_{k}", "symbols": sector_members.get(k, []),
+                     "heat": round(v, 4)} for k, v in ranked_sectors if v > 0.1]
+    cold_sectors = [{"label": f"sector_{k}", "symbols": sector_members.get(k, []),
+                     "heat": round(v, 4)} for k, v in ranked_sectors if v < -0.1]
+
+    return {
+        "sector_heat":  symbol_heat,
+        "hot_sectors":  hot_sectors[:3],
+        "cold_sectors": cold_sectors[:3],
+        "n_clusters":   n_clusters,
+        "n_symbols":    len(syms),
     }
 
 
