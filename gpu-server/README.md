@@ -1,12 +1,24 @@
 # GPU Inference Server
 
-Standalone FastAPI server that runs the upgraded ML models:
-- **Transformer** (multi-head attention, 10 features, 30-candle window)
-- **Dueling Double DQN** with prioritized experience replay
-- **Semantic sentiment** via `sentence-transformers/all-MiniLM-L6-v2`
-- **Ensemble endpoint** combining all models into a single signal
+Standalone FastAPI server running **10 ML models** for trading signal generation:
 
-Works on any machine. Falls back to CPU if no GPU is available, but CUDA is strongly recommended.
+**Price Direction:**
+- **Transformer** (multi-head attention, 10 features, 30-candle window)
+- **LSTM** (ensemble member, 40% weight)
+- **Multi-Timeframe Fusion** — single Transformer sees 15m+1h+4h+1d simultaneously
+
+**Risk Management:**
+- **Dueling Double DQN** with prioritized experience replay
+- **Optimal Exit RL** — dedicated agent for exit timing (HOLD/PARTIAL_25/PARTIAL_50/CLOSE)
+- **Anomaly Detection Autoencoder** — flags pump-and-dumps, flash crashes
+
+**Market Intelligence:**
+- **Semantic sentiment** via `sentence-transformers/all-MiniLM-L6-v2`
+- **Volatility Forecasting** — LSTM predicting future σ for SL/TP & Monte Carlo
+- **Cross-Symbol Correlation Tracker** — GPU-parallel Pearson matrix + divergence signals
+- **Attention Explainability** — extracts which candles/features drove the prediction
+
+All models auto-train via background loop (60s). Falls back to CPU if no GPU is available.
 
 ---
 
@@ -113,10 +125,19 @@ The `/health` endpoint is always accessible without auth.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/health` | Server status, GPU info, loaded models |
+| GET | `/health` | Server status, GPU info, loaded models (10 model states) |
 | POST | `/train/lstm` | Train Transformer + LSTM ensemble |
 | POST | `/predict/lstm` | Predict with Transformer/LSTM (60/40 weighted) |
 | POST | `/train/rl` | Train Dueling Double DQN |
 | POST | `/predict/rl` | Get RL Q-values |
 | POST | `/sentiment` | Score headlines with sentence-transformer |
 | POST | `/predict/ensemble` | Combined signal from all models |
+| POST | `/train/mtf` | Train Multi-Timeframe Fusion (15m+1h+4h+1d) |
+| POST | `/predict/mtf` | Predict with cross-TF context |
+| POST | `/predict/volatility` | Forecast future realized volatility |
+| POST | `/detect/anomaly` | Detect pump-and-dump / flash crash patterns |
+| POST | `/train/exit` | Train Exit RL from position outcomes |
+| POST | `/predict/exit` | Get optimal exit action for open position |
+| POST | `/explain/attention` | Extract attention weights (which candles/features matter) |
+| POST | `/correlations` | GPU-parallel cross-symbol correlation + divergence signals |
+| POST | `/simulate/montecarlo` | Monte Carlo SL/TP probability estimation (10K paths) |

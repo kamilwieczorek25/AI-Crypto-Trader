@@ -9,7 +9,7 @@ Runs in **demo mode** (paper trading) by default. Live trading requires explicit
 ## What It Can Do
 
 ### Signal Intelligence
-- **17-factor quant scorer** (0–100 scale): RSI, MACD, Bollinger Bands + squeeze detection, volume ratio, OBV trend, VWAP position, multi-timeframe trend alignment, support/resistance proximity, BTC correlation anchor, orderbook bid/ask pressure, depth imbalance, funding rate (contrarian), long/short ratio, open interest trend, whale flow, and ML consensus
+- **17-factor quant scorer** (0–100 scale): RSI, MACD, Bollinger Bands + squeeze detection, volume ratio, OBV trend, VWAP position, multi-timeframe trend alignment, support/resistance proximity, BTC correlation anchor, orderbook bid/ask pressure, depth imbalance, funding rate (contrarian), long/short ratio, open interest trend, whale flow, and ML consensus (boosted weight when GPU models are active)
 - **LSTM price predictor** — 2-layer LSTM trained on 500-candle windows across top symbols; predicts SELL / HOLD / BUY with probability distribution
 - **DQN reinforcement learning agent** — learns from live paper-trading outcomes via experience replay; improves every cycle
 - **Real-time whale detector** — monitors Binance WebSocket trade stream for large trades (default ≥ $50k USDT) and injects whale flow signal into the scorer
@@ -48,6 +48,12 @@ Run `gpu-server/server.py` on any machine (GPU optional — falls back to CPU) t
 - **Dueling Double DQN** with prioritized experience replay (replaces vanilla DQN)
 - **Semantic news sentiment** via `sentence-transformers/all-MiniLM-L6-v2` (replaces keyword counting)
 - **Full ensemble endpoint** — Transformer (45%) + LSTM (25%) + RL (15%) + Sentiment (15%) combined signal
+- **Multi-Timeframe Fusion** — single Transformer sees 15m+1h+4h+1d simultaneously, learns cross-TF patterns (e.g. "15m reversal while 4h trends up")
+- **Volatility Forecasting** — LSTM predicts future σ for better SL/TP placement and Monte Carlo accuracy
+- **Anomaly Detection Autoencoder** — flags pump-and-dumps, flash crashes, whale manipulation; blocks entry automatically
+- **Optimal Exit RL** — dedicated Dueling DQN trained only on exit timing: HOLD / PARTIAL_25% / PARTIAL_50% / CLOSE
+- **Attention Explainability** — extracts which candles and features the Transformer focused on, shown to Claude
+- **Cross-Symbol Correlation Tracker** — GPU-parallel Pearson correlation matrix; detects divergence = mean-reversion signals
 
 ---
 
@@ -75,8 +81,22 @@ Run `gpu-server/server.py` on any machine (GPU optional — falls back to CPU) t
 └────────────────────┬────────────────────────────────┘
                      │ HTTP (optional)
 ┌────────────────────▼────────────────────────────────┐
-│             GPU Inference Server                    │  :9090
-│  Transformer · Dueling DQN · Semantic Sentiment     │
+│            GPU Inference Server (10 models)         │  :9090
+│                                                     │
+│  ┌─ Price Direction ───────────────────────────┐    │
+│  │  Transformer · LSTM · Multi-TF Fusion       │    │
+│  └─────────────────────────────────────────────┘    │
+│  ┌─ Risk Management ──────────────────────────┐    │
+│  │  Dueling DQN · Exit RL · Anomaly Detector   │    │
+│  └─────────────────────────────────────────────┘    │
+│  ┌─ Market Intelligence ──────────────────────┐    │
+│  │  Volatility Forecast · Correlation Tracker  │    │
+│  │  Semantic Sentiment · Attention Explainer   │    │
+│  └─────────────────────────────────────────────┘    │
+│  ┌─ Simulation ───────────────────────────────┐    │
+│  │  Monte Carlo (10K GPU-parallel paths)       │    │
+│  └─────────────────────────────────────────────┘    │
+│  Background training loop (60s) · Data augmentation │
 │           (any machine, GPU optional)               │
 └─────────────────────────────────────────────────────┘
 ```

@@ -125,12 +125,21 @@ You receive:
 - Recent news sentiment per symbol (with min/max/trend — may use GPU semantic analysis)
 - AI Signal Ensemble: LSTM neural-net direction probabilities + RL agent Q-value recommendations
 - GPU Ensemble (when available): Transformer + LSTM + Dueling DQN + semantic sentiment combined signal with agreement score
+- Multi-Timeframe Fusion (MTF): GPU model seeing 15m+1h+4h+1d simultaneously — the strongest directional signal when available
+- Volatility Forecast: GPU-predicted future σ — more accurate than backward-looking ATR
+- Anomaly Detection: GPU autoencoder flags pump-and-dumps, flash crashes — ⚠ANOMALY means DO NOT BUY
+- Exit RL: GPU reinforcement learning agent specialized in exit timing — HOLD_POS/PARTIAL_25/PARTIAL_50/CLOSE
+- Attention Explainability: which candles and features the Transformer focused on — validate with your own analysis
+- Correlation Divergence: when correlated pairs diverge, the laggard often catches up — mean-reversion opportunity
 - RAG context: relevant snippets from past trades and market insights
 - New listings and top 24h gainers with price change and volume data
 
 When the LSTM and RL agent agree on a direction, treat that as a strong corroborating signal.
 When they disagree, exercise extra caution — prefer HOLD unless technical indicators are compelling.
 When a GPU ensemble signal is present with agreement >= 75%, treat it as the strongest ML signal available.
+When MTF model has confidence >= 70%, treat it as strong cross-timeframe confirmation.
+When Exit RL recommends CLOSE or PARTIAL, strongly consider following it for held positions.
+When anomaly flag is raised, NEVER BUY — the autoencoder detected abnormal price/volume patterns.
 Always explain in your reasoning how you weighted the AI ensemble signals.
 """
 
@@ -392,7 +401,32 @@ def build_prompt(
             ens = sig.get("ensemble")
             if ens:
                 parts.append(f" GPU={ens['signal']}({ens['confidence']:.0%} agree={ens['agreement']:.0%})")
+            # Multi-Timeframe Fusion signal
+            mtf = sig.get("mtf")
+            if mtf:
+                parts.append(f" MTF={mtf['signal']}({mtf['confidence']:.0%} tf={','.join(mtf.get('timeframes', []))})")
+            # Anomaly flag
+            anom = sig.get("anomaly")
+            if anom and anom.get("is_anomaly"):
+                parts.append(f" ⚠ANOMALY(z={anom['anomaly_score']:.1f})")
+            # Volatility forecast
+            vol = sig.get("vol_forecast")
+            if vol:
+                parts.append(f" σ={vol['predicted_vol']:.4f}({vol['source']})")
             lines.append("".join(parts))
+            # Attention explainability (what the model focused on)
+            attn = sig.get("attention")
+            if attn and attn.get("top_features"):
+                feat_str = " ".join(f"{k}={v:.3f}" for k, v in attn["top_features"][:3])
+                lines.append(f"    Attn: {feat_str} candles={attn.get('top_candles', [])}")
+            # Exit RL recommendation for held positions
+            exit_rl = sig.get("exit_rl")
+            if exit_rl and sym in held_symbols:
+                lines.append(f"    ExitRL: {exit_rl['action']} Q={exit_rl.get('q_values', {})}")
+            # Correlation divergence signal
+            corr_div = sig.get("corr_divergence")
+            if corr_div:
+                lines.append(f"    CorrDiv: {corr_div['signal']} (gap={corr_div['return_gap_pct']:.1f}% r={corr_div['correlation']:.2f})")
             if ls == ra and ls != "HOLD":
                 if not (ls == "SELL" and sym not in held_symbols):
                     agree_syms.append(f"{sym}→{ls}")
@@ -400,6 +434,10 @@ def build_prompt(
             elif ens and ens.get("agreement", 0) >= 0.75 and ens.get("signal") != "HOLD":
                 if not (ens["signal"] == "SELL" and sym not in held_symbols):
                     agree_syms.append(f"{sym}→{ens['signal']}(GPU)")
+            # MTF high-confidence signal
+            elif mtf and mtf.get("confidence", 0) >= 0.7 and mtf.get("signal") != "HOLD":
+                if not (mtf["signal"] == "SELL" and sym not in held_symbols):
+                    agree_syms.append(f"{sym}→{mtf['signal']}(MTF)")
         if agree_syms:
             lines.append(f"  CONSENSUS: {', '.join(agree_syms)}")
 

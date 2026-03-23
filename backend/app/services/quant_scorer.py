@@ -19,17 +19,17 @@ logger = logging.getLogger(__name__)
 # These are tuned for crypto momentum/mean-reversion blend.
 # Each factor produces a raw signal in [-1, +1] which gets multiplied by weight.
 _WEIGHTS: dict[str, float] = {
-    "rsi_signal":       0.08,   # RSI oversold/overbought
-    "macd_signal":      0.07,   # MACD histogram direction + magnitude
-    "bb_signal":        0.06,   # Bollinger Band position
+    "rsi_signal":       0.07,   # RSI oversold/overbought
+    "macd_signal":      0.06,   # MACD histogram direction + magnitude
+    "bb_signal":        0.05,   # Bollinger Band position
     "bb_squeeze_signal":0.05,   # Bollinger squeeze (breakout detector)
-    "volume_signal":    0.09,   # Volume ratio (activity)
+    "volume_signal":    0.08,   # Volume ratio (activity)
     "obv_signal":       0.04,   # On-Balance Volume trend
-    "vwap_signal":      0.05,   # Price vs VWAP
-    "trend_signal":     0.08,   # Multi-timeframe trend alignment
+    "vwap_signal":      0.04,   # Price vs VWAP
+    "trend_signal":     0.07,   # Multi-timeframe trend alignment
     "sr_signal":        0.05,   # Support/resistance proximity
     "btc_signal":       0.07,   # BTC anchor trend (critical for alts)
-    "ml_signal":        0.04,   # LSTM + RL consensus
+    "ml_signal":        0.10,   # LSTM + RL + GPU ensemble + MTF + anomaly (boosted)
     "orderbook_signal": 0.04,   # Bid/ask pressure ratio
     "depth_signal":     0.05,   # Orderbook depth imbalance within 2%
     "whale_signal":     0.07,   # Whale trade flow (WebSocket real-time)
@@ -238,7 +238,7 @@ def _score_btc(btc_anchor: dict | None) -> float:
 
 
 def _score_ml(ml_signal: dict | None) -> float:
-    """LSTM + RL consensus. Only counts when they agree."""
+    """LSTM + RL + GPU ensemble + MTF consensus. Weighted by model diversity."""
     if not ml_signal:
         return 0.0
 
@@ -248,17 +248,49 @@ def _score_ml(ml_signal: dict | None) -> float:
     lstm_conf = lstm.get("confidence", 0)
     rl_sig = rl.get("action", "HOLD")
 
+    score = 0.0
+
+    # LSTM + RL agreement
     if lstm_sig == rl_sig:
         if lstm_sig == "BUY":
-            return min(lstm_conf, 1.0) * 0.8
+            score += min(lstm_conf, 1.0) * 0.4
         elif lstm_sig == "SELL":
-            return -min(lstm_conf, 1.0) * 0.8
-    # Disagreement: slight signal in LSTM direction if it's confident
-    if lstm_sig == "BUY" and lstm_conf > 0.6:
-        return 0.2
-    if lstm_sig == "SELL" and lstm_conf > 0.6:
-        return -0.2
-    return 0.0
+            score -= min(lstm_conf, 1.0) * 0.4
+    elif lstm_sig == "BUY" and lstm_conf > 0.6:
+        score += 0.1
+    elif lstm_sig == "SELL" and lstm_conf > 0.6:
+        score -= 0.1
+
+    # GPU ensemble bonus
+    ens = ml_signal.get("ensemble", {})
+    ens_sig = ens.get("signal", "HOLD")
+    ens_conf = ens.get("confidence", 0)
+    ens_agree = ens.get("agreement", 0)
+    if ens_sig == "BUY" and ens_agree >= 0.75:
+        score += min(ens_conf, 1.0) * 0.3
+    elif ens_sig == "SELL" and ens_agree >= 0.75:
+        score -= min(ens_conf, 1.0) * 0.3
+
+    # MTF fusion bonus (strongest cross-TF signal)
+    mtf = ml_signal.get("mtf", {})
+    mtf_sig = mtf.get("signal", "HOLD")
+    mtf_conf = mtf.get("confidence", 0)
+    if mtf_sig == "BUY" and mtf_conf >= 0.6:
+        score += min(mtf_conf, 1.0) * 0.2
+    elif mtf_sig == "SELL" and mtf_conf >= 0.6:
+        score -= min(mtf_conf, 1.0) * 0.2
+
+    # Anomaly penalty
+    anom = ml_signal.get("anomaly", {})
+    if anom.get("is_anomaly"):
+        score -= 0.5  # strong bearish penalty for anomalous patterns
+
+    # Correlation divergence bonus
+    corr_div = ml_signal.get("corr_divergence")
+    if corr_div:
+        score += 0.15  # mean-reversion opportunity for laggard
+
+    return max(-1.0, min(1.0, score))
 
 
 def _score_orderbook(ob: dict) -> float:

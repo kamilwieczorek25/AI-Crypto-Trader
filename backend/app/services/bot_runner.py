@@ -288,7 +288,7 @@ class BotRunner:
                 from app.services import gpu_client
 
                 async def _ml_for_symbol(sym: str, data: dict) -> tuple:
-                    """Compute LSTM + RL + ensemble signals for one symbol.
+                    """Compute LSTM + RL + ensemble + MTF + anomaly + vol + attention signals.
 
                     All symbols are independent — gathered in parallel so GPU
                     round-trips overlap instead of queuing sequentially.
@@ -325,10 +325,50 @@ class BotRunner:
                                 "agreement":  ensemble.get("agreement_score", 0),
                             }
 
+                        # Multi-Timeframe Fusion prediction
+                        mtf_candles = {
+                            tf: all_ohlcv.get(sym, {}).get(tf, [])
+                            for tf in ("15m", "1h", "4h", "1d")
+                        }
+                        mtf_candles = {tf: c for tf, c in mtf_candles.items() if c}
+                        if len(mtf_candles) >= 2:
+                            mtf_pred = await gpu_client.predict_mtf(mtf_candles)
+                            if mtf_pred:
+                                sig["mtf"] = {
+                                    "signal": mtf_pred.get("signal", "HOLD"),
+                                    "confidence": mtf_pred.get("confidence", 0),
+                                    "timeframes": mtf_pred.get("timeframes_used", []),
+                                }
+
+                        # Anomaly detection
+                        anomaly = await gpu_client.detect_anomaly(candles_1h)
+                        if anomaly:
+                            sig["anomaly"] = {
+                                "is_anomaly": anomaly.get("is_anomaly", False),
+                                "anomaly_score": anomaly.get("anomaly_score", 0),
+                            }
+
+                        # Volatility forecast (for MC refinement later)
+                        vol_pred = await gpu_client.predict_volatility(candles_1h)
+                        if vol_pred:
+                            sig["vol_forecast"] = {
+                                "predicted_vol": vol_pred.get("predicted_vol", 0),
+                                "source": vol_pred.get("source", "historical"),
+                            }
+
+                        # Attention explainability (only for top symbols by volume)
+                        attn = await gpu_client.explain_attention(candles_1h)
+                        if attn:
+                            sig["attention"] = {
+                                "top_features": list(attn.get("feature_importance", {}).items())[:3],
+                                "top_candles": attn.get("top_candle_positions", [])[:3],
+                                "entropy": attn.get("attention_entropy", 0),
+                            }
+
                     return sym, state, sig
 
                 # Run all symbols concurrently — GPU round-trips overlap instead
-                # of serialising (e.g. 8 symbols × 3 calls = 24 sequential → parallel)
+                # of serialising (e.g. 8 symbols × 6 calls = parallel)
                 results = await asyncio.gather(
                     *[_ml_for_symbol(sym, data) for sym, data in symbols_data.items()],
                     return_exceptions=True,
@@ -340,6 +380,25 @@ class BotRunner:
                     sym, state, sig = res
                     rl_states[sym]  = state
                     ml_signals[sym] = sig
+
+                # GPU cross-symbol correlation tracker
+                if gpu_client.is_enabled():
+                    corr_candles = {
+                        sym: all_ohlcv.get(sym, {}).get("1h", [])
+                        for sym in list(symbols_data.keys())[:30]
+                    }
+                    corr_candles = {s: c for s, c in corr_candles.items() if c}
+                    if len(corr_candles) >= 3:
+                        gpu_corr = await gpu_client.compute_correlations(corr_candles)
+                        if gpu_corr:
+                            # Merge GPU divergence signals into ml_signals
+                            for div_sig in gpu_corr.get("divergence_signals", []):
+                                laggard = div_sig.get("laggard", "")
+                                if laggard in ml_signals:
+                                    ml_signals[laggard]["corr_divergence"] = div_sig
+                            # Update correlation_info with GPU-computed data
+                            if gpu_corr.get("high_corr_pairs"):
+                                correlation_info["gpu_high_corr_pairs"] = gpu_corr["high_corr_pairs"]
 
             except Exception as exc:
                 logger.warning("ML signal computation failed (non-fatal): %s", exc)
@@ -448,6 +507,83 @@ class BotRunner:
                     return_exceptions=True,
                 )
                 quant_candidates = [r for r in mc_results if not isinstance(r, Exception)]
+
+            # 4f. Anomaly detection — reject BUY candidates flagged as anomalous
+            if quant_candidates and _gpu_available:
+                async def _anomaly_check(cand):
+                    if cand.action != "BUY":
+                        return cand
+                    sig = ml_signals.get(cand.symbol, {})
+                    anom = sig.get("anomaly", {})
+                    if anom.get("is_anomaly"):
+                        logger.warning(
+                            "Anomaly rejection: %s (score=%.2f) — skipping BUY",
+                            cand.symbol, anom.get("anomaly_score", 0),
+                        )
+                        return None  # reject
+                    return cand
+
+                anom_results = await asyncio.gather(
+                    *[_anomaly_check(c) for c in quant_candidates],
+                    return_exceptions=True,
+                )
+                quant_candidates = [
+                    r for r in anom_results
+                    if r is not None and not isinstance(r, Exception)
+                ]
+
+            # 4g. Exit RL — check if open positions should be closed/reduced
+            if _gpu_available and self._portfolio.all_positions():
+                try:
+                    from app.services import gpu_client as _gpu
+                    for pos in self._portfolio.all_positions():
+                        if getattr(pos, "source", "bot") != "bot":
+                            continue
+                        sig = ml_signals.get(pos.symbol, {})
+                        ind_1h = symbols_data.get(pos.symbol, {}).get("indicators", {}).get("1h", {})
+                        hold_duration = (datetime.now(timezone.utc) - pos.opened_at).total_seconds() / 3600 if hasattr(pos, 'opened_at') and pos.opened_at else 0
+                        pnl_pct = ((pos.current_price - pos.avg_entry_price) / pos.avg_entry_price * 100) if pos.avg_entry_price > 0 else 0
+                        highest = getattr(pos, 'highest_price', pos.current_price) or pos.current_price
+                        drawdown_from_high = ((highest - pos.current_price) / highest * 100) if highest > 0 else 0
+                        exit_state = [
+                            pnl_pct / 100,
+                            min(hold_duration / 48, 1.0),
+                            drawdown_from_high / 100,
+                            ind_1h.get("rsi14", 50) / 100,
+                            ind_1h.get("macd_hist", 0) * 50,
+                            ind_1h.get("bb_pct_b", 0.5),
+                            ind_1h.get("volume_ratio", 1.0) / 5,
+                            ind_1h.get("trend", 0),
+                            ind_1h.get("obv_trend", 0),
+                            ind_1h.get("price_vs_vwap", 0) / 5,
+                            sig.get("ensemble", {}).get("confidence", 0.5),
+                            1.0 if sig.get("ensemble", {}).get("signal") == "SELL" else 0.0,
+                            sig.get("anomaly", {}).get("anomaly_score", 0) / 5,
+                            sig.get("vol_forecast", {}).get("predicted_vol", 0.02) * 10,
+                            pos.stop_loss_pct / 100 if hasattr(pos, 'stop_loss_pct') and pos.stop_loss_pct else 0.05,
+                            pos.take_profit_pct / 100 if hasattr(pos, 'take_profit_pct') and pos.take_profit_pct else 0.10,
+                            min(pos.quantity * pos.current_price / max(self._portfolio.total_value, 1), 1.0),
+                            sig.get("mtf", {}).get("confidence", 0.5),
+                        ]
+                        exit_rec = await _gpu.predict_exit(exit_state)
+                        if exit_rec:
+                            ml_signals.setdefault(pos.symbol, {})["exit_rl"] = exit_rec
+                except Exception as exc:
+                    logger.warning("Exit RL check failed (non-fatal): %s", exc)
+
+            # 4h. Train MTF model with multi-TF candle data
+            if _gpu_available:
+                try:
+                    from app.services import gpu_client as _gpu
+                    mtf_train_data = {}
+                    for sym in list(symbols_data.keys())[:15]:
+                        sym_ohlcv = all_ohlcv.get(sym, {})
+                        if len(sym_ohlcv) >= 2:
+                            mtf_train_data[sym] = sym_ohlcv
+                    if mtf_train_data:
+                        asyncio.create_task(_gpu.train_mtf(mtf_train_data))
+                except Exception:
+                    pass
 
             # 5a. No candidates → HOLD (no Claude call, saves API cost)
             if not quant_candidates:
