@@ -20,10 +20,12 @@ Usage:
 
 import asyncio
 import ctypes
+import functools
 import logging
 import math
 import os
 import platform
+import threading
 import time
 from pathlib import Path
 
@@ -51,6 +53,19 @@ if torch.cuda.is_available():
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "./data"))
 DATA_DIR.mkdir(exist_ok=True)
+
+# ── GPU inference lock (CUDA is not thread-safe across concurrent requests) ──
+_GPU_LOCK = threading.Lock()
+
+
+def gpu_locked(fn):
+    """Decorator that serialises access to CUDA via _GPU_LOCK."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with _GPU_LOCK:
+            return fn(*args, **kwargs)
+    return wrapper
+
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 SEQ_LEN = 30          # longer look-back for transformer (was 20)
@@ -851,7 +866,31 @@ class ExplainRequest(BaseModel):
 
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
-app = FastAPI(title="GPU Inference Server v2")
+
+import json as _json
+
+class _NumpyEncoder(_json.JSONEncoder):
+    """Ensure numpy types are serialised to native Python for JSON responses."""
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.bool_):
+            return bool(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super().default(obj)
+
+
+from fastapi.responses import JSONResponse as _JSONResponse
+
+class _SafeJSONResponse(_JSONResponse):
+    def render(self, content) -> bytes:
+        return _json.dumps(content, cls=_NumpyEncoder).encode("utf-8")
+
+
+app = FastAPI(title="GPU Inference Server v2", default_response_class=_SafeJSONResponse)
 
 _ALLOWED_ORIGINS = os.environ.get(
     "CORS_ORIGINS", "http://localhost:9000,http://127.0.0.1:9000"
@@ -1021,6 +1060,7 @@ async def train_lstm(req: TrainLSTMRequest):
 
 # ── PREDICT: Ensemble (Transformer + LSTM average) ───────────────────────────
 @app.post("/predict/lstm")
+@gpu_locked
 def predict_lstm(req: PredictLSTMRequest):
     neutral = {"BUY": 0.33, "HOLD": 0.34, "SELL": 0.33,
                "signal": "HOLD", "confidence": 0.34, "status": "untrained"}
@@ -1150,6 +1190,7 @@ async def train_rl(req: TrainRLRequest):
 
 # ── PREDICT RL ────────────────────────────────────────────────────────────────
 @app.post("/predict/rl")
+@gpu_locked
 def predict_rl(req: PredictRLRequest):
     if not rl_trained or rl_policy is None:
         return {"q_values": {"SELL": 0.0, "HOLD": 0.0, "BUY": 0.0}, "trained": False}
@@ -1399,6 +1440,7 @@ class MonteCarloRequest(BaseModel):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/predict/ensemble")
+@gpu_locked
 def predict_ensemble(req: EnsembleRequest):
     """Combine Transformer, LSTM, RL, and sentiment for a unified signal."""
     result = {
@@ -1483,6 +1525,7 @@ def predict_ensemble(req: EnsembleRequest):
 
 # ── Monte Carlo simulation endpoint ──────────────────────────────────────────
 @app.post("/simulate/montecarlo")
+@gpu_locked
 def monte_carlo(req: MonteCarloRequest):
     """GPU-parallel Monte Carlo: estimate SL/TP hit probabilities."""
     closes = np.array([c[4] for c in req.candles], dtype=np.float64)
@@ -1654,6 +1697,7 @@ async def train_mtf(req: MTFTrainRequest):
 
 
 @app.post("/predict/mtf")
+@gpu_locked
 def predict_mtf(req: MTFPredictRequest):
     """Predict using Multi-Timeframe Fusion — cross-TF context."""
     if not mtf_trained or mtf_model is None:
@@ -1685,6 +1729,7 @@ def predict_mtf(req: MTFPredictRequest):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/predict/volatility")
+@gpu_locked
 def predict_volatility(req: VolatilityPredictRequest):
     """Predict future realized volatility for better SL/TP & MC σ."""
     global vol_model, vol_trained
@@ -1761,6 +1806,7 @@ def _train_vol_inline(feat: np.ndarray):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/detect/anomaly")
+@gpu_locked
 def detect_anomaly(req: AnomalyDetectRequest):
     """Detect anomalous price/volume patterns (pumps, flash crashes, etc.)."""
     global anomaly_model, anomaly_trained, _anomaly_mean_error, _anomaly_std_error
@@ -1784,7 +1830,7 @@ def detect_anomaly(req: AnomalyDetectRequest):
 
     # Z-score relative to training distribution
     z_score = (error - _anomaly_mean_error) / (_anomaly_std_error + 1e-10)
-    is_anomaly = z_score > ANOMALY_THRESHOLD
+    is_anomaly = bool(z_score > ANOMALY_THRESHOLD)
 
     return {
         "is_anomaly": is_anomaly,
@@ -1837,6 +1883,7 @@ def _train_anomaly_inline(feat: np.ndarray):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/predict/exit")
+@gpu_locked
 def predict_exit(req: ExitPredictRequest):
     """Get optimal exit action for an open position."""
     if not exit_trained or exit_policy is None:
@@ -1933,6 +1980,7 @@ async def train_exit(req: ExitTrainRequest):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/explain/attention")
+@gpu_locked
 def explain_attention(req: ExplainRequest):
     """Extract attention weights showing which candles/features influenced prediction."""
     if not transformer_trained or transformer_model is None:
@@ -1964,6 +2012,7 @@ def explain_attention(req: ExplainRequest):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/correlations")
+@gpu_locked
 def compute_correlations(req: CorrelationRequest):
     """GPU-accelerated correlation matrix across symbols.
 
@@ -2058,6 +2107,7 @@ def compute_correlations(req: CorrelationRequest):
 
 
 @app.post("/rank/momentum")
+@gpu_locked
 def rank_momentum(req: MomentumRankRequest):
     """Cross-sectional risk-adjusted momentum ranking.
 
@@ -2126,6 +2176,7 @@ def rank_momentum(req: MomentumRankRequest):
 
 
 @app.post("/cluster/rotation")
+@gpu_locked
 def cluster_rotation(req: SectorRotationRequest):
     """Spectral sector clustering + rotation heat scoring.
 
