@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="style.css?v=20" />
+  <link rel="stylesheet" href="style.css?v=21" />
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
 </head>
 <body>
@@ -299,7 +299,49 @@
       </section>
     </div>
 
-    <!-- ── Row 5: Binance Account ── -->
+    <!-- ── Row 5: Background Processes ── -->
+    <section class="card card-bgproc">
+      <div class="card-header">
+        <h2>Background Processes</h2>
+        <span id="bgproc-task-count" class="card-badge">0 tasks</span>
+      </div>
+      <div class="bgproc-grid" id="bgproc-grid">
+        <div class="bgproc-col">
+          <div class="bgproc-row">
+            <span class="bgproc-label">Bot Loop</span>
+            <span id="bgproc-bot-loop" class="bgproc-value">—</span>
+          </div>
+          <div class="bgproc-row">
+            <span class="bgproc-label">Startup Backtest</span>
+            <span id="bgproc-backtest" class="bgproc-value">—</span>
+          </div>
+          <div class="bgproc-row">
+            <span class="bgproc-label">Last Express</span>
+            <span id="bgproc-last-express" class="bgproc-value muted">—</span>
+          </div>
+        </div>
+        <div class="bgproc-col">
+          <div class="bgproc-row">
+            <span class="bgproc-label">Express Lane</span>
+            <span id="bgproc-express" class="bgproc-value">—</span>
+          </div>
+          <div class="bgproc-row">
+            <span class="bgproc-label">Scanner Hits</span>
+            <span id="bgproc-scanner" class="bgproc-value">—</span>
+          </div>
+          <div class="bgproc-row">
+            <span class="bgproc-label">Hot Candidates</span>
+            <div id="bgproc-hot" class="bgproc-pills"></div>
+          </div>
+        </div>
+        <div class="bgproc-col bgproc-col-tasks">
+          <div class="bgproc-label">Active asyncio Tasks</div>
+          <div id="bgproc-tasks" class="bgproc-task-list"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── Row 6: Binance Account ── -->
     <section class="card" id="exchange-card">
       <div class="card-header">
         <h2>Binance Account</h2>
@@ -327,7 +369,7 @@
       </div>
     </section>
 
-    <!-- ── Row 6: Trade History ── -->
+    <!-- ── Row 7: Trade History ── -->
     <section class="card">
       <div class="card-header">
         <h2>Trade History</h2>
@@ -370,6 +412,6 @@
     </div>
   </footer>
 
-  <script src="app.js?v=20"></script>
+  <script src="app.js?v=21"></script>
 </body>
 </html>

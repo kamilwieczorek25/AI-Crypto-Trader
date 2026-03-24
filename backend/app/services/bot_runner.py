@@ -70,6 +70,9 @@ class BotRunner:
         self._beta_data: dict[str, dict] = {}
         # Last market_intel snapshot (for express lane access)
         self._last_market_intel: dict = {}
+        # Background task status flags (for dashboard)
+        self._startup_backtest_done: bool = False
+        self._last_express_fired: str | None = None  # last symbol that triggered express lane
 
     # ------------------------------------------------------------------ #
     # Control
@@ -168,6 +171,7 @@ class BotRunner:
                                 and self._portfolio.cash_usdt >= 10.0
                             ):
                                 self._express_tasks.add(hc.symbol)
+                                self._last_express_fired = hc.symbol
                                 asyncio.create_task(
                                     self._express_cycle(hc.symbol, hc.score),
                                     name=f"express_{hc.symbol}",
@@ -1142,6 +1146,25 @@ class BotRunner:
             next_in = max(0, int(settings.CYCLE_INTERVAL_SECONDS - elapsed))
 
         from app.services.claude_engine import get_profile_info
+
+        # Build background-process snapshot for dashboard
+        hot = fast_scanner.hot_candidates
+        bg_processes = {
+            "express_active": sorted(self._express_tasks),
+            "express_last": self._last_express_fired,
+            "scanner_hot_count": len(hot),
+            "scanner_top": [
+                {"symbol": hc.symbol, "score": round(hc.score, 1)}
+                for hc in hot[:4]
+            ],
+            "startup_backtest_done": self._startup_backtest_done,
+            "asyncio_tasks": [
+                t.get_name()
+                for t in asyncio.all_tasks()
+                if not t.done() and t.get_name() not in ("Task-1",)
+            ],
+        }
+
         await self._broadcast(
             "BOT_STATUS",
             {
@@ -1156,6 +1179,7 @@ class BotRunner:
                 "market_regime": self._last_regime,
                 "circuit_breaker_tripped": self._circuit_breaker_tripped,
                 "less_fear": settings.LESS_FEAR,
+                "bg_processes": bg_processes,
             },
         )
 
@@ -1813,6 +1837,9 @@ class BotRunner:
             days=settings.BACKTEST_DAYS,
             n_symbols=settings.BACKTEST_SYMBOLS,
         )
+
+        self._startup_backtest_done = True
+        await self._broadcast_status()
 
         if result:
             await self._broadcast("BACKTEST_COMPLETE", {

@@ -545,6 +545,89 @@ footer {
 .footer-sep { color: var(--border); }
 
 /* ═══════════════════════════════════════════════════════════
+   BACKGROUND PROCESSES PANEL
+   ═══════════════════════════════════════════════════════════ */
+.card-bgproc { margin-bottom: 0; }
+
+.bgproc-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1.4fr;
+  gap: 0 24px;
+  padding: 4px 0;
+}
+
+.bgproc-col { display: flex; flex-direction: column; gap: 6px; }
+
+.bgproc-col-tasks {
+  border-left: 1px solid var(--border);
+  padding-left: 20px;
+}
+
+.bgproc-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.bgproc-label {
+  color: var(--muted);
+  font-size: 11px;
+  min-width: 110px;
+  flex-shrink: 0;
+}
+
+.bgproc-value {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text);
+}
+
+.bgproc-value.muted  { color: var(--muted); }
+.bgproc-value.ok     { color: var(--green); }
+.bgproc-value.warn   { color: #ffd740; }
+.bgproc-value.err    { color: var(--red); }
+
+.bgproc-pills { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 2px; }
+
+.bgproc-pill {
+  background: rgba(124,77,255,0.12);
+  color: #b388ff;
+  border: 1px solid rgba(124,77,255,0.25);
+  border-radius: 4px;
+  padding: 1px 6px;
+  font-size: 10px;
+  font-family: 'JetBrains Mono', monospace;
+  font-weight: 600;
+}
+
+.bgproc-task-list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-top: 4px;
+  max-height: 90px;
+  overflow-y: auto;
+}
+
+.bgproc-task {
+  font-size: 11px;
+  font-family: 'JetBrains Mono', monospace;
+  color: var(--muted);
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: rgba(255,255,255,0.03);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.bgproc-task.express  { color: #ffd740; }
+.bgproc-task.bot      { color: var(--green); }
+.bgproc-task.backtest { color: #448aff; }
+
+/* ═══════════════════════════════════════════════════════════
    RESPONSIVE
    ═══════════════════════════════════════════════════════════ */
 @media (max-width: 1400px) {

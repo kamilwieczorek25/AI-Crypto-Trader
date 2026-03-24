@@ -303,6 +303,88 @@ function renderBotStatus(s) {
   if (s.less_fear !== undefined) {
     syncLessFearButton(s.less_fear);
   }
+
+  // Background processes panel
+  if (s.bg_processes) {
+    renderBgProcesses(s.bg_processes, s.running);
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════
+   Background Processes
+   ═══════════════════════════════════════════════════════════ */
+function renderBgProcesses(bg, botRunning) {
+  const set = (id, html) => { const el = $(id); if (el) el.innerHTML = html; };
+  const setText = (id, txt, cls='') => {
+    const el = $(id);
+    if (!el) return;
+    el.textContent = txt;
+    el.className = 'bgproc-value' + (cls ? ' ' + cls : '');
+  };
+
+  // Bot loop
+  setText('bgproc-bot-loop',
+    botRunning ? '● Running' : '○ Stopped',
+    botRunning ? 'ok' : 'muted'
+  );
+
+  // Startup backtest
+  setText('bgproc-backtest',
+    bg.startup_backtest_done ? '✓ Done' : '⟳ Running…',
+    bg.startup_backtest_done ? 'ok' : 'warn'
+  );
+
+  // Last express fired
+  const lastExp = $('bgproc-last-express');
+  if (lastExp) {
+    lastExp.textContent = bg.express_last || '—';
+    lastExp.className = 'bgproc-value' + (bg.express_last ? ' warn' : ' muted');
+  }
+
+  // Active express tasks
+  const expActive = bg.express_active || [];
+  setText('bgproc-express',
+    expActive.length === 0
+      ? 'Idle'
+      : `${expActive.length} active: ${expActive.map(s => s.split('/')[0]).join(', ')}`,
+    expActive.length > 0 ? 'warn' : 'muted'
+  );
+
+  // Scanner hit count
+  setText('bgproc-scanner',
+    `${bg.scanner_hot_count || 0} hot symbols`,
+    bg.scanner_hot_count > 0 ? 'ok' : 'muted'
+  );
+
+  // Hot candidate pills
+  const pillsEl = $('bgproc-hot');
+  if (pillsEl) {
+    const top = bg.scanner_top || [];
+    pillsEl.innerHTML = top.length === 0
+      ? '<span class="bgproc-value muted">—</span>'
+      : top.map(c => `<span class="bgproc-pill" title="score ${c.score}">${c.symbol.split('/')[0]} ${c.score}</span>`).join('');
+  }
+
+  // asyncio task count badge
+  const tasks = (bg.asyncio_tasks || []).filter(n => n && n !== 'Task-1');
+  const badgeEl = $('bgproc-task-count');
+  if (badgeEl) badgeEl.textContent = `${tasks.length} task${tasks.length !== 1 ? 's' : ''}`;
+
+  // asyncio task list
+  const taskListEl = $('bgproc-tasks');
+  if (taskListEl) {
+    if (tasks.length === 0) {
+      taskListEl.innerHTML = '<div class="bgproc-task muted">—</div>';
+    } else {
+      taskListEl.innerHTML = tasks.map(name => {
+        let cls = '';
+        if (name.startsWith('express_')) cls = ' express';
+        else if (name === 'bot_loop') cls = ' bot';
+        else if (name.includes('backtest')) cls = ' backtest';
+        return `<div class="bgproc-task${cls}" title="${escapeHtml(name)}">${escapeHtml(name)}</div>`;
+      }).join('');
+    }
+  }
 }
 
 /* ═══════════════════════════════════════════════════════════
