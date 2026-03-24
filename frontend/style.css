@@ -607,25 +607,26 @@ footer {
   flex-direction: column;
   gap: 3px;
   margin-top: 4px;
-  max-height: 90px;
+  max-height: 180px;
   overflow-y: auto;
 }
 
 .bgproc-task {
-  font-size: 11px;
+  font-size: 12px;
   font-family: 'JetBrains Mono', monospace;
-  color: var(--muted);
-  padding: 1px 4px;
+  color: var(--text-2);
+  padding: 3px 7px;
   border-radius: 3px;
-  background: rgba(255,255,255,0.03);
+  background: rgba(255,255,255,0.06);
+  border-left: 2px solid rgba(255,255,255,0.15);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
-.bgproc-task.express  { color: #ffd740; }
-.bgproc-task.bot      { color: var(--green); }
-.bgproc-task.backtest { color: #448aff; }
+.bgproc-task.express  { color: #ffd740; border-left-color: #ffd740; }
+.bgproc-task.bot      { color: var(--green); border-left-color: var(--green); }
+.bgproc-task.backtest { color: #448aff; border-left-color: #448aff; }
 
 /* ═══════════════════════════════════════════════════════════
    RESPONSIVE
