@@ -1,6 +1,6 @@
 # AI Crypto Trader
 
-A production-ready autonomous trading bot for Binance that uses **Claude (claude-sonnet-4-6)** as its decision engine. The bot combines a 17-factor quantitative signal stack, LSTM + reinforcement learning models, real-time whale detection, and news sentiment analysis — then routes the top candidates to Claude for structured BUY / SELL / HOLD decisions via forced `tool_use`.
+A production-ready autonomous trading bot for Binance that uses **Claude (claude-sonnet-4-6)** as its decision engine. The bot combines a 26-factor quantitative signal stack, LSTM + reinforcement learning models, real-time whale detection, market intelligence, and news sentiment analysis — then routes the top candidates to Claude for structured BUY / SELL / HOLD decisions via forced `tool_use`.
 
 Runs in **demo mode** (paper trading) by default. Live trading requires explicit opt-in.
 
@@ -9,18 +9,22 @@ Runs in **demo mode** (paper trading) by default. Live trading requires explicit
 ## What It Can Do
 
 ### Signal Intelligence
-- **17-factor quant scorer** (0–100 scale): RSI, MACD, Bollinger Bands + squeeze detection, volume ratio, OBV trend, VWAP position, multi-timeframe trend alignment, support/resistance proximity, BTC correlation anchor, orderbook bid/ask pressure, depth imbalance, funding rate (contrarian), long/short ratio, open interest trend, whale flow, and ML consensus (boosted weight when GPU models are active)
+- **26-factor quant scorer** (0–100 scale): RSI, MACD, MACD divergence, Bollinger Bands + squeeze detection, Bollinger squeeze setup, volume ratio, volume Z-score, OBV trend, VWAP position, multi-timeframe trend alignment, support/resistance proximity, BTC correlation anchor, BTC beta, orderbook bid/ask pressure, depth imbalance, funding rate (contrarian), long/short ratio, open interest trend, whale flow, ML consensus, GPU momentum ranking, sector rotation heat, breakout signal, momentum acceleration, and news burst detection
 - **LSTM price predictor** — 2-layer LSTM trained on 500-candle windows across top symbols; predicts SELL / HOLD / BUY with probability distribution
 - **DQN reinforcement learning agent** — learns from live paper-trading outcomes via experience replay; improves every cycle
 - **Real-time whale detector** — monitors Binance WebSocket trade stream for large trades (default ≥ $50k USDT) and injects whale flow signal into the scorer
 - **Background fast scanner** — continuously scans a wide altcoin universe every 60 seconds (independent of the main cycle) to surface breakout candidates early
+- **Express lane** — when the fast scanner detects a high-scoring candidate between main cycles, an immediate lightweight focused analysis fires (OHLCV fetch → re-score → Haiku validation → execute) within seconds, without waiting for the full 5-min cycle. Includes a 5-minute cooldown per symbol to prevent spam.
 - **Top gainers injection** — automatically adds top 24h performers above a configurable % threshold into the universe each cycle
 - **New listing tracking** — newly listed coins are auto-injected for 48 hours regardless of volume
+- **Market intelligence module** — aggregated data layer pulling Fear & Greed index, CoinGecko trending coins, Binance funding rates, long/short ratios, open interest changes, BTC dominance (altseason detection), and per-symbol short squeeze detection — all cached with TTL
+- **Session-aware thresholds** — score thresholds auto-adjust by UTC trading session (lower during Asian pump hours, higher during thin-liquidity dead zones, weekend penalty)
 
 ### AI Decision Layer
 - **Claude as validator, not originator** — only pre-scored, high-conviction candidates are sent to Claude, keeping API costs low and focusing reasoning where it matters
 - **Four risk profiles**: `conservative` (confidence ≥ 0.75, max 2% position), `balanced` (≥ 0.55, max 5%), `aggressive` (≥ 0.45), `fast_profit` (≥ 0.40, short holds)
 - **Auto risk profile** — detects market regime each cycle (bull / bear / sideways) and adjusts the profile automatically
+- **Less-fear mode** — overrides Claude's conservative bias: lowers quant threshold (55 → 45), blocks auto-downgrade to conservative profile, forces Claude to approve high-scoring candidates it would otherwise HOLD. Toggleable via dashboard button or `LESS_FEAR=true` in `.env`
 - **Cost optimisation** — uses Haiku for flat/quiet cycles, Sonnet for actionable signals; skips Claude call entirely when no strong signals exist
 - **RAG memory** — retrieves relevant historical trade outcomes and news context before each Claude call; profitable past trades surface higher in results (outcome-weighted + recency-decayed, SQLite-persisted across restarts)
 
@@ -29,13 +33,18 @@ Runs in **demo mode** (paper trading) by default. Live trading requires explicit
 - **Kelly criterion sizing** — scales position sizes using edge estimates from backtest results (half-Kelly cap for safety)
 - **Pyramiding** — adds to profitable open positions when quant score remains high and P&L exceeds threshold
 - **ATR-based stop-loss / take-profit** — dynamic levels calibrated to each symbol's volatility; minimum reward-to-risk ratio enforced
+- **Monte Carlo SL/TP refinement** — GPU runs 10K simulated price paths to validate and tighten SL/TP; if simulated edge is negative, TP is reduced automatically
+- **Trailing take-profit** — when price hits TP, instead of selling immediately, activates trailing mode: tracks the peak and sells only when price pulls back a configurable % from that peak (or drops below original TP as safety floor)
+- **Partial sells** — Claude can direct partial position exits (25%, 50%, etc.) instead of all-or-nothing closes; Exit RL can also recommend partial exits
 - **Time-based exits** — stagnant positions automatically closed after a configurable hold duration
-- **Exchange sync on startup** — in real mode, imports actual Binance balances and positions into the portfolio state
+- **Exchange sync** — in real mode, imports actual Binance balances and positions into the portfolio state every cycle. Pre-existing holdings imported as "external" (read-only)
+- **Position adoption** — external positions can be converted to bot-managed via dashboard button or `POST /api/bot/adopt-positions`. Sets SL/TP based on current price and config defaults, enabling full bot management (SL/TP monitoring, trailing stops, Exit RL, sell signals)
 
 ### Risk Management
 - **Demo / real mode gate** — two independent flags (`MODE=real` AND `REAL_TRADING=true`) required for live orders
 - **Max drawdown circuit breaker** — pauses the bot if portfolio drops a configurable % from its peak
 - **Position size caps** — max % per trade and max total altcoin exposure enforced at both the prompt and executor level
+- **Banned symbol auto-detection** — when the exchange rejects a symbol (not permitted for account), the bot auto-bans it for the session to prevent repeated failed orders
 - **Discord notifications** — trade alerts, errors, and daily summaries sent to a webhook
 
 ### Auto-Tuning
@@ -101,7 +110,7 @@ Run `gpu-server/server.py` on any machine (GPU optional — falls back to CPU) t
 └─────────────────────────────────────────────────────┘
 ```
 
-**Stack:** Python 3.11+ · FastAPI · SQLAlchemy (SQLite) · ccxt · pandas-ta · PyTorch · Anthropic SDK · Nginx
+**Stack:** Python 3.11+ · FastAPI · SQLAlchemy (PostgreSQL + SQLite) · ccxt · pandas-ta · PyTorch · Anthropic SDK · Nginx
 
 ---
 
@@ -174,7 +183,16 @@ nano .env   # add ANTHROPIC_API_KEY at minimum
 bash deploy-ubuntu.sh
 ```
 
-The script builds the Docker images, opens firewall ports (9000, 9080) via `ufw` if active, starts the services, and waits for the health check to pass. The dashboard is then accessible at `http://<server-ip>:9080` from your local network.
+The script:
+1. Installs PostgreSQL if not present, creates the `ai_trader` database and user
+2. Configures `pg_hba.conf` to allow Docker container connections
+3. Builds Docker images and starts the services via `docker compose`
+4. Opens firewall ports (9000, 9080) via `ufw` if active
+5. Waits for the health check to pass
+
+The dashboard is then accessible at `http://<server-ip>:9080` from your local network.
+
+> **Database:** Ubuntu deployment uses PostgreSQL by default (via asyncpg). Local development uses SQLite. The backend auto-detects the driver from `DATABASE_URL`.
 
 ---
 
@@ -235,15 +253,22 @@ All settings live in `.env`. See `.env.example` for the full list with comments.
 | `DCA_ENABLED` | `true` | Split BUY entries into two tranches |
 | `KELLY_SIZING` | `true` | Scale position size from backtest edge |
 | `PYRAMID_ENABLED` | `true` | Add to profitable open positions |
+| `LESS_FEAR` | `false` | Override conservative bias — lower thresholds, force buys |
+| `TRAILING_TP_PULLBACK_PCT` | `3.0` | Sell only after this % pullback from peak above TP |
+| `TRAILING_TP_FLOOR` | `true` | Safety: sell immediately if price drops back below TP |
+| `DATABASE_URL` | `postgresql+asyncpg://...` | PostgreSQL (default) or `sqlite+aiosqlite:///...` |
 | `DISCORD_WEBHOOK_URL` | — | Trade alerts and errors (optional) |
 | `GPU_SERVER_URL` | — | GPU inference server URL (optional) |
+| `GPU_SERVER_TOKEN` | — | Shared auth token for GPU server (optional) |
 
 ---
 
 ## Dashboard Features
 
 - **Portfolio summary** — total value, cash balance, unrealised P&L, win rate
-- **Open positions table** — live P&L per position with entry price, stop-loss, and take-profit levels
+- **Open positions table** — live P&L per position with entry price, SL/TP levels, hold duration, and source badge (bot / external). External positions have an **Adopt** button to convert them to bot-managed.
+- **Adopt All External** — bulk-adopt button appears when external positions exist
+- **Less-fear toggle** — dashboard button to enable/disable less-fear mode in real-time
 - **Claude's last decision** — full reasoning, signals used, confidence score, and model tier (Sonnet / Haiku)
 - **Price chart** — candlestick with RSI and MACD panels (Chart.js)
 - **Trade history** — paginated log of all executed trades with P&L
