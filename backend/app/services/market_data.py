@@ -58,11 +58,11 @@ class MarketDataService:
         quote = settings.QUOTE_CURRENCY  # e.g. "USDC" or "USDT"
         pair_suffix = f"/{quote}"
 
-        # Relaxed volume floor for gainers (top movers deserve a look even
-        # if they haven't *yet* hit the main volume threshold)
-        gainer_vol_floor = settings.MIN_VOLUME_USDT * 0.1  # 10% of normal (~$500K)
+        # Relaxed volume floor for gainers — uses its own configurable setting so
+        # low-liquidity USDC pairs (e.g. ONT/USDC) are not silently excluded
+        gainer_vol_floor = settings.GAINER_MIN_VOLUME_USDT
         # Very relaxed floor for new listings (they start with near-zero history)
-        new_listing_vol_floor = settings.MIN_VOLUME_USDT * 0.03  # 3% of normal (~$150K)
+        new_listing_vol_floor = settings.GAINER_MIN_VOLUME_USDT * 0.3
 
         # Collect all current quote-currency pairs for new-listing detection
         all_quote_syms: set[str] = set()

@@ -134,6 +134,11 @@ class Settings(BaseSettings):
     # Minimum scanner score (0-100) to qualify as "hot"
     SCANNER_MIN_SCORE: float = 15.0
 
+    # ── Gainer injection ─────────────────────────────────────────────────
+    # Minimum 24h volume for a gainer to be injected into the main cycle.
+    # Independent of MIN_VOLUME_USDT so USDC pairs with lower liquidity still get caught.
+    GAINER_MIN_VOLUME_USDT: float = 50_000.0
+
     # ── Remote GPU server (optional) ─────────────────────────────────
     # URL of the GPU inference server (e.g. http://192.168.1.50:9090)
     # When set, LSTM/RL training and prediction are offloaded to that machine.
