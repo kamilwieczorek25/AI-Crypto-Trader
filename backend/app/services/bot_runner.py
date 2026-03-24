@@ -1136,7 +1136,6 @@ class BotRunner:
 
     def _add_sl_cooldown(self, symbol: str, minutes: int = 20) -> None:
         """Prevent re-buying a symbol for N minutes after stop-loss hit."""
-        from datetime import timedelta
         self._sl_cooldown[symbol] = datetime.now(timezone.utc) + timedelta(minutes=minutes)
 
     # ------------------------------------------------------------------ #
@@ -1390,7 +1389,6 @@ class BotRunner:
         hold_h     = 0.0
         opened     = getattr(pos, "opened_at", None)
         if opened is not None:
-            from datetime import datetime, timezone
             now = datetime.now(timezone.utc)
             if opened.tzinfo is None:
                 opened = opened.replace(tzinfo=timezone.utc)
@@ -1762,7 +1760,6 @@ class BotRunner:
 
             # Cooldown guard
             if symbol in self._sl_cooldown:
-                from datetime import datetime, timezone
                 if datetime.now(timezone.utc) < self._sl_cooldown[symbol]:
                     logger.info("Express lane: %s in cooldown — aborting", symbol)
                     return
