@@ -775,10 +775,11 @@ class BotRunner:
             # 5c. Skip Claude if top candidate score is too weak to ever pass
             top_candidates = quant_candidates[:2]
             best_score = top_candidates[0].score if top_candidates else 0
-            if best_score < 55 and not any(c.action == "SELL" for c in top_candidates):
+            _pre_claude_floor = 45 if settings.LESS_FEAR else 55
+            if best_score < _pre_claude_floor and not any(c.action == "SELL" for c in top_candidates):
                 logger.info(
-                    "Quant: top score %.0f < 55 — skipping Claude call (would HOLD anyway)",
-                    best_score,
+                    "Quant: top score %.0f < %d — skipping Claude call (would HOLD anyway)",
+                    best_score, _pre_claude_floor,
                 )
                 claude_engine.record_skipped_cycle()
                 self._cycle_count += 1
@@ -854,7 +855,7 @@ class BotRunner:
             #      auto-approve the highest-scoring BUY candidate
             if decision.action == "HOLD" and settings.LESS_FEAR:
                 best_buy = next(
-                    (c for c in top_candidates if c.action == "BUY" and c.score >= 55),
+                    (c for c in top_candidates if c.action == "BUY" and c.score >= _pre_claude_floor),
                     None,
                 )
                 if best_buy:
