@@ -3,7 +3,7 @@
 import asyncio
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -65,6 +65,8 @@ class BotRunner:
         self._low_funds_notified: bool = False
         # Express lane: symbols currently in a hot-candidate mini-cycle
         self._express_tasks: set[str] = set()
+        # Express lane cooldown: {symbol: datetime} — prevent re-triggering failed symbols
+        self._express_cooldown: dict[str, datetime] = {}
         # Per-symbol beta vs BTC: {symbol: {"beta": float, "correlation": float}}
         # Computed from 1h OHLCV each cycle and passed to quant scorer
         self._beta_data: dict[str, dict] = {}
@@ -162,11 +164,18 @@ class BotRunner:
                     # without waiting for the full 5-min cycle to expire.
                     try:
                         held_now = {p.symbol for p in self._portfolio.all_positions()}
+                        now = datetime.now(timezone.utc)
+                        # Purge expired cooldowns (older than 5 min)
+                        self._express_cooldown = {
+                            s: t for s, t in self._express_cooldown.items()
+                            if now < t
+                        }
                         for hc in fast_scanner.hot_candidates:
                             if (
                                 hc.score >= 60
                                 and hc.symbol not in held_now
                                 and hc.symbol not in self._express_tasks
+                                and hc.symbol not in self._express_cooldown
                                 and hc.symbol not in self._banned_symbols
                                 and self._portfolio.cash_usdt >= 10.0
                             ):
@@ -1688,9 +1697,10 @@ class BotRunner:
             # 6. Only proceed if re-scored high enough
             if direction <= 0 or express_score < 55:
                 logger.info(
-                    "Express lane: %s score %.0f below 70 or bearish — aborting",
+                    "Express lane: %s score %.0f below 55 or bearish — cooldown 5 min",
                     symbol, express_score,
                 )
+                self._express_cooldown[symbol] = datetime.now(timezone.utc) + timedelta(minutes=5)
                 return
 
             # 7. Compute trade levels
@@ -1819,6 +1829,7 @@ class BotRunner:
             raise
         except Exception as exc:
             logger.warning("Express lane failed for %s (non-fatal): %s", symbol, exc)
+            self._express_cooldown[symbol] = datetime.now(timezone.utc) + timedelta(minutes=5)
         finally:
             self._express_tasks.discard(symbol)
 
