@@ -551,7 +551,7 @@ footer {
 
 .bgproc-grid {
   display: grid;
-  grid-template-columns: 1fr 1fr 1.4fr;
+  grid-template-columns: 1fr 1fr 2.5fr;
   gap: 0 24px;
   padding: 4px 0;
 }
@@ -571,8 +571,8 @@ footer {
 }
 
 .bgproc-label {
-  color: var(--muted);
-  font-size: 11px;
+  color: var(--text-2);
+  font-size: 12px;
   min-width: 110px;
   flex-shrink: 0;
 }
@@ -605,28 +605,29 @@ footer {
 .bgproc-task-list {
   display: flex;
   flex-direction: column;
-  gap: 3px;
-  margin-top: 4px;
-  max-height: 180px;
+  gap: 4px;
+  margin-top: 6px;
+  max-height: 220px;
   overflow-y: auto;
 }
 
 .bgproc-task {
-  font-size: 12px;
+  font-size: 13px;
   font-family: 'JetBrains Mono', monospace;
-  color: var(--text-2);
-  padding: 3px 7px;
-  border-radius: 3px;
-  background: rgba(255,255,255,0.06);
-  border-left: 2px solid rgba(255,255,255,0.15);
+  color: var(--text);
+  padding: 5px 10px;
+  border-radius: 4px;
+  background: rgba(255,255,255,0.07);
+  border-left: 3px solid rgba(255,255,255,0.2);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  line-height: 1.4;
 }
 
-.bgproc-task.express  { color: #ffd740; border-left-color: #ffd740; }
-.bgproc-task.bot      { color: var(--green); border-left-color: var(--green); }
-.bgproc-task.backtest { color: #448aff; border-left-color: #448aff; }
+.bgproc-task.express  { color: #ffd740; border-left-color: #ffd740; background: rgba(255,215,64,0.07); }
+.bgproc-task.bot      { color: var(--green); border-left-color: var(--green); background: rgba(0,230,118,0.07); }
+.bgproc-task.backtest { color: #448aff; border-left-color: #448aff; background: rgba(68,138,255,0.07); }
 
 /* ═══════════════════════════════════════════════════════════
    RESPONSIVE
