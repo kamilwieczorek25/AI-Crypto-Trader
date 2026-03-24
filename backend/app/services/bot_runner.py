@@ -164,7 +164,7 @@ class BotRunner:
                         held_now = {p.symbol for p in self._portfolio.all_positions()}
                         for hc in fast_scanner.hot_candidates:
                             if (
-                                hc.score >= 75
+                                hc.score >= 60
                                 and hc.symbol not in held_now
                                 and hc.symbol not in self._express_tasks
                                 and hc.symbol not in self._banned_symbols
@@ -1686,7 +1686,7 @@ class BotRunner:
             )
 
             # 6. Only proceed if re-scored high enough
-            if direction <= 0 or express_score < 70:
+            if direction <= 0 or express_score < 55:
                 logger.info(
                     "Express lane: %s score %.0f below 70 or bearish — aborting",
                     symbol, express_score,
