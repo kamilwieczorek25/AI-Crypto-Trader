@@ -712,7 +712,7 @@ class BotRunner:
                 try:
                     from app.services import gpu_client as _gpu
                     mtf_train_data = {}
-                    for sym in list(symbols_data.keys())[:15]:
+                    for sym in list(symbols_data.keys())[:30]:
                         sym_ohlcv = all_ohlcv.get(sym, {})
                         if len(sym_ohlcv) >= 2:
                             mtf_train_data[sym] = sym_ohlcv

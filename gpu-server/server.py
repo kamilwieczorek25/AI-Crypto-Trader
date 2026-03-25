@@ -1651,7 +1651,7 @@ async def train_mtf(req: MTFTrainRequest):
             tf_all.append(tf_ids)
             y_all.append(label)
 
-        if len(X_all) < 16:
+        if len(X_all) < 8:
             return {"status": "skipped", "reason": f"only {len(X_all)} MTF samples"}
 
         # Pad to max length
