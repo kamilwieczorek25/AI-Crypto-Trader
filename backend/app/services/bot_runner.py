@@ -503,7 +503,24 @@ class BotRunner:
                     for pos in self._portfolio.all_positions():
                         sym = pos.symbol
                         ind_1h = symbols_data.get(sym, {}).get("indicators", {}).get("1h", {})
+                        prev_state = self._exit_states.get(sym)
                         exit_state = self._build_exit_state(pos, ind_1h, btc_anchor)
+
+                        # Submit intermediate HOLD_POS experience so the buffer fills
+                        # quickly without waiting for position closes.
+                        # "I held this cycle and PnL moved by X" — teaches the model
+                        # when holding is correct vs when it should have exited.
+                        if prev_state is not None:
+                            pnl_pct = float(getattr(pos, "pnl_pct", 0) or 0)
+                            hold_reward = float(pnl_pct / 100.0) * 0.1  # small per-cycle reward
+                            asyncio.create_task(gpu_client.train_exit([{
+                                "state":      prev_state,
+                                "action":     0,          # HOLD_POS
+                                "reward":     hold_reward,
+                                "next_state": exit_state,
+                                "done":       False,
+                            }]))
+
                         self._exit_states[sym] = exit_state
                         try:
                             exit_pred = await gpu_client.predict_exit(exit_state)

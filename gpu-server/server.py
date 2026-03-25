@@ -1928,7 +1928,7 @@ async def train_exit(req: ExitTrainRequest):
                 ns = ns + [0.0] * (EXIT_STATE_SIZE - len(ns))
             exit_buffer.push(s[:EXIT_STATE_SIZE], a, r, ns[:EXIT_STATE_SIZE], d)
 
-        if len(exit_buffer) < 64:
+        if len(exit_buffer) < 16:
             return {"status": "buffering", "experiences": len(exit_buffer)}
 
         policy = ExitDQN().to(DEVICE)
