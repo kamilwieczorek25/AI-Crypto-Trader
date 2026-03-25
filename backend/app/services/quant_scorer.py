@@ -5,7 +5,7 @@ Computes ATR-based stop-loss/take-profit levels with enforced minimum
 reward-to-risk ratio. Produces structured trade candidates for Claude
 to validate (not originate).
 
-Factor set (26 total):
+Factor set (27 total):
 - breakout_signal       : price breaking above N-period high (strong momentum)
 - vol_zscore_signal     : statistically unusual volume for THIS symbol
 - macd_div_signal       : swing-based MACD divergence
@@ -32,11 +32,13 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-# ── Base scoring weights (sum to 1.0, 26 factors) ────────────────────────────
+# ── Base scoring weights (sum to 1.0, 27 factors) ────────────────────────────
 # Existing factors trimmed slightly to make room for 3 new ones:
 #   squeeze_signal (+0.03), beta_signal (+0.02), news_burst_signal (+0.03)
 # Reductions: obv -0.01, vwap -0.01, depth -0.01, orderbook -0.01,
 #             oi -0.01, ls_ratio -0.01, momentum_accel -0.01, sr -0.01
+# pct_24h_signal (+0.04): 24h price change momentum — gainers score higher.
+# Reductions for pct_24h: obv -0.01, depth -0.01, sr -0.01, momentum_accel -0.01
 _WEIGHTS: dict[str, float] = {
     "rsi_signal":            0.06,   # RSI oversold/overbought
     "macd_signal":           0.05,   # MACD histogram direction + magnitude
@@ -45,16 +47,16 @@ _WEIGHTS: dict[str, float] = {
     "bb_squeeze_signal":     0.04,   # Bollinger squeeze (volatility contraction)
     "volume_signal":         0.05,   # Volume ratio (activity vs average)
     "vol_zscore_signal":     0.05,   # Volume Z-score — statistically unusual
-    "obv_signal":            0.02,   # On-Balance Volume trend
+    "obv_signal":            0.01,   # On-Balance Volume trend
     "vwap_signal":           0.01,   # Price vs VWAP
     "trend_signal":          0.05,   # Multi-timeframe trend alignment
-    "sr_signal":             0.02,   # Support/resistance proximity
+    "sr_signal":             0.01,   # Support/resistance proximity
     "breakout_signal":       0.06,   # N-period high/low breakout
-    "momentum_accel_signal": 0.03,   # Momentum acceleration 2nd derivative
+    "momentum_accel_signal": 0.02,   # Momentum acceleration 2nd derivative
     "btc_signal":            0.05,   # BTC anchor trend (critical for alts)
     "ml_signal":             0.08,   # LSTM + RL + GPU ensemble + MTF + anomaly
     "orderbook_signal":      0.01,   # Bid/ask pressure ratio
-    "depth_signal":          0.02,   # Orderbook depth imbalance within 2%
+    "depth_signal":          0.01,   # Orderbook depth imbalance within 2%
     "whale_signal":          0.05,   # Whale trade flow (WebSocket real-time)
     "funding_signal":        0.04,   # Binance funding rate (contrarian)
     "ls_ratio_signal":       0.03,   # Long/short ratio (contrarian)
@@ -64,6 +66,7 @@ _WEIGHTS: dict[str, float] = {
     "squeeze_signal":        0.03,   # Short squeeze potential (new)
     "beta_signal":           0.02,   # Altcoin beta vs BTC (new)
     "news_burst_signal":     0.03,   # CryptoPanic catalyst velocity (new)
+    "pct_24h_signal":        0.04,   # 24h price change momentum (gainers prioritised)
 }
 # Verify: sum(_WEIGHTS.values()) == 1.00  →  checked via test below
 
@@ -571,6 +574,24 @@ def _score_news_burst(symbol: str, news_data: dict | None) -> float:
     return 0.0
 
 
+def _score_pct_24h(pct_24h: float) -> float:
+    """24-hour price change momentum signal.
+
+    Strong gainers (+10%+) are more likely to be in a trending move.
+    Strong losers (-10%+) are bearish — only enter on squeeze/reversal setups.
+    Moderate positive moves (+5-10%) get a mild boost; flat = neutral.
+    """
+    if pct_24h >= 20:    return 0.9   # explosive gainer — very bullish
+    elif pct_24h >= 10:  return 0.7   # strong uptrend
+    elif pct_24h >= 5:   return 0.4   # moderate gainer
+    elif pct_24h >= 2:   return 0.2   # mild positive drift
+    elif pct_24h <= -20: return -0.8  # severe dump
+    elif pct_24h <= -10: return -0.6  # strong downtrend
+    elif pct_24h <= -5:  return -0.3  # moderate decline
+    elif pct_24h <= -2:  return -0.1  # mild negative drift
+    return 0.0
+
+
 def _get_regime_weights(regime: str) -> dict[str, float]:
     """Return live weights adjusted for current market regime.
 
@@ -664,6 +685,7 @@ def score_symbol(
     ob = symbol_data.get("orderbook", {})
     sr = symbol_data.get("support_resistance", {})
     price = symbol_data.get("price", 0)
+    pct_24h = symbol_data.get("pct_24h", 0.0)
 
     # Select regime-adjusted weights (re-normalised to sum=1 inside _get_regime_weights)
     weights = _get_regime_weights(market_regime)
@@ -697,6 +719,8 @@ def score_symbol(
         "squeeze_signal":        _score_squeeze(symbol, squeeze_data),
         "beta_signal":           _score_beta(symbol, beta_data, btc_dominance),
         "news_burst_signal":     _score_news_burst(symbol, news_data),
+        # 24h price change momentum
+        "pct_24h_signal":        _score_pct_24h(pct_24h),
     }
 
     # RSI divergence adds bonus to RSI score
@@ -717,7 +741,7 @@ def score_symbol(
     # Build signal descriptions for the top contributing factors
     signals: list[str] = []
     sorted_factors = sorted(factors.items(), key=lambda x: abs(x[1]), reverse=True)
-    for fname, fval in sorted_factors[:6]:  # show top 6 for 26-factor model
+    for fname, fval in sorted_factors[:7]:  # show top 7 for 27-factor model
         if abs(fval) < 0.1:
             continue
         label = fname.replace("_signal", "").upper()

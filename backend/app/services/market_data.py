@@ -76,8 +76,16 @@ class MarketDataService:
             vol = t.get("quoteVolume") or 0
             pct = t.get("percentage") or 0  # 24h price change %
 
-            # Regular universe: high volume
-            if vol >= settings.MIN_VOLUME_USDT:
+            # Regular universe: high volume.
+            # Use a lower floor for USDC pairs — they trade at 10-20× less
+            # volume than USDT equivalents, so the standard $5M bar would
+            # exclude almost the entire mid-cap USDC universe.
+            vol_floor = (
+                settings.MIN_VOLUME_USDT_USDC
+                if quote == "USDC"
+                else settings.MIN_VOLUME_USDT
+            )
+            if vol >= vol_floor:
                 quote_pairs.append((sym, t))
 
             # Top gainers: significant move + minimum liquidity
@@ -155,7 +163,7 @@ class MarketDataService:
             "Symbol universe: %d pairs (%d base + %d gainers + %d new listings, min_vol=$%s, cap=%s)",
             len(symbols), len(quote_pairs),
             len(injected_gainers), len(injected_new),
-            f"{settings.MIN_VOLUME_USDT:,.0f}",
+            f"{settings.MIN_VOLUME_USDT_USDC if quote == 'USDC' else settings.MIN_VOLUME_USDT:,.0f}",
             n if n > 0 else "none",
         )
         return symbols

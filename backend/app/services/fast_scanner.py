@@ -206,9 +206,9 @@ class FastScanner:
                 score += min(abs(accel) * 8, 8)  # downward accel = also notable
                 reasons.append(f"accel_dn_{accel:.2f}")
 
-            # 2. 24h momentum — big movers
+            # 2. 24h momentum — big movers (cap raised to 45 to catch explosive gainers)
             if abs(pct_24h) >= 5:
-                score += min(abs(pct_24h) * 1.5, 25)
+                score += min(abs(pct_24h) * 1.5, 45)
                 reasons.append(f"24h_{pct_24h:+.1f}%")
 
             # 3a. Volume Z-score — statistically unusual volume for THIS coin

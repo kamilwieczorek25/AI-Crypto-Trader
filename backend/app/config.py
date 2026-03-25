@@ -175,6 +175,10 @@ class Settings(BaseSettings):
     TOP_N_SYMBOLS: int = 0
     # Minimum 24h quote volume (USDT) to be included in the universe
     MIN_VOLUME_USDT: float = 5_000_000.0
+    # Separate floor for USDC quote pairs — USDC pairs trade at 10-20× lower
+    # volume than USDT equivalents, so the $5M bar makes the universe nearly empty.
+    # $300K still filters dust while covering the full mid-cap USDC tier.
+    MIN_VOLUME_USDT_USDC: float = 300_000.0
     # Max concurrent OHLCV/orderbook fetches (avoid rate-limit bans)
     FETCH_CONCURRENCY: int = 10
     # Top gainers: min 24h price change % to qualify as a "gainer"

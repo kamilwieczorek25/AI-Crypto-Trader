@@ -280,11 +280,20 @@ class BotRunner:
                 price = indicators.get("1h", {}).get("close") or await self._market.get_price(sym)
                 sr_candles = mtf.get("4h", mtf.get("1h", []))
                 sr_levels = detect_support_resistance(sr_candles)
+                # Compute 24h price change from 1h OHLCV (24 bars back)
+                ohlcv_1h = mtf.get("1h", [])
+                pct_24h = 0.0
+                if len(ohlcv_1h) >= 25:
+                    c_now = ohlcv_1h[-1][4]
+                    c_24h = ohlcv_1h[-25][4]
+                    if c_24h > 0:
+                        pct_24h = (c_now - c_24h) / c_24h * 100
                 symbols_data[sym] = {
                     "price": price,
                     "indicators": indicators,
                     "orderbook": all_orderbooks.get(sym, {}),
                     "support_resistance": sr_levels,
+                    "pct_24h": round(pct_24h, 2),
                 }
 
             # 3. Update position prices
@@ -1651,11 +1660,20 @@ class BotRunner:
 
             sr_candles = sym_ohlcv.get("4h", sym_ohlcv.get("1h", []))
             sr_levels = detect_support_resistance(sr_candles)
+            # Compute 24h price change from 1h OHLCV (24 bars back)
+            ohlcv_1h_ex = sym_ohlcv.get("1h", [])
+            pct_24h_ex = 0.0
+            if len(ohlcv_1h_ex) >= 25:
+                c_now_ex = ohlcv_1h_ex[-1][4]
+                c_24h_ex = ohlcv_1h_ex[-25][4]
+                if c_24h_ex > 0:
+                    pct_24h_ex = (c_now_ex - c_24h_ex) / c_24h_ex * 100
             symbol_data = {
                 "price":              price,
                 "indicators":         indicators,
                 "orderbook":          {},
                 "support_resistance": sr_levels,
+                "pct_24h":            round(pct_24h_ex, 2),
             }
 
             # 3. BTC anchor
