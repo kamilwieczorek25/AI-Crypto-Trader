@@ -61,6 +61,12 @@ class Settings(BaseSettings):
     SKIP_FLAT_CYCLES: bool = True
     # Use cheaper Haiku model for routine/flat cycles, Sonnet for actionable
     USE_HAIKU_FOR_HOLD: bool = True
+    # Express lane: skip Claude validation entirely when LESS_FEAR=True.
+    # With LESS_FEAR on we override Claude's HOLD anyway, so the call is pure waste.
+    EXPRESS_SKIP_CLAUDE_WHEN_LESS_FEAR: bool = True
+    # Hard cap: max Claude calls the express lane may make per 60-second window.
+    # Prevents a flood of hot candidates from draining the API budget.
+    EXPRESS_MAX_CLAUDE_PER_MINUTE: int = 3
 
     # ── Quant scorer ────────────────────────────────────────────────────────
     # Minimum composite score (0-100) to consider a trade candidate

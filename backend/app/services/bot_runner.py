@@ -52,8 +52,11 @@ class BotRunner:
         self._recent_results: list[bool] = []  # True=win, False=loss (last 10)
         # Kelly criterion: cached fraction from backtest results
         self._kelly_fraction: float = 1.0  # 1.0 = no adjustment (full quant sizing)
-        # Cooldown: symbols that recently hit stop-loss
+        # Cooldown: symbols that recently hit stop-loss or took profit
         self._sl_cooldown: dict[str, datetime] = {}  # symbol -> cooldown_until
+        # Express lane Claude rate-limiter: timestamps of recent Haiku calls
+        from collections import deque as _deque
+        self._express_claude_calls: _deque = _deque()  # deque of call datetimes
         # Circuit breaker: track peak portfolio value (set properly on start())
         self._peak_value: float = 0.0
         self._circuit_breaker_tripped = False
@@ -1744,19 +1747,64 @@ class BotRunner:
                 correlation_info={},
                 market_intel=intel,
             )
-            # Prepend express context so Claude knows this is a hot fast-scanner signal
-            prompt = (
-                f"[EXPRESS LANE] Fast scanner score={scanner_score:.0f}, "
-                f"re-scored={express_score:.0f}. Evaluate quickly.\n\n{prompt}"
+            # ── 8a. Decide whether to call Claude at all ──────────────────
+            # With LESS_FEAR=True we override Claude's HOLD anyway, so calling
+            # it is pure API spend.  Skip and build the decision from quant data.
+            _skip_claude = (
+                settings.LESS_FEAR and settings.EXPRESS_SKIP_CLAUDE_WHEN_LESS_FEAR
             )
 
-            try:
-                decision, _ = await claude_engine.call_claude(
-                    prompt, use_haiku=True, validation_mode=True
+            # Hard per-minute rate cap even when Claude is enabled
+            if not _skip_claude:
+                _now = datetime.now(timezone.utc)
+                # Purge timestamps older than 60 s
+                while self._express_claude_calls and \
+                      (_now - self._express_claude_calls[0]).total_seconds() > 60:
+                    self._express_claude_calls.popleft()
+                if len(self._express_claude_calls) >= settings.EXPRESS_MAX_CLAUDE_PER_MINUTE:
+                    logger.info(
+                        "Express lane: Claude rate cap hit (%d/%d per min) — "
+                        "skipping Claude for %s",
+                        len(self._express_claude_calls),
+                        settings.EXPRESS_MAX_CLAUDE_PER_MINUTE,
+                        symbol,
+                    )
+                    _skip_claude = True
+
+            if _skip_claude:
+                # Build decision directly from quant candidate — no API call needed
+                from app.schemas.decision import TradeDecision
+                decision = TradeDecision(
+                    action="BUY",
+                    symbol=symbol,
+                    timeframe="1h",
+                    quantity_pct=candidate.quantity_pct,
+                    stop_loss_pct=candidate.stop_loss_pct,
+                    take_profit_pct=candidate.take_profit_pct,
+                    confidence=candidate.score / 100.0,
+                    reasoning=f"[EXPRESS/QUANT] score={express_score:.0f} scanner={scanner_score:.0f}",
+                    primary_signals=candidate.signals,
+                    risk_factors=[],
                 )
-            except Exception as exc:
-                logger.warning("Express lane: Claude validation failed: %s", exc)
-                return
+                logger.info(
+                    "Express lane: %s — Claude skipped (LESS_FEAR/rate-cap), "
+                    "executing on quant score %.0f",
+                    symbol, express_score,
+                )
+            else:
+                # Prepend express context so Claude knows this is a hot fast-scanner signal
+                prompt = (
+                    f"[EXPRESS LANE] Fast scanner score={scanner_score:.0f}, "
+                    f"re-scored={express_score:.0f}. Evaluate quickly.\n\n{prompt}"
+                )
+                try:
+                    decision, _ = await claude_engine.call_claude(
+                        prompt, use_haiku=True, validation_mode=True
+                    )
+                    self._express_claude_calls.append(datetime.now(timezone.utc))
+                except Exception as exc:
+                    logger.warning("Express lane: Claude validation failed: %s", exc)
+                    return
 
             if decision.action != "BUY" or decision.symbol != symbol:
                 # LESS_FEAR override: mirror the main-cycle behaviour — if Claude
