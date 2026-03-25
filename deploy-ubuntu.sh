@@ -108,7 +108,66 @@ else
   fi
 fi
 
-# ── 3. Check ANTHROPIC_API_KEY is set ────────────────────────────────────────
+# ── 3b. Sync missing settings from .env.example → .env ──────────────────────
+# For every key present in .env.example but absent in .env, append it with
+# its default value (plus the preceding comment block for context).
+# Secret / personal keys are skipped — the user must set those manually.
+if [ -f "$PROJECT_DIR/.env.example" ]; then
+  echo ""
+  echo "▶ Checking .env for missing settings..."
+
+  # Keys that require personal credentials — never auto-add with placeholder values
+  _SECRET_KEYS="ANTHROPIC_API_KEY BINANCE_API_KEY BINANCE_SECRET DISCORD_WEBHOOK_URL CRYPTOCOMPARE_API_KEY GPU_SERVER_URL"
+
+  ADDED=0
+  pending_lines=()   # comment/blank lines buffered until we see a real key=value
+
+  while IFS= read -r line; do
+    # Accumulate comment and blank lines — they belong to the next real key
+    if [[ "$line" =~ ^[[:space:]]*# ]] || [[ -z "${line// }" ]]; then
+      pending_lines+=("$line")
+      continue
+    fi
+
+    # Real key=value line
+    key="${line%%=*}"
+    value="${line#*=}"
+
+    # Skip secrets and placeholder values (user must fill these in manually)
+    _skip=0
+    for _sk in $_SECRET_KEYS; do
+      [[ "$key" == "$_sk" ]] && { _skip=1; break; }
+    done
+    # Also skip if value itself looks like a placeholder
+    [[ "$value" == *"sk-ant-"* || "$value" == *"your-"* || "$value" == *"<"*">"* ]] && _skip=1
+
+    if [[ $_skip -eq 1 ]]; then
+      pending_lines=()
+      continue
+    fi
+
+    if [[ -n "$key" ]] && ! grep -q "^${key}=" "$PROJECT_DIR/.env"; then
+      # Append a blank separator, the buffered comment block, then the key=value
+      {
+        echo ""
+        printf '%s\n' "${pending_lines[@]}"
+        echo "$line"
+      } >> "$PROJECT_DIR/.env"
+      echo "  + $key=$value"
+      ADDED=$((ADDED + 1))
+    fi
+
+    pending_lines=()   # reset after every real key, added or not
+  done < "$PROJECT_DIR/.env.example"
+
+  if [ "$ADDED" -gt 0 ]; then
+    echo "✔ Added $ADDED missing setting(s) to .env"
+  else
+    echo "✔ .env is up to date — no missing settings"
+  fi
+fi
+
+# ── 3d. Check ANTHROPIC_API_KEY is set ───────────────────────────────────────
 ANTHROPIC_KEY=$(grep -E '^ANTHROPIC_API_KEY=' "$PROJECT_DIR/.env" | cut -d'=' -f2 | tr -d ' ')
 if [ -z "$ANTHROPIC_KEY" ] || [ "$ANTHROPIC_KEY" = "sk-ant-..." ]; then
   echo ""

@@ -1246,7 +1246,8 @@ class BotRunner:
 
         for symbol, reason, price in triggers:
             logger.info("SL/TP triggered: %s on %s @ $%.6f", reason, symbol, price)
-            # Add cooldown after stop-loss to prevent revenge trading
+            # Add cooldown after stop-loss to prevent revenge trading,
+            # and after take-profit to prevent churning back into trending coins.
             if reason == "stop_loss":
                 self._add_sl_cooldown(symbol, minutes=20)
                 self._recent_results.append(False)
@@ -1254,6 +1255,15 @@ class BotRunner:
             elif reason == "take_profit":
                 self._recent_results.append(True)
                 self._recent_results = self._recent_results[-10:]
+                # Block re-entry so the bot doesn't immediately buy back the
+                # same coin it just sold — lets the trend confirm or reverse.
+                tp_cool = settings.TP_COOLDOWN_MINUTES
+                if tp_cool > 0:
+                    self._add_sl_cooldown(symbol, minutes=tp_cool)
+                    logger.info(
+                        "TP cooldown: %s blocked for %d min to prevent churn",
+                        symbol, tp_cool,
+                    )
             elif reason == "time_exit":
                 # Time exit: count as neutral (neither win nor loss streak)
                 pass
@@ -1749,8 +1759,29 @@ class BotRunner:
                 return
 
             if decision.action != "BUY" or decision.symbol != symbol:
-                logger.info("Express lane: Claude rejected %s — aborting", symbol)
-                return
+                # LESS_FEAR override: mirror the main-cycle behaviour — if Claude
+                # says HOLD but score is solid and direction is bullish, force BUY.
+                if settings.LESS_FEAR and express_score >= 55 and direction > 0:
+                    logger.info(
+                        "Express lane: LESS_FEAR override — Claude said %s for %s, "
+                        "forcing BUY (score=%.0f)",
+                        decision.action, symbol, express_score,
+                    )
+                    decision.action = "BUY"
+                    decision.symbol = symbol
+                    decision.stop_loss_pct   = candidate.stop_loss_pct
+                    decision.take_profit_pct = candidate.take_profit_pct
+                    decision.quantity_pct    = candidate.quantity_pct
+                    decision.confidence      = candidate.score / 100.0
+                    if not getattr(decision, "reasoning", ""):
+                        decision.reasoning = f"LESS_FEAR override, score={express_score:.0f}"
+                else:
+                    logger.info(
+                        "Express lane: Claude rejected %s (action=%s) — cooldown 5 min",
+                        symbol, decision.action,
+                    )
+                    self._express_cooldown[symbol] = datetime.now(timezone.utc) + timedelta(minutes=5)
+                    return
 
             # Override with quant levels (same as main cycle)
             decision.stop_loss_pct  = candidate.stop_loss_pct
@@ -1797,6 +1828,17 @@ class BotRunner:
                         self._banned_symbols.add(symbol)
                     logger.warning("Express lane execute failed for %s: %s", symbol, exec_err)
                     return
+
+                if trade is None:
+                    # Executor declined silently (exposure limit, order too small,
+                    # insufficient cash, etc.).  Set cooldown so the scanner doesn't
+                    # hammer this symbol every 60 s in a tight retry loop.
+                    logger.info(
+                        "Express lane: executor returned None for %s "
+                        "(exposure limit / order too small?) — cooldown 5 min",
+                        symbol,
+                    )
+                    self._express_cooldown[symbol] = datetime.now(timezone.utc) + timedelta(minutes=5)
 
                 if trade:
                     db_decision.executed = True

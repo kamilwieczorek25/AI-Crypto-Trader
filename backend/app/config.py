@@ -100,9 +100,12 @@ class Settings(BaseSettings):
     # ── Trailing take-profit ──────────────────────────────────────────────
     # When price hits TP, don't sell immediately — let it run.
     # Sell only when price pulls back this % from the peak above TP.
-    TRAILING_TP_PULLBACK_PCT: float = 3.0
+    TRAILING_TP_PULLBACK_PCT: float = 6.0
     # Safety floor: if price drops back below original TP, sell immediately.
     TRAILING_TP_FLOOR: bool = True
+    # Minutes to block re-entry after a take-profit exit.
+    # Prevents churning in/out of the same trending coin repeatedly.
+    TP_COOLDOWN_MINUTES: int = 45
 
     # ── Time-based exit ──────────────────────────────────────────────────
     # Max hours to hold a stagnant position (0 = disabled)
