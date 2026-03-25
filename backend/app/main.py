@@ -119,9 +119,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     if "mode" in state and state["mode"] in ("demo", "real"):
         settings.MODE = state["mode"]
     if "less_fear" in state:
-        settings.LESS_FEAR = state["less_fear"].lower() == "true"
-        if settings.LESS_FEAR:
-            _log.info("Less-fear mode restored from DB: ENABLED")
+        db_val = state["less_fear"].lower() == "true"
+        # .env wins when it explicitly enables Less Fear — the DB can turn it on
+        # (user clicked the button) but cannot silently override an env-level true.
+        settings.LESS_FEAR = db_val or settings.LESS_FEAR
+        _log.info(
+            "Less-fear mode: %s (env=%s db=%s)",
+            "ENABLED" if settings.LESS_FEAR else "disabled",
+            settings.LESS_FEAR, db_val,
+        )
 
     # Warn early if Anthropic key is missing
     if not settings.ANTHROPIC_API_KEY:

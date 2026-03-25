@@ -1116,11 +1116,19 @@ class BotRunner:
                 trade = await self._executor.execute(db, decision, db_decision.id)
             except Exception as exec_err:
                 err_msg = str(exec_err).lower()
-                if "not permitted" in err_msg or "not allowed" in err_msg:
+                _perm_fail = (
+                    "not permitted" in err_msg
+                    or "not allowed" in err_msg
+                    or "market is closed" in err_msg
+                    or "invalid symbol" in err_msg
+                    or "does not exist" in err_msg
+                    or "badrequest" in err_msg
+                )
+                if _perm_fail:
                     self._banned_symbols.add(decision.symbol)
                     logger.warning(
-                        "Symbol %s banned (not permitted). Banned: %s",
-                        decision.symbol, self._banned_symbols,
+                        "Symbol %s banned (permanent error: %s). Banned list: %s",
+                        decision.symbol, exec_err, self._banned_symbols,
                     )
                 else:
                     raise
@@ -2021,9 +2029,29 @@ class BotRunner:
                     trade = await self._executor.execute(db, decision, db_decision.id)
                 except Exception as exec_err:
                     err_msg = str(exec_err).lower()
-                    if "not permitted" in err_msg or "not allowed" in err_msg:
+                    _perm_fail = (
+                        "not permitted" in err_msg
+                        or "not allowed" in err_msg
+                        or "market is closed" in err_msg
+                        or "invalid symbol" in err_msg
+                        or "does not exist" in err_msg
+                        or "badrequest" in err_msg
+                    )
+                    if _perm_fail:
                         self._banned_symbols.add(symbol)
-                    logger.warning("Express lane execute failed for %s: %s", symbol, exec_err)
+                        logger.warning(
+                            "Express lane: %s banned (permanent error: %s)",
+                            symbol, exec_err,
+                        )
+                    else:
+                        # Temporary error — cooldown 15 min before retrying
+                        self._express_cooldown[symbol] = (
+                            datetime.now(timezone.utc) + timedelta(minutes=15)
+                        )
+                        logger.warning(
+                            "Express lane execute failed for %s (cooldown 15 min): %s",
+                            symbol, exec_err,
+                        )
                     return
 
                 if trade is None:

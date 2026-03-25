@@ -18,6 +18,46 @@ let knownSymbols = new Set();
 
 const PALETTE = ['#7c4dff','#00e676','#ffd740','#448aff','#ff5252','#b388ff','#18ffff','#ff9100','#ec4899','#06b6d4'];
 
+/* ─── Button tooltips (data-tip attribute → styled popup) ─── */
+(function initTooltips() {
+  const box = document.getElementById('btn-tooltip');
+  if (!box) return;
+  let hideTimer = null;
+
+  document.addEventListener('mouseover', e => {
+    const el = e.target.closest('[data-tip]');
+    if (!el) return;
+    clearTimeout(hideTimer);
+    box.innerHTML = el.dataset.tip;
+    box.classList.add('visible');
+    positionTooltip(el);
+  });
+
+  document.addEventListener('mouseout', e => {
+    const el = e.target.closest('[data-tip]');
+    if (!el) return;
+    hideTimer = setTimeout(() => box.classList.remove('visible'), 80);
+  });
+
+  document.addEventListener('mousemove', e => {
+    if (!box.classList.contains('visible')) return;
+    const el = e.target.closest('[data-tip]');
+    if (el) positionTooltip(el);
+  });
+
+  function positionTooltip(el) {
+    const r = el.getBoundingClientRect();
+    const tw = 310; // max-width
+    // Try below first, flip above if not enough space
+    let top = r.bottom + 8;
+    if (top + 160 > window.innerHeight) top = r.top - 8 - box.offsetHeight;
+    let left = r.left + r.width / 2 - tw / 2;
+    left = Math.max(8, Math.min(left, window.innerWidth - tw - 8));
+    box.style.top  = top  + 'px';
+    box.style.left = left + 'px';
+  }
+})();
+
 /* ─── DOM helpers ─── */
 const $ = id => document.getElementById(id);
 const fmt = (n, dec=2) => n == null ? '—' : Number(n).toLocaleString('en-US', {minimumFractionDigits: dec, maximumFractionDigits: dec});

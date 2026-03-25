@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="style.css?v=21" />
+  <link rel="stylesheet" href="style.css?v=22" />
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
 </head>
 <body>
@@ -29,21 +29,28 @@
       <div class="risk-group">
         <span class="control-label">Risk</span>
         <div class="risk-btns">
-          <button id="risk-conservative" class="btn-risk" onclick="setRiskProfile('conservative')" title="Conservative — high conviction only, 2% max">🛡 Safe</button>
-          <button id="risk-balanced"     class="btn-risk" onclick="setRiskProfile('balanced')"     title="Balanced — default behaviour, 5% max">⚖ Balanced</button>
-          <button id="risk-aggressive"   class="btn-risk" onclick="setRiskProfile('aggressive')"   title="Aggressive — more trades, momentum focus">⚡ Aggressive</button>
-          <button id="risk-fast_profit"  class="btn-risk" onclick="setRiskProfile('fast_profit')"  title="Fast Profit — maximum aggression, 15m/1h signals">🚀 Fast</button>
+          <button id="risk-conservative" class="btn-risk" onclick="setRiskProfile('conservative')"
+            data-tip="<b>🛡 Safe — Conservative</b><br>Min confidence: <b>75%</b> &nbsp;|&nbsp; Max position: <b>2%</b><br>Textbook setups only: RSI oversold, clear MACD crossover, BB support<br>Stop-loss: <b>6–10%</b> (wide, avoids whipsaws)<br><span class='tip-auto'>Auto-selected in: downtrend / choppy market</span>">🛡 Safe</button>
+          <button id="risk-balanced"     class="btn-risk" onclick="setRiskProfile('balanced')"
+            data-tip="<b>⚖ Balanced — Default</b><br>Min confidence: <b>55%</b> &nbsp;|&nbsp; Max position: <b>5%</b><br>All timeframes equally weighted — standard behaviour<br>Stop-loss: <b>4–8%</b><br><span class='tip-auto'>Auto-selected in: uptrend / ranging market</span>">⚖ Balanced</button>
+          <button id="risk-aggressive"   class="btn-risk" onclick="setRiskProfile('aggressive')"
+            data-tip="<b>⚡ Aggressive — Momentum</b><br>Min confidence: <b>45%</b> &nbsp;|&nbsp; Max position: <b>5%</b><br>Favours 15m/1h signals — reacts fast to momentum shifts<br>Stop-loss: <b>3–5%</b> (tight — cut losses, redeploy fast)<br>Chases breakouts, volume spikes, RSI recoveries">⚡ Aggressive</button>
+          <button id="risk-fast_profit"  class="btn-risk" onclick="setRiskProfile('fast_profit')"
+            data-tip="<b>🚀 Fast Profit — Max Aggression</b><br>Min confidence: <b>38%</b> &nbsp;|&nbsp; Max position: <b>5%</b><br><b>15m/1h only</b> — pure short-term momentum, no long-hold signals<br>Stop-loss: <b>2–4%</b> &nbsp;|&nbsp; Take-profit: <b>15–30%</b><br>Sells the moment momentum stalls — speed over patience">🚀 Fast</button>
         </div>
       </div>
       <div class="header-sep"></div>
-      <button id="btn-less-fear" class="btn-fear" onclick="toggleLessFear()" title="Override Claude's conservative bias — auto-approve high-scoring trades">😱 Less Fear</button>
+      <button id="btn-less-fear" class="btn-fear" onclick="toggleLessFear()"
+        data-tip="<b>😱 Less Fear</b><br>Reduces Claude's conservative bias in two ways:<br>① Auto-approves BUY when quant score ≥ 45 (skips Claude on main cycle)<br>② Skips Claude entirely in the express lane — saves API cost<br>③ Blocks auto-downgrade to Conservative profile<br><span class='tip-warn'>Use in uptrends. Disable in downtrends/choppy markets.</span>">😱 Less Fear</button>
     </div>
     <div class="header-right">
       <div class="mode-group">
         <span class="control-label">Mode</span>
         <div class="mode-btns">
-          <button id="btn-demo" class="btn-mode active" onclick="setMode('demo')">DEMO</button>
-          <button id="btn-real" class="btn-mode" onclick="setMode('real')">REAL</button>
+          <button id="btn-demo" class="btn-mode active" onclick="setMode('demo')"
+            data-tip="<b>DEMO mode</b><br>Paper trading — no real money used<br>Simulates trades against real market prices<br>Safe for testing strategies and new settings">DEMO</button>
+          <button id="btn-real" class="btn-mode" onclick="setMode('real')"
+            data-tip="<b>REAL mode</b><br>Live trading on Binance with real funds<br>Requires REAL_TRADING=true in .env<br><span class='tip-warn'>All trades are executed and cannot be reversed</span>">REAL</button>
         </div>
       </div>
       <div class="action-btns">
@@ -412,6 +419,9 @@
     </div>
   </footer>
 
-  <script src="app.js?v=21"></script>
+  <!-- Floating tooltip for data-tip buttons -->
+  <div id="btn-tooltip" role="tooltip" aria-hidden="true"></div>
+
+  <script src="app.js?v=22"></script>
 </body>
 </html>
