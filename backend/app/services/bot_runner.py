@@ -56,7 +56,9 @@ class BotRunner:
         self._sl_cooldown: dict[str, datetime] = {}  # symbol -> cooldown_until
         # Express lane Claude rate-limiter: timestamps of recent Haiku calls
         from collections import deque as _deque
-        self._express_claude_calls: _deque = _deque()  # deque of call datetimes
+        self._express_claude_calls: _deque = _deque()   # deque of call datetimes
+        # Main-cycle Claude rate-limiter: timestamps within the last 3600 s
+        self._main_claude_calls: _deque = _deque()      # deque of call datetimes
         # Circuit breaker: track peak portfolio value (set properly on start())
         self._peak_value: float = 0.0
         self._circuit_breaker_tripped = False
@@ -831,38 +833,150 @@ class BotRunner:
                 return
 
             logger.info(
-                "Quant: %d candidates, top %d → Claude validation: %s",
+                "Quant: %d candidates, top %d — evaluating: %s",
                 len(quant_candidates), len(top_candidates),
                 " | ".join(f"{c.symbol} {c.action} score={c.score:.0f}" for c in top_candidates),
             )
 
-            # 6. Build validation prompt (compact — only candidates + context)
-            prompt = claude_engine.build_validation_prompt(
-                candidates=top_candidates,
-                portfolio=portfolio_dict,
-                news=news_data,
-                market_regime=market_regime,
-                btc_anchor=btc_anchor,
-                correlation_info=correlation_info,
-                market_intel=market_intel,
-            )
+            top_cand = top_candidates[0]
+            _has_sell = any(c.action == "SELL" for c in top_candidates)
 
-            # 6a. Model tier: Haiku for BUY-only validation, Sonnet for SELL decisions
-            use_haiku = (
-                settings.USE_HAIKU_FOR_HOLD
-                and not any(c.action == "SELL" for c in top_candidates)
-            )
+            # ── 5d. Gate: call Claude only when ALL local models agree ──────────
+            #
+            # Default outcome is HOLD — Claude is only called when the quant
+            # scorer, GPU ensemble, and anomaly detector all say "yes" at once.
+            # If any local model is sceptical, there is no edge worth paying
+            # for Claude to evaluate.
+            #
+            # SELL decisions bypass this gate (always need Claude's caution).
+            # LESS_FEAR mode also bypasses (we'd override Claude anyway).
+            #
+            # When the gate passes, Claude makes the final decision.
+            # If Claude call budget is exhausted, execute directly from quant.
 
-            # 7. Call Claude (validation mode)
-            tier_label = "haiku" if use_haiku else "sonnet"
-            logger.info("Calling Claude [%s] for validation...", tier_label)
-            try:
-                decision, raw_response = await claude_engine.call_claude(
-                    prompt, use_haiku=use_haiku, validation_mode=True,
+            _call_claude  = False   # default: HOLD without calling Claude
+            _auto_execute = False   # execute from quant/GPU without Claude
+            _gate_reason  = ""
+
+            if _has_sell:
+                # SELL candidates always get Claude validation
+                _call_claude = True
+                _gate_reason = "SELL candidate — Claude required"
+
+            elif settings.MAIN_CYCLE_SKIP_CLAUDE_WHEN_LESS_FEAR and settings.LESS_FEAR:
+                # LESS_FEAR: we override Claude's HOLD anyway, so skip the call
+                # and execute directly from quant.
+                _auto_execute = True
+                _gate_reason  = f"LESS_FEAR auto-execute (score={top_cand.score:.0f})"
+
+            else:
+                # Gate check: all local models must agree before we involve Claude.
+                _gpu_ens    = ml_signals.get(top_cand.symbol, {}).get("ensemble", {})
+                _gpu_sig    = _gpu_ens.get("signal", "HOLD")
+                _gpu_conf   = float(_gpu_ens.get("confidence", 0))
+                _gpu_agree  = float(_gpu_ens.get("agreement", 0))
+                _mtf_sig    = ml_signals.get(top_cand.symbol, {}).get("mtf", {}).get("signal", "HOLD")
+                _anomaly    = ml_signals.get(top_cand.symbol, {}).get("anomaly", {})
+                _is_anomaly = bool(_anomaly.get("is_anomaly", False))
+
+                _local_agree = (
+                    _gpu_sig  == "BUY"
+                    and _gpu_conf  >= settings.SKIP_CLAUDE_GPU_MIN_CONFIDENCE
+                    and _gpu_agree >= 0.55
+                    and _mtf_sig   != "SELL"
+                    and not _is_anomaly
                 )
-            except Exception as exc:
-                logger.error("Claude validation failed: %s", exc)
-                raise
+
+                if not _local_agree:
+                    # Local models don't agree — HOLD, no Claude call
+                    _gate_reason = (
+                        f"local models disagree — HOLD "
+                        f"(gpu={_gpu_sig} conf={_gpu_conf:.2f} agree={_gpu_agree:.2f} "
+                        f"mtf={_mtf_sig} anomaly={_is_anomaly})"
+                    )
+                else:
+                    # Local models agree — check hourly Claude budget
+                    _now_hr = datetime.now(timezone.utc)
+                    while self._main_claude_calls and \
+                          (_now_hr - self._main_claude_calls[0]).total_seconds() > 3600:
+                        self._main_claude_calls.popleft()
+
+                    if (
+                        settings.MAIN_CYCLE_MAX_CLAUDE_PER_HOUR > 0
+                        and len(self._main_claude_calls) >= settings.MAIN_CYCLE_MAX_CLAUDE_PER_HOUR
+                    ):
+                        # Budget exhausted — local models agree so execute directly
+                        _auto_execute = True
+                        _gate_reason  = (
+                            f"Claude budget exhausted ({len(self._main_claude_calls)}/"
+                            f"{settings.MAIN_CYCLE_MAX_CLAUDE_PER_HOUR}/hr) — "
+                            f"all local models agree, executing from quant"
+                        )
+                    else:
+                        _call_claude = True
+                        _gate_reason = (
+                            f"all local models agree — calling Claude "
+                            f"(gpu={_gpu_conf:.2f} agree={_gpu_agree:.2f})"
+                        )
+
+            # ── 5e. Handle gate outcome ─────────────────────────────────────────
+            if not _call_claude and not _auto_execute:
+                # Local models disagree → HOLD cycle, no API call
+                logger.info("Main cycle: HOLD — %s", _gate_reason)
+                claude_engine.record_skipped_cycle()
+                self._cycle_count += 1
+                self._last_cycle_at = datetime.now(timezone.utc)
+                await self._portfolio.take_snapshot(db)
+                await self._broadcast("PORTFOLIO_UPDATE", self._portfolio.get_state().model_dump())
+                return
+
+            if _auto_execute:
+                # All local models agree but Claude budget is gone (or LESS_FEAR)
+                logger.info("Main cycle: auto-execute from quant/GPU — %s", _gate_reason)
+                from app.schemas.decision import TradeDecision
+                decision = TradeDecision(
+                    action=top_cand.action,
+                    symbol=top_cand.symbol,
+                    timeframe="1h",
+                    quantity_pct=top_cand.quantity_pct,
+                    stop_loss_pct=top_cand.stop_loss_pct,
+                    take_profit_pct=top_cand.take_profit_pct,
+                    confidence=top_cand.score / 100.0,
+                    reasoning=f"[QUANT/GPU] {_gate_reason}",
+                    primary_signals=top_cand.signals,
+                    risk_factors=[],
+                )
+                raw_response = decision.reasoning
+            else:
+                # ── 6. Build validation prompt + call Claude ─────────────────
+                logger.info("Main cycle: %s", _gate_reason)
+                prompt = claude_engine.build_validation_prompt(
+                    candidates=top_candidates,
+                    portfolio=portfolio_dict,
+                    news=news_data,
+                    market_regime=market_regime,
+                    btc_anchor=btc_anchor,
+                    correlation_info=correlation_info,
+                    market_intel=market_intel,
+                )
+
+                # 6a. Model tier: Haiku for BUY-only, Sonnet for SELL decisions
+                use_haiku = (
+                    settings.USE_HAIKU_FOR_HOLD
+                    and not _has_sell
+                )
+
+                tier_label = "haiku" if use_haiku else "sonnet"
+                logger.info("Calling Claude [%s] for validation...", tier_label)
+                try:
+                    decision, raw_response = await claude_engine.call_claude(
+                        prompt, use_haiku=use_haiku, validation_mode=True,
+                    )
+                    # Record timestamp for hourly budget tracking
+                    self._main_claude_calls.append(datetime.now(timezone.utc))
+                except Exception as exc:
+                    logger.error("Claude validation failed: %s", exc)
+                    raise
 
             # 7a. Override SL/TP with quant model values (Claude validates, not sets levels)
             if decision.action in ("BUY", "SELL"):

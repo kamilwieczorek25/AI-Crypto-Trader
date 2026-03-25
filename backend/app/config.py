@@ -59,14 +59,27 @@ class Settings(BaseSettings):
     MAX_PROMPT_SYMBOLS: int = 8
     # Skip Claude call when market is flat (saves ~20-40% of calls)
     SKIP_FLAT_CYCLES: bool = True
-    # Use cheaper Haiku model for routine/flat cycles, Sonnet for actionable
+    # Use cheaper Haiku model for routine/hold cycles, Sonnet for SELL decisions
     USE_HAIKU_FOR_HOLD: bool = True
     # Express lane: skip Claude validation entirely when LESS_FEAR=True.
     # With LESS_FEAR on we override Claude's HOLD anyway, so the call is pure waste.
     EXPRESS_SKIP_CLAUDE_WHEN_LESS_FEAR: bool = True
     # Hard cap: max Claude calls the express lane may make per 60-second window.
-    # Prevents a flood of hot candidates from draining the API budget.
     EXPRESS_MAX_CLAUDE_PER_MINUTE: int = 3
+
+    # Main-cycle Claude bypass — let GPU model take the decision directly.
+    # Tier 1: LESS_FEAR bypass — if LESS_FEAR=True and we'd override Claude's HOLD
+    #   anyway, skip the call entirely (mirrors what express lane already does).
+    MAIN_CYCLE_SKIP_CLAUDE_WHEN_LESS_FEAR: bool = True
+    # Tier 2: High-conviction GPU bypass — skip Claude when quant score AND GPU
+    #   ensemble are both confident. Claude would agree in >90% of these cases.
+    #   Set to 0.0 to disable. Recommended: 75.0
+    SKIP_CLAUDE_ABOVE_SCORE: float = 75.0
+    # Minimum GPU ensemble confidence required for the high-conviction bypass.
+    SKIP_CLAUDE_GPU_MIN_CONFIDENCE: float = 0.65
+    # Tier 3: Hard hourly cap on main-cycle Claude calls (0 = unlimited).
+    #   Even if tiers 1+2 miss, this prevents a call storm in active markets.
+    MAIN_CYCLE_MAX_CLAUDE_PER_HOUR: int = 4
 
     # ── Quant scorer ────────────────────────────────────────────────────────
     # Minimum composite score (0-100) to consider a trade candidate
