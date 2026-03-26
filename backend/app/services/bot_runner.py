@@ -726,6 +726,11 @@ class BotRunner:
                 except Exception as exc:
                     logger.warning("Exit RL check failed (non-fatal): %s", exc)
 
+            # 4g2. Smart Exit — analyze open positions for exit signals
+            #      Combines GPU Exit RL + local reversal detector + profit lock.
+            if settings.SMART_EXIT_ENABLED:
+                await self._smart_exit_check(db, symbols_data, btc_anchor, ml_signals)
+
             # 4h. Train MTF model with multi-TF candle data
             if _gpu_available:
                 try:
@@ -1353,6 +1358,140 @@ class BotRunner:
             {sym: {"price": price} for sym, price in prices.items()},
         )
         await self._check_sl_tp()
+
+    async def _smart_exit_check(
+        self,
+        db: AsyncSession,
+        symbols_data: dict,
+        btc_anchor: dict,
+        ml_signals: dict,
+    ) -> None:
+        """Run the smart exit analyzer on every open bot-managed position.
+
+        This is the intelligent exit engine that combines:
+          1. GPU Exit RL (Dueling DQN) when trained
+          2. Local reversal detector (10 independent technical signals)
+          3. Profit lock sliding floor (safety net)
+
+        Executes CLOSE or PARTIAL exits immediately — no Claude call needed.
+        """
+        from app.services.exit_analyzer import analyze_exit, ExitSignal
+
+        positions = [
+            p for p in self._portfolio.all_positions()
+            if getattr(p, "source", "bot") == "bot"
+        ]
+        if not positions:
+            return
+
+        profit_lock_keep = settings.PROFIT_LOCK_KEEP_PCT / 100.0
+
+        for pos in positions:
+            sym = pos.symbol
+            ind_1h = symbols_data.get(sym, {}).get("indicators", {}).get("1h", {})
+            sig = ml_signals.get(sym, {})
+
+            signal: ExitSignal = analyze_exit(
+                pos=pos,
+                ind_1h=ind_1h,
+                btc_anchor=btc_anchor,
+                exit_rl=sig.get("exit_rl"),
+                ensemble=sig.get("ensemble"),
+                anomaly=sig.get("anomaly"),
+                vol_forecast=sig.get("vol_forecast"),
+                profit_lock_activate=settings.PROFIT_LOCK_ACTIVATE_PCT,
+                profit_lock_floor_min=settings.PROFIT_LOCK_FLOOR_PCT,
+                profit_lock_keep=profit_lock_keep,
+            )
+
+            if signal.action == "HOLD":
+                continue
+
+            pnl_pct = pos.pnl_pct
+            qty_pct = 100.0 if signal.action == "CLOSE" else 50.0
+            label = f"Smart exit ({signal.source}): {signal.reason}"
+
+            logger.info(
+                "Smart exit: %s %s %s (PnL=%.2f%%, conf=%.0f%%) — %s",
+                signal.action, sym, f"{qty_pct:.0f}%",
+                pnl_pct, signal.confidence * 100, signal.reason,
+            )
+
+            # Log synthetic SELL decision
+            db_decision = ClaudeDecision(
+                raw_prompt=f"[SMART_EXIT {signal.source.upper()}]",
+                raw_response=signal.reason,
+                action="SELL",
+                symbol=sym,
+                timeframe="auto",
+                quantity_pct=qty_pct,
+                stop_loss_pct=0.0,
+                take_profit_pct=0.0,
+                confidence=signal.confidence,
+                primary_signals=f'["{label}"]',
+                risk_factors="[]",
+                reasoning=f"Smart exit: {signal.reason}",
+                executed=False,
+            )
+            db.add(db_decision)
+            await db.commit()
+            await db.refresh(db_decision)
+
+            synthetic = TradeDecision(
+                action="SELL",
+                symbol=sym,
+                timeframe="auto",
+                quantity_pct=0.0,
+                stop_loss_pct=0.0,
+                take_profit_pct=0.0,
+                confidence=signal.confidence,
+                sell_pct=qty_pct,
+                primary_signals=[label],
+                risk_factors=[],
+                reasoning=f"Smart exit: {signal.reason}",
+            )
+            trade = await self._executor.execute(db, synthetic, db_decision.id)
+
+            if trade:
+                db_decision.executed = True
+                db.add(db_decision)
+                await db.commit()
+                await self._broadcast("TRADE_EXECUTED", {
+                    "id": trade.id,
+                    "symbol": trade.symbol,
+                    "direction": trade.direction,
+                    "mode": trade.mode,
+                    "quantity": trade.quantity,
+                    "price": trade.price,
+                    "pnl_usdt": trade.pnl_usdt,
+                    "pnl_pct": trade.pnl_pct,
+                    "trigger": f"smart_exit_{signal.source}",
+                })
+                await send_trade_notification(
+                    action="SELL",
+                    symbol=trade.symbol,
+                    price=trade.price,
+                    quantity=trade.quantity,
+                    pnl_usdt=trade.pnl_usdt,
+                    pnl_pct=trade.pnl_pct,
+                    confidence=signal.confidence,
+                    reasoning=f"Smart exit: {signal.reason}",
+                    trigger=f"SE_{signal.source[:2].upper()}",
+                )
+                await self._broadcast(
+                    "PORTFOLIO_UPDATE", self._portfolio.get_state().model_dump()
+                )
+                # Train Exit RL with the outcome
+                if trade.pnl_pct is not None:
+                    action_idx = 3 if signal.action == "CLOSE" else 2  # CLOSE=3, PARTIAL_50=2
+                    await self._submit_exit_experience(
+                        trade.symbol, trade.pnl_pct, action=action_idx
+                    )
+                # Cooldown to prevent re-entry
+                if signal.action == "CLOSE":
+                    self._add_sl_cooldown(sym, minutes=10)
+                    self._recent_results.append(pnl_pct > 0)
+                    self._recent_results = self._recent_results[-10:]
 
     async def _check_sl_tp(self) -> None:
         """Auto-close positions that have hit their stop-loss, take-profit, or time limit.

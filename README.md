@@ -1,6 +1,6 @@
 # AI Crypto Trader
 
-A production-ready autonomous trading bot for Binance that uses **Claude (claude-sonnet-4-6)** as its decision engine. The bot combines a 26-factor quantitative signal stack, LSTM + reinforcement learning models, real-time whale detection, market intelligence, and news sentiment analysis — then routes the top candidates to Claude for structured BUY / SELL / HOLD decisions via forced `tool_use`.
+A production-ready autonomous trading bot for Binance that uses **Claude (claude-sonnet-4-6)** as its decision engine. The bot combines a 27-factor quantitative signal stack, LSTM + reinforcement learning models, real-time whale detection, market intelligence, and news sentiment analysis — then routes the top candidates to Claude for structured BUY / SELL / HOLD decisions via forced `tool_use`.
 
 Runs in **demo mode** (paper trading) by default. Live trading requires explicit opt-in.
 
@@ -9,7 +9,7 @@ Runs in **demo mode** (paper trading) by default. Live trading requires explicit
 ## What It Can Do
 
 ### Signal Intelligence
-- **26-factor quant scorer** (0–100 scale): RSI, MACD, MACD divergence, Bollinger Bands + squeeze detection, Bollinger squeeze setup, volume ratio, volume Z-score, OBV trend, VWAP position, multi-timeframe trend alignment, support/resistance proximity, BTC correlation anchor, BTC beta, orderbook bid/ask pressure, depth imbalance, funding rate (contrarian), long/short ratio, open interest trend, whale flow, ML consensus, GPU momentum ranking, sector rotation heat, breakout signal, momentum acceleration, and news burst detection
+- **27-factor quant scorer** (0–100 scale): RSI, MACD, MACD divergence, Bollinger Bands + squeeze detection, Bollinger squeeze setup, volume ratio, volume Z-score, OBV trend, VWAP position, multi-timeframe trend alignment, support/resistance proximity, BTC correlation anchor, BTC beta, orderbook bid/ask pressure, depth imbalance, funding rate (contrarian), long/short ratio, open interest trend, whale flow, ML consensus, GPU momentum ranking, sector rotation heat, breakout signal, momentum acceleration, news burst detection, and **24h price change momentum**
 - **LSTM price predictor** — 2-layer LSTM trained on 500-candle windows across top symbols; predicts SELL / HOLD / BUY with probability distribution
 - **DQN reinforcement learning agent** — learns from live paper-trading outcomes via experience replay; improves every cycle
 - **Real-time whale detector** — monitors Binance WebSocket trade stream for large trades (default ≥ $50k USDT) and injects whale flow signal into the scorer
@@ -25,7 +25,7 @@ Runs in **demo mode** (paper trading) by default. Live trading requires explicit
 - **Four risk profiles**: `conservative` (confidence ≥ 0.75, max 2% position), `balanced` (≥ 0.55, max 5%), `aggressive` (≥ 0.45), `fast_profit` (≥ 0.40, short holds)
 - **Auto risk profile** — detects market regime each cycle (bull / bear / sideways) and adjusts the profile automatically
 - **Less-fear mode** — overrides Claude's conservative bias: lowers quant threshold (55 → 45), blocks auto-downgrade to conservative profile, forces Claude to approve high-scoring candidates it would otherwise HOLD. Toggleable via dashboard button or `LESS_FEAR=true` in `.env`
-- **Cost optimisation** — uses Haiku for flat/quiet cycles, Sonnet for actionable signals; skips Claude call entirely when no strong signals exist
+- **Three-tier Claude gating** — Claude is only called when all local models agree; default is auto-HOLD with no API call. Tier 1: LESS_FEAR bypass (skip Claude when override is active). Tier 2: GPU high-conviction bypass (skip when quant score + GPU ensemble both confident). Tier 3: hourly hard cap (default 4 calls/hour). Uses Haiku for quiet cycles, Sonnet for actionable signals
 - **RAG memory** — retrieves relevant historical trade outcomes and news context before each Claude call; profitable past trades surface higher in results (outcome-weighted + recency-decayed, SQLite-persisted across restarts)
 
 ### Trade Execution
@@ -34,8 +34,12 @@ Runs in **demo mode** (paper trading) by default. Live trading requires explicit
 - **Pyramiding** — adds to profitable open positions when quant score remains high and P&L exceeds threshold
 - **ATR-based stop-loss / take-profit** — dynamic levels calibrated to each symbol's volatility; minimum reward-to-risk ratio enforced
 - **Monte Carlo SL/TP refinement** — GPU runs 10K simulated price paths to validate and tighten SL/TP; if simulated edge is negative, TP is reduced automatically
+- **Smart exit engine** — three-layer intelligent exit system that runs every cycle for open positions:
+  - **GPU Exit RL** (Dueling DQN) — when trained, its CLOSE/PARTIAL predictions are now executed automatically based on Q-value confidence spread
+  - **Local reversal detector** — 10 independent technical signals (RSI overbought/crash, MACD bearish flip, price below VWAP, BB lower band, drawdown from peak, OBV bearish, BTC dragging down, GPU ensemble SELL, anomaly detected, volatility spike) — needs 3+ confirmations to close, 2+ for partial exit
+  - **Profit lock sliding floor** — when a position peaks at +X%, a dynamic floor at max(1%, X×50%) protects gains (e.g. peaked +10% → sells at +5% if gains erode)
 - **Trailing take-profit** — when price hits TP, instead of selling immediately, activates trailing mode: tracks the peak and sells only when price pulls back a configurable % from that peak (or drops below original TP as safety floor)
-- **Partial sells** — Claude can direct partial position exits (25%, 50%, etc.) instead of all-or-nothing closes; Exit RL can also recommend partial exits
+- **Partial sells** — Claude, Exit RL, and the smart exit engine can all direct partial position exits (25%, 50%, etc.) instead of all-or-nothing closes
 - **Time-based exits** — stagnant positions automatically closed after a configurable hold duration
 - **Exchange sync** — in real mode, imports actual Binance balances and positions into the portfolio state every cycle. Pre-existing holdings imported as "external" (read-only)
 - **Position adoption** — external positions can be converted to bot-managed via dashboard button or `POST /api/bot/adopt-positions`. Sets SL/TP based on current price and config defaults, enabling full bot management (SL/TP monitoring, trailing stops, Exit RL, sell signals)
@@ -43,8 +47,8 @@ Runs in **demo mode** (paper trading) by default. Live trading requires explicit
 ### Risk Management
 - **Demo / real mode gate** — two independent flags (`MODE=real` AND `REAL_TRADING=true`) required for live orders
 - **Max drawdown circuit breaker** — pauses the bot if portfolio drops a configurable % from its peak
-- **Position size caps** — max % per trade and max total altcoin exposure enforced at both the prompt and executor level
-- **Banned symbol auto-detection** — when the exchange rejects a symbol (not permitted for account), the bot auto-bans it for the session to prevent repeated failed orders
+- **Position size caps** — max % per trade, max total altcoin exposure, and max concurrent open positions (default 3) enforced at both the prompt and executor level
+- **Banned symbol auto-detection** — when the exchange rejects a symbol (not permitted, market closed, invalid symbol, bad request), the bot auto-bans it for the session; temporary errors get a 15-minute cooldown instead
 - **Discord notifications** — trade alerts, errors, and daily summaries sent to a webhook
 
 ### Auto-Tuning
@@ -60,9 +64,9 @@ Run `gpu-server/server.py` on any machine (GPU optional — falls back to CPU) t
 - **Multi-Timeframe Fusion** — single Transformer sees 15m+1h+4h+1d simultaneously, learns cross-TF patterns (e.g. "15m reversal while 4h trends up")
 - **Volatility Forecasting** — LSTM predicts future σ for better SL/TP placement and Monte Carlo accuracy
 - **Anomaly Detection Autoencoder** — flags pump-and-dumps, flash crashes, whale manipulation; blocks entry automatically
-- **Optimal Exit RL** — dedicated Dueling DQN trained only on exit timing: HOLD / PARTIAL_25% / PARTIAL_50% / CLOSE
+- **Optimal Exit RL** — dedicated Dueling DQN trained only on exit timing: HOLD / PARTIAL_25% / PARTIAL_50% / CLOSE. Predictions are now executed by the smart exit engine when Q-value confidence is sufficient
 - **Attention Explainability** — extracts which candles and features the Transformer focused on, shown to Claude
-- **Cross-Symbol Correlation Tracker** — GPU-parallel Pearson correlation matrix; detects divergence = mean-reversion signals
+- **Cross-Symbol Correlation Tracker** — GPU-parallel Pearson correlation matrix; detects divergence = mean-reversion signals, used to reject BUY candidates correlated (r > 0.8) with existing positions
 
 ---
 
@@ -79,14 +83,15 @@ Run `gpu-server/server.py` on any machine (GPU optional — falls back to CPU) t
 │                                                     │
 │  bot_runner ──► quant_scorer ──► claude_engine      │
 │       │              │                │             │
-│  fast_scanner   17 signals      tool_use API        │
+│  fast_scanner   27 signals      tool_use API        │
 │  whale_detector  market_data    RAG context         │
 │  backtester      technical      risk profiles       │
-│  auto_tuner      news/intel     cost optimiser      │
+│  auto_tuner      news/intel     3-tier gating       │
+│  exit_analyzer   market_intel   cost optimiser      │
 │       │                                             │
 │  executor ──► Binance (ccxt) ── demo / real mode    │
 │       │                                             │
-│  SQLite (portfolio · trades · decisions · RAG)      │
+│  PostgreSQL (portfolio · trades · decisions · RAG)  │
 └────────────────────┬────────────────────────────────┘
                      │ HTTP (optional)
 ┌────────────────────▼────────────────────────────────┐
@@ -243,8 +248,9 @@ All settings live in `.env`. See `.env.example` for the full list with comments.
 | `QUOTE_CURRENCY` | `USDC` | Quote asset — `USDC` or `USDT` |
 | `RISK_PROFILE` | `balanced` | `conservative` · `balanced` · `aggressive` · `fast_profit` |
 | `AUTO_RISK_PROFILE` | `true` | Auto-adjust profile based on market regime |
-| `MAX_POSITION_PCT` | `5.0` | Max % of portfolio per single trade |
+| `MAX_POSITION_PCT` | `25.0` | Max % of portfolio per single trade |
 | `MAX_TOTAL_EXPOSURE_PCT` | `70.0` | Max % of portfolio in altcoins at once |
+| `MAX_OPEN_POSITIONS` | `3` | Max concurrent open positions (0 = unlimited) |
 | `MAX_DRAWDOWN_PCT` | `15.0` | Circuit breaker — pauses bot if exceeded |
 | `CYCLE_INTERVAL_SECONDS` | `300` | How often a full analysis cycle runs |
 | `MIN_QUANT_SCORE` | `60.0` | Minimum score (0–100) to consider a trade |
@@ -254,8 +260,14 @@ All settings live in `.env`. See `.env.example` for the full list with comments.
 | `KELLY_SIZING` | `true` | Scale position size from backtest edge |
 | `PYRAMID_ENABLED` | `true` | Add to profitable open positions |
 | `LESS_FEAR` | `false` | Override conservative bias — lower thresholds, force buys |
-| `TRAILING_TP_PULLBACK_PCT` | `3.0` | Sell only after this % pullback from peak above TP |
+| `TRAILING_TP_PULLBACK_PCT` | `6.0` | Sell only after this % pullback from peak above TP |
 | `TRAILING_TP_FLOOR` | `true` | Safety: sell immediately if price drops back below TP |
+| `SMART_EXIT_ENABLED` | `true` | Enable smart exit engine (Exit RL + reversal detector + profit lock) |
+| `PROFIT_LOCK_ACTIVATE_PCT` | `3.0` | Arm profit lock when position reaches this % gain |
+| `PROFIT_LOCK_FLOOR_PCT` | `1.0` | Minimum floor % (absolute) for profit lock |
+| `PROFIT_LOCK_KEEP_PCT` | `50.0` | Keep this % of peak gains (sliding floor) |
+| `MAIN_CYCLE_MAX_CLAUDE_PER_HOUR` | `4` | Hard hourly cap on main-cycle Claude API calls |
+| `SKIP_CLAUDE_GPU_MIN_CONFIDENCE` | `0.65` | Min GPU ensemble confidence to bypass Claude |
 | `DATABASE_URL` | `postgresql+asyncpg://...` | PostgreSQL (default) or `sqlite+aiosqlite:///...` |
 | `DISCORD_WEBHOOK_URL` | — | Trade alerts and errors (optional) |
 | `GPU_SERVER_URL` | — | GPU inference server URL (optional) |
@@ -268,7 +280,7 @@ All settings live in `.env`. See `.env.example` for the full list with comments.
 - **Portfolio summary** — total value, cash balance, unrealised P&L, win rate
 - **Open positions table** — live P&L per position with entry price, SL/TP levels, hold duration, and source badge (bot / external). External positions have an **Adopt** button to convert them to bot-managed.
 - **Adopt All External** — bulk-adopt button appears when external positions exist
-- **Less-fear toggle** — dashboard button to enable/disable less-fear mode in real-time
+- **Mode / risk / less-fear toggles** — dashboard buttons with rich hover tooltips explaining what each mode changes (confidence thresholds, position sizes, SL ranges, auto-select conditions)
 - **Claude's last decision** — full reasoning, signals used, confidence score, and model tier (Sonnet / Haiku)
 - **Price chart** — candlestick with RSI and MACD panels (Chart.js)
 - **Trade history** — paginated log of all executed trades with P&L
@@ -280,5 +292,6 @@ All settings live in `.env`. See `.env.example` for the full list with comments.
 
 - Never commit `.env` — it contains live API keys. The repo's `.gitignore` excludes it by default.
 - Start in `MODE=demo` and run for at least a full day before switching to real.
-- Keep `MAX_POSITION_PCT` at 5% or lower for real trading — the quant scorer and Claude both enforce limits, but the `.env` value is the hard ceiling.
+- Keep `MAX_POSITION_PCT` reasonable for your balance — for small balances (<$500), 25–40% with `MAX_OPEN_POSITIONS=3` concentrates capital into meaningful positions.
 - Set `MAX_DRAWDOWN_PCT` before going live — it is your last automatic safety net.
+- The smart exit engine (`SMART_EXIT_ENABLED=true`) runs independently of Claude and will close positions when technical indicators confirm a reversal — no API cost for exit decisions.

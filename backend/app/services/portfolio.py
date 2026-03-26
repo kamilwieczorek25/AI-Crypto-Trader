@@ -331,6 +331,9 @@ class PortfolioService:
             # ── Profit lock: protect unrealised gains before TP ──────────
             # Sliding floor = max(FLOOR_MIN, peak_pnl × KEEP_PCT).
             # E.g. peaked +10%, keep=50% → floor = +5%.
+            # When SMART_EXIT_ENABLED, the analyzer handles this with more
+            # nuance (it also checks indicators).  Keep this as a fast
+            # safety net on every price tick for rapid drops.
             # Skip if trailing TP is already active — that system takes over.
             if profit_lock_activate > 0 and pos.avg_entry_price > 0 and not pos.tp_activated:
                 peak_pnl_pct = (

@@ -126,6 +126,12 @@ class Settings(BaseSettings):
     # Prevents churning in/out of the same trending coin repeatedly.
     TP_COOLDOWN_MINUTES: int = 45
 
+    # ── Smart exit engine ────────────────────────────────────────────────
+    # Runs every cycle for open positions.  Combines GPU Exit RL (DQN),
+    # local reversal detector (10 technical signals), and profit lock.
+    # When disabled, only SL/TP/time-exit triggers remain active.
+    SMART_EXIT_ENABLED: bool = True
+
     # ── Profit lock (protect unrealised gains before TP) ────────────────
     # When a position reaches PROFIT_LOCK_ACTIVATE_PCT unrealised gain,
     # a sliding floor is placed.  The floor = max(FLOOR_PCT, peak × KEEP_PCT).
