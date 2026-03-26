@@ -126,6 +126,15 @@ class Settings(BaseSettings):
     # Prevents churning in/out of the same trending coin repeatedly.
     TP_COOLDOWN_MINUTES: int = 45
 
+    # ── Profit lock (protect unrealised gains before TP) ────────────────
+    # When a position reaches PROFIT_LOCK_ACTIVATE_PCT unrealised gain,
+    # a dynamic floor is placed at PROFIT_LOCK_FLOOR_PCT.  If the gain
+    # subsequently drops back to that floor, the position is sold — locking
+    # in a small profit instead of riding all the way back to stop-loss.
+    # Set PROFIT_LOCK_ACTIVATE_PCT = 0 to disable.
+    PROFIT_LOCK_ACTIVATE_PCT: float = 3.0   # activate when PnL >= +3%
+    PROFIT_LOCK_FLOOR_PCT: float = 1.0      # sell if PnL drops back to +1%
+
     # ── Time-based exit ──────────────────────────────────────────────────
     # Max hours to hold a stagnant position (0 = disabled)
     MAX_HOLD_HOURS: float = 48.0
@@ -180,8 +189,13 @@ class Settings(BaseSettings):
     # Bot behaviour
     CYCLE_INTERVAL_SECONDS: int = 300
     DEMO_INITIAL_BALANCE: float = 10_000.0
-    MAX_POSITION_PCT: float = 5.0
+    MAX_POSITION_PCT: float = 25.0
     MAX_TOTAL_EXPOSURE_PCT: float = 70.0
+    # Maximum open positions at any time.  On small balances (< $500),
+    # fewer concentrated positions beat many tiny ones — each position
+    # must be large enough to absorb round-trip fees (~0.2%) and still
+    # produce meaningful gains.  3 positions × ~$40–50 each on $150.
+    MAX_OPEN_POSITIONS: int = 3
 
     # Symbol universe
     # TOP_N_SYMBOLS: 0 = all pairs passing the volume filter, >0 = hard cap

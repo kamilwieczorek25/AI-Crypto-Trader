@@ -313,6 +313,8 @@ class PortfolioService:
 
         pullback_pct = settings.TRAILING_TP_PULLBACK_PCT
         floor_enabled = settings.TRAILING_TP_FLOOR
+        profit_lock_activate = settings.PROFIT_LOCK_ACTIVATE_PCT
+        profit_lock_floor = settings.PROFIT_LOCK_FLOOR_PCT
         triggers: list[tuple[str, str, float]] = []
 
         for sym, pos in list(self._positions.items()):
@@ -324,6 +326,28 @@ class PortfolioService:
             if pos.stop_loss_price > 0 and price <= pos.stop_loss_price:
                 triggers.append((sym, "stop_loss", price))
                 continue
+
+            # ── Profit lock: protect unrealised gains before TP ──────────
+            # If the position EVER reached PROFIT_LOCK_ACTIVATE_PCT (using
+            # highest_price), and current PnL has now dropped back to
+            # PROFIT_LOCK_FLOOR_PCT, sell to lock in a small profit.
+            # Skip if trailing TP is already active — that system takes over.
+            if profit_lock_activate > 0 and pos.avg_entry_price > 0 and not pos.tp_activated:
+                peak_pnl_pct = (
+                    (pos.highest_price - pos.avg_entry_price)
+                    / pos.avg_entry_price * 100
+                ) if pos.highest_price > 0 else 0.0
+                if peak_pnl_pct >= profit_lock_activate:
+                    current_pnl_pct = (price - pos.avg_entry_price) / pos.avg_entry_price * 100
+                    if current_pnl_pct <= profit_lock_floor:
+                        logger.info(
+                            "Profit lock: %s peaked at +%.1f%%, now +%.1f%% "
+                            "(floor +%.1f%%) — selling to protect gains at $%.6f",
+                            sym, peak_pnl_pct, current_pnl_pct,
+                            profit_lock_floor, price,
+                        )
+                        triggers.append((sym, "profit_lock", price))
+                        continue
 
             if pos.take_profit_price <= 0:
                 continue

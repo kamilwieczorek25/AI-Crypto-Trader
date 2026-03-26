@@ -162,6 +162,15 @@ class TradeExecutor:
                     )
                     return None
 
+            # Check max open positions limit
+            n_open = len(self._portfolio.all_positions())
+            if settings.MAX_OPEN_POSITIONS > 0 and n_open >= settings.MAX_OPEN_POSITIONS:
+                logger.warning(
+                    "Already %d/%d open positions — skipping BUY %s",
+                    n_open, settings.MAX_OPEN_POSITIONS, decision.symbol,
+                )
+                return None
+
             # Check if adding this position would exceed exposure limit
             proposed_usdt = total_value * (decision.quantity_pct / 100)
             new_exposure = self._portfolio.positions_value + proposed_usdt

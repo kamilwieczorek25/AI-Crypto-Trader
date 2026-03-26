@@ -1415,6 +1415,12 @@ class BotRunner:
                         "TP cooldown: %s blocked for %d min to prevent churn",
                         symbol, tp_cool,
                     )
+            elif reason == "profit_lock":
+                # Profit lock: position peaked at +X%, dropped back to floor — counts as win
+                self._recent_results.append(True)
+                self._recent_results = self._recent_results[-10:]
+                # Short cooldown to avoid buying back immediately
+                self._add_sl_cooldown(symbol, minutes=10)
             elif reason == "time_exit":
                 # Time exit: count as neutral (neither win nor loss streak)
                 pass
@@ -1433,6 +1439,12 @@ class BotRunner:
                         label = f"Trailing take-profit (ran +{extra_pct:.1f}% past TP, peak ${peak:.6f})"
                     else:
                         label = "Take-profit"
+                elif reason == "profit_lock":
+                    pos = self._portfolio.get_position(symbol)
+                    peak_pnl = 0.0
+                    if pos and pos.highest_price > 0 and pos.avg_entry_price > 0:
+                        peak_pnl = (pos.highest_price - pos.avg_entry_price) / pos.avg_entry_price * 100
+                    label = f"Profit lock (peaked +{peak_pnl:.1f}%, sold at floor +{settings.PROFIT_LOCK_FLOOR_PCT:.1f}%)"
                 else:
                     label = "Time exit"
                 db_decision = ClaudeDecision(
@@ -1494,7 +1506,7 @@ class BotRunner:
                         pnl_pct=trade.pnl_pct,
                         confidence=1.0,
                         reasoning=f"Automatic {label.lower()} execution.",
-                        trigger="SL" if reason == "stop_loss" else "TP",
+                        trigger="SL" if reason == "stop_loss" else ("PL" if reason == "profit_lock" else "TP"),
                     )
                     await self._broadcast(
                         "PORTFOLIO_UPDATE", self._portfolio.get_state().model_dump()
