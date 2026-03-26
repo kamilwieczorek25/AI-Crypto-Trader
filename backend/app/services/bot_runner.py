@@ -972,6 +972,7 @@ class BotRunner:
                     risk_factors=[],
                 )
                 raw_response = decision.reasoning
+                prompt = f"[AUTO-EXECUTE — Claude skipped] {_gate_reason}"
             else:
                 # ── 6. Build validation prompt + call Claude ─────────────────
                 logger.info("Main cycle: %s", _gate_reason)
