@@ -314,7 +314,8 @@ class PortfolioService:
         pullback_pct = settings.TRAILING_TP_PULLBACK_PCT
         floor_enabled = settings.TRAILING_TP_FLOOR
         profit_lock_activate = settings.PROFIT_LOCK_ACTIVATE_PCT
-        profit_lock_floor = settings.PROFIT_LOCK_FLOOR_PCT
+        profit_lock_floor_min = settings.PROFIT_LOCK_FLOOR_PCT
+        profit_lock_keep = settings.PROFIT_LOCK_KEEP_PCT / 100.0  # 50 → 0.50
         triggers: list[tuple[str, str, float]] = []
 
         for sym, pos in list(self._positions.items()):
@@ -328,9 +329,8 @@ class PortfolioService:
                 continue
 
             # ── Profit lock: protect unrealised gains before TP ──────────
-            # If the position EVER reached PROFIT_LOCK_ACTIVATE_PCT (using
-            # highest_price), and current PnL has now dropped back to
-            # PROFIT_LOCK_FLOOR_PCT, sell to lock in a small profit.
+            # Sliding floor = max(FLOOR_MIN, peak_pnl × KEEP_PCT).
+            # E.g. peaked +10%, keep=50% → floor = +5%.
             # Skip if trailing TP is already active — that system takes over.
             if profit_lock_activate > 0 and pos.avg_entry_price > 0 and not pos.tp_activated:
                 peak_pnl_pct = (
@@ -338,13 +338,15 @@ class PortfolioService:
                     / pos.avg_entry_price * 100
                 ) if pos.highest_price > 0 else 0.0
                 if peak_pnl_pct >= profit_lock_activate:
+                    # Sliding floor: keep a fraction of peak gains, but at least FLOOR_MIN
+                    dynamic_floor = max(profit_lock_floor_min, peak_pnl_pct * profit_lock_keep)
                     current_pnl_pct = (price - pos.avg_entry_price) / pos.avg_entry_price * 100
-                    if current_pnl_pct <= profit_lock_floor:
+                    if current_pnl_pct <= dynamic_floor:
                         logger.info(
                             "Profit lock: %s peaked at +%.1f%%, now +%.1f%% "
                             "(floor +%.1f%%) — selling to protect gains at $%.6f",
                             sym, peak_pnl_pct, current_pnl_pct,
-                            profit_lock_floor, price,
+                            dynamic_floor, price,
                         )
                         triggers.append((sym, "profit_lock", price))
                         continue

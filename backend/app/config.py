@@ -128,12 +128,17 @@ class Settings(BaseSettings):
 
     # ── Profit lock (protect unrealised gains before TP) ────────────────
     # When a position reaches PROFIT_LOCK_ACTIVATE_PCT unrealised gain,
-    # a dynamic floor is placed at PROFIT_LOCK_FLOOR_PCT.  If the gain
-    # subsequently drops back to that floor, the position is sold — locking
-    # in a small profit instead of riding all the way back to stop-loss.
+    # a sliding floor is placed.  The floor = max(FLOOR_PCT, peak × KEEP_PCT).
+    # If the gain drops to that floor, the position is sold — locking in
+    # profit instead of riding all the way back to stop-loss.
+    # Examples with defaults (activate=3, floor=1, keep=50%):
+    #   peaked +3%  → floor = max(1%, 3%×0.5)  = +1.5% → sell at +1.5%
+    #   peaked +5%  → floor = max(1%, 5%×0.5)  = +2.5% → sell at +2.5%
+    #   peaked +10% → floor = max(1%, 10%×0.5) = +5.0% → sell at +5.0%
     # Set PROFIT_LOCK_ACTIVATE_PCT = 0 to disable.
     PROFIT_LOCK_ACTIVATE_PCT: float = 3.0   # activate when PnL >= +3%
-    PROFIT_LOCK_FLOOR_PCT: float = 1.0      # sell if PnL drops back to +1%
+    PROFIT_LOCK_FLOOR_PCT: float = 1.0      # minimum floor (absolute %)
+    PROFIT_LOCK_KEEP_PCT: float = 50.0      # keep this % of peak gains
 
     # ── Time-based exit ──────────────────────────────────────────────────
     # Max hours to hold a stagnant position (0 = disabled)

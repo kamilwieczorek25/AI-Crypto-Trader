@@ -1444,7 +1444,9 @@ class BotRunner:
                     peak_pnl = 0.0
                     if pos and pos.highest_price > 0 and pos.avg_entry_price > 0:
                         peak_pnl = (pos.highest_price - pos.avg_entry_price) / pos.avg_entry_price * 100
-                    label = f"Profit lock (peaked +{peak_pnl:.1f}%, sold at floor +{settings.PROFIT_LOCK_FLOOR_PCT:.1f}%)"
+                    keep = settings.PROFIT_LOCK_KEEP_PCT / 100.0
+                    dyn_floor = max(settings.PROFIT_LOCK_FLOOR_PCT, peak_pnl * keep)
+                    label = f"Profit lock (peaked +{peak_pnl:.1f}%, sold at floor +{dyn_floor:.1f}%)"
                 else:
                     label = "Time exit"
                 db_decision = ClaudeDecision(
