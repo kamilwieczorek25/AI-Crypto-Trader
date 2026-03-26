@@ -16,6 +16,7 @@ Returns one of:
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,7 @@ class ExitSignal:
 # How many local reversal signals must fire before we act
 _MIN_REVERSAL_SIGNALS = 3   # out of ~8 checks → strong confirmation
 _MIN_PARTIAL_SIGNALS  = 2   # weaker → partial exit
+_MIN_HOLD_MINUTES     = 15  # don't exit positions held less than this
 
 
 def analyze_exit(
@@ -57,6 +59,13 @@ def analyze_exit(
     if entry <= 0 or price <= 0:
         return ExitSignal("HOLD", "no price data", 0.0, "local")
 
+    # Minimum hold duration — don't evaluate freshly opened positions
+    opened_at = getattr(pos, "opened_at", None)
+    if opened_at:
+        hold_min = (datetime.now(timezone.utc) - opened_at).total_seconds() / 60
+        if hold_min < _MIN_HOLD_MINUTES:
+            return ExitSignal("HOLD", f"too young ({hold_min:.0f}m < {_MIN_HOLD_MINUTES}m)", 0.0, "local")
+
     pnl_pct = (price - entry) / entry * 100
     highest = getattr(pos, "highest_price", price) or price
     peak_pnl_pct = (highest - entry) / entry * 100 if highest > 0 else 0.0
@@ -74,7 +83,7 @@ def analyze_exit(
 
         if rl_action == "CLOSE" and q_spread > 0.05:
             return ExitSignal("CLOSE", f"Exit RL: CLOSE (Q-spread={q_spread:.3f})", min(q_spread * 5, 1.0), "exit_rl")
-        if rl_action in ("PARTIAL_25", "PARTIAL_50") and q_spread > 0.03:
+        if rl_action in ("PARTIAL_25", "PARTIAL_50") and q_spread > 0.06:
             return ExitSignal("PARTIAL", f"Exit RL: {rl_action} (Q-spread={q_spread:.3f})", min(q_spread * 5, 1.0), "exit_rl")
 
     # ── 2. Local reversal detector (multi-signal confirmation) ───────
