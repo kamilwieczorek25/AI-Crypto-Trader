@@ -72,6 +72,9 @@ class BotRunner:
         self._express_tasks: set[str] = set()
         # Express lane cooldown: {symbol: datetime} — prevent re-triggering failed symbols
         self._express_cooldown: dict[str, datetime] = {}
+        # Express lane strike counter: {symbol: int} — ban after N consecutive failures
+        self._express_strikes: dict[str, int] = {}
+        _EXPRESS_BAN_STRIKES = 5  # ban symbol after 5 consecutive express lane failures
         # Per-symbol beta vs BTC: {symbol: {"beta": float, "correlation": float}}
         # Computed from 1h OHLCV each cycle and passed to quant scorer
         self._beta_data: dict[str, dict] = {}
@@ -236,7 +239,10 @@ class BotRunner:
             hot_syms = fast_scanner.hot_symbols
             if hot_syms:
                 existing = set(symbols)
-                injected = [s for s in hot_syms if s not in existing]
+                injected = [
+                    s for s in hot_syms
+                    if s not in existing and s not in self._banned_symbols
+                ]
                 if injected:
                     symbols.extend(injected)
                     logger.info(
@@ -661,7 +667,21 @@ class BotRunner:
                     *[_mc_refine(c) for c in quant_candidates],
                     return_exceptions=True,
                 )
-                quant_candidates = [r for r in mc_results if not isinstance(r, Exception)]
+                # Keep original candidate when MC refinement fails (don't silently drop)
+                mc_ok = []
+                mc_fail_count = 0
+                for orig, res in zip(quant_candidates, mc_results):
+                    if isinstance(res, Exception):
+                        mc_fail_count += 1
+                        mc_ok.append(orig)  # keep unrefined candidate
+                    else:
+                        mc_ok.append(res)
+                if mc_fail_count:
+                    logger.warning(
+                        "MC refinement: %d/%d calls failed — kept original candidates",
+                        mc_fail_count, len(quant_candidates),
+                    )
+                quant_candidates = mc_ok
 
             # 4f. Anomaly detection — reject BUY candidates flagged as anomalous
             if quant_candidates and _gpu_available:
@@ -1940,7 +1960,26 @@ class BotRunner:
                 btc_sym = f"BTC/{settings.QUOTE_CURRENCY}"
                 btc_ohlcv = await self._market.get_multi_timeframe_ohlcv(btc_sym)
             except Exception as exc:
-                logger.warning("Express lane: OHLCV fetch failed for %s: %s", symbol, exc)
+                # OHLCV failure counts as a strike — ban if persistent
+                strikes = self._express_strikes.get(symbol, 0) + 1
+                self._express_strikes[symbol] = strikes
+                err_msg = str(exc).lower()
+                _perm = "market is closed" in err_msg or "invalid symbol" in err_msg or "does not exist" in err_msg
+                if _perm or strikes >= 5:
+                    self._banned_symbols.add(symbol)
+                    self._express_strikes.pop(symbol, None)
+                    logger.warning(
+                        "Express lane: %s BANNED (OHLCV fail: %s, strikes=%d)",
+                        symbol, exc, strikes,
+                    )
+                else:
+                    self._express_cooldown[symbol] = (
+                        datetime.now(timezone.utc) + timedelta(minutes=min(5 * strikes, 30))
+                    )
+                    logger.warning(
+                        "Express lane: OHLCV fetch failed for %s (strike %d/5): %s",
+                        symbol, strikes, exc,
+                    )
                 return
 
             # 2. Build indicators
@@ -2017,12 +2056,31 @@ class BotRunner:
 
             # 6. Only proceed if re-scored high enough
             if direction <= 0 or express_score < 55:
-                logger.info(
-                    "Express lane: %s score %.0f below 55 or bearish — cooldown 5 min",
-                    symbol, express_score,
-                )
-                self._express_cooldown[symbol] = datetime.now(timezone.utc) + timedelta(minutes=5)
+                # Track consecutive failures — ban symbol after too many
+                strikes = self._express_strikes.get(symbol, 0) + 1
+                self._express_strikes[symbol] = strikes
+                if strikes >= 5:
+                    self._banned_symbols.add(symbol)
+                    self._express_strikes.pop(symbol, None)
+                    logger.warning(
+                        "Express lane: %s BANNED after %d consecutive re-score failures "
+                        "(last score=%.0f) — will not be re-evaluated",
+                        symbol, strikes, express_score,
+                    )
+                else:
+                    cooldown_min = min(5 * strikes, 30)  # escalating: 5, 10, 15, 20 min
+                    self._express_cooldown[symbol] = (
+                        datetime.now(timezone.utc) + timedelta(minutes=cooldown_min)
+                    )
+                    logger.info(
+                        "Express lane: %s score %.0f below 55 or bearish — "
+                        "strike %d/5, cooldown %d min",
+                        symbol, express_score, strikes, cooldown_min,
+                    )
                 return
+
+            # Re-score passed — reset strike counter
+            self._express_strikes.pop(symbol, None)
 
             # 7. Compute trade levels
             levels = compute_trade_levels(symbol, symbol_data, "BUY", express_score)
