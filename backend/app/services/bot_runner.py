@@ -179,24 +179,41 @@ class BotRunner:
                             if now < t
                         }
                         for hc in fast_scanner.hot_candidates:
-                            if (
-                                hc.score >= 60
-                                and hc.symbol not in held_now
-                                and hc.symbol not in self._express_tasks
-                                and hc.symbol not in self._express_cooldown
-                                and hc.symbol not in self._banned_symbols
-                                and self._portfolio.cash_usdt >= 10.0
-                            ):
-                                self._express_tasks.add(hc.symbol)
-                                self._last_express_fired = hc.symbol
-                                asyncio.create_task(
-                                    self._express_cycle(hc.symbol, hc.score),
-                                    name=f"express_{hc.symbol}",
-                                )
+                            if hc.score < 60:
+                                continue
+                            # Log why high-scoring symbols are skipped
+                            if hc.symbol in held_now:
+                                logger.debug("Express skip %s (score=%.0f): already held", hc.symbol, hc.score)
+                                continue
+                            if hc.symbol in self._express_tasks:
+                                logger.debug("Express skip %s (score=%.0f): already in express", hc.symbol, hc.score)
+                                continue
+                            if hc.symbol in self._express_cooldown:
+                                cd = self._express_cooldown[hc.symbol]
+                                remaining = (cd - now).total_seconds() / 60
+                                strikes = self._express_strikes.get(hc.symbol, 0)
                                 logger.info(
-                                    "Express lane triggered for %s (scanner_score=%.0f)",
-                                    hc.symbol, hc.score,
+                                    "Express skip %s (score=%.0f): cooldown %.0f min left, strikes=%d/5",
+                                    hc.symbol, hc.score, remaining, strikes,
                                 )
+                                continue
+                            if hc.symbol in self._banned_symbols:
+                                logger.debug("Express skip %s (score=%.0f): banned", hc.symbol, hc.score)
+                                continue
+                            if self._portfolio.cash_usdt < 10.0:
+                                logger.info("Express skip %s (score=%.0f): low cash ($%.2f)", hc.symbol, hc.score, self._portfolio.cash_usdt)
+                                continue
+
+                            self._express_tasks.add(hc.symbol)
+                            self._last_express_fired = hc.symbol
+                            asyncio.create_task(
+                                self._express_cycle(hc.symbol, hc.score),
+                                name=f"express_{hc.symbol}",
+                            )
+                            logger.info(
+                                "Express lane triggered for %s (scanner_score=%.0f)",
+                                hc.symbol, hc.score,
+                            )
                     except Exception as exc:
                         logger.debug("Express lane check failed (non-fatal): %s", exc)
 
@@ -1471,7 +1488,25 @@ class BotRunner:
                 risk_factors=[],
                 reasoning=f"Smart exit: {signal.reason}",
             )
-            trade = await self._executor.execute(db, synthetic, db_decision.id)
+            try:
+                trade = await self._executor.execute(db, synthetic, db_decision.id)
+            except Exception as exec_err:
+                err_msg = str(exec_err).lower()
+                if "notional" in err_msg and qty_pct < 100:
+                    # Partial sell too small for Binance min notional — upgrade to full close
+                    logger.warning(
+                        "Smart exit: %s PARTIAL below min notional — upgrading to CLOSE",
+                        sym,
+                    )
+                    synthetic.sell_pct = 100.0
+                    try:
+                        trade = await self._executor.execute(db, synthetic, db_decision.id)
+                    except Exception as retry_err:
+                        logger.error("Smart exit: %s CLOSE retry also failed: %s", sym, retry_err)
+                        trade = None
+                else:
+                    logger.error("Smart exit execute failed for %s: %s", sym, exec_err)
+                    trade = None
 
             if trade:
                 db_decision.executed = True
