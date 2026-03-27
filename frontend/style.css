@@ -659,23 +659,257 @@ footer {
 .bgproc-task.backtest { color: #448aff; border-left-color: #448aff; background: rgba(68,138,255,0.07); }
 
 /* ═══════════════════════════════════════════════════════════
-   RESPONSIVE
+   FORCE-BUY PANEL
    ═══════════════════════════════════════════════════════════ */
+.card-force-buy { border-top: 2px solid rgba(255,215,64,0.35); }
+
+.force-buy-note {
+  font-size: 12px;
+  color: var(--muted);
+  padding: 0 0 12px 0;
+  line-height: 1.5;
+}
+.force-buy-note strong { color: var(--text-2); }
+
+/* Score column badges */
+.fb-score { font-family: var(--mono); font-weight: 700; font-size: 13px; padding: 2px 7px; border-radius: 5px; }
+.fb-score.score-high { background: rgba(0,230,118,0.15); color: var(--green); }
+.fb-score.score-mid  { background: rgba(255,215,64,0.15); color: #ffd740; }
+.fb-score.score-low  { background: rgba(255,82,82,0.12);  color: var(--red); }
+
+/* Symbol badge */
+.sym-badge {
+  font-family: var(--mono); font-weight: 700; font-size: 12px;
+  background: rgba(124,77,255,0.15); color: #b388ff;
+  border: 1px solid rgba(124,77,255,0.3);
+  padding: 2px 7px; border-radius: 5px;
+}
+
+/* Status pills */
+.fb-status { font-size: 10px; font-weight: 700; letter-spacing: .4px; padding: 2px 7px; border-radius: 4px; }
+.fb-status.fb-ready    { background: rgba(0,230,118,0.15); color: var(--green); }
+.fb-status.fb-running  { background: rgba(255,215,64,0.15); color: #ffd740; }
+.fb-status.fb-cooldown { background: rgba(255,145,0,0.15);  color: var(--orange); }
+.fb-status.fb-held     { background: rgba(68,138,255,0.15);  color: var(--blue); }
+
+/* Reason tags */
+.fb-reasons { max-width: 260px; }
+.force-reason {
+  display: inline-block; font-size: 10px; font-family: var(--mono);
+  background: rgba(255,255,255,0.06); color: var(--text-2);
+  border: 1px solid var(--border); border-radius: 3px;
+  padding: 1px 5px; margin: 1px 2px 1px 0;
+}
+
+/* Force-buy buttons */
+.btn-force-buy {
+  font-size: 11px; font-weight: 700; letter-spacing: .3px;
+  padding: 4px 12px; border-radius: 6px; border: none; cursor: pointer;
+  transition: opacity .15s, transform .1s;
+  white-space: nowrap;
+}
+.btn-force-buy:disabled { opacity: .45; cursor: not-allowed; transform: none !important; }
+.btn-force-buy:not(:disabled):hover { transform: translateY(-1px); opacity: .9; }
+
+.btn-force-active {
+  background: linear-gradient(135deg, #ffd740, #ff9100);
+  color: #0a0a0a;
+}
+.btn-force-override {
+  background: linear-gradient(135deg, #ff9100, #ff5252);
+  color: #fff;
+}
+.btn-force-running { background: rgba(255,215,64,0.15); color: #ffd740; border: 1px solid rgba(255,215,64,0.3); }
+.btn-force-done    { background: rgba(0,230,118,0.15); color: var(--green); border: 1px solid rgba(0,230,118,0.3); }
+
+/* P&L +/- colouring re-used */
+.pos { color: var(--green); }
+.neg { color: var(--red); }
+.muted-text { color: var(--muted); }
+
+/* ═══════════════════════════════════════════════════════════
+   RESPONSIVE — MOBILE-FIRST OVERRIDES
+   ═══════════════════════════════════════════════════════════ */
+
+/* Global touch improvements — no 300ms delay, no tap flash */
+button, select, a, [role="button"] {
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+/* Smooth momentum scrolling on all scrollable areas */
+.table-wrap, .decision-feed, .metrics-strip, .bgproc-task-list {
+  -webkit-overflow-scrolling: touch;
+}
+
+/* ── ≤ 1400px ──────────────────────────────────────────────── */
 @media (max-width: 1400px) {
   .kpi-strip { grid-template-columns: repeat(4, 1fr); }
 }
+
+/* ── ≤ 1100px: small laptop / tablet landscape ─────────────── */
 @media (max-width: 1100px) {
   .grid-2-1, .grid-1-1 { grid-template-columns: 1fr; }
   .chart-indicators { grid-template-columns: 1fr; }
+  /* bgproc: drop from 3-col to 2-col */
+  .bgproc-grid { grid-template-columns: 1fr 1fr; }
+  .bgproc-col-tasks { border-left: none; padding-left: 0; border-top: 1px solid var(--border); padding-top: 10px; }
 }
+
+/* ── ≤ 900px: tablet portrait ───────────────────────────────── */
 @media (max-width: 900px) {
-  .kpi-strip { grid-template-columns: repeat(2, 1fr); }
-  header { flex-direction: column; height: auto; padding: 10px 16px; gap: 8px; }
-  .header-center { flex-wrap: wrap; justify-content: center; }
+  /* Header: logo+actions on row 1, controls on row 2 */
+  header {
+    flex-wrap: wrap;
+    height: auto;
+    padding: 10px 14px;
+    gap: 8px;
+  }
+  .header-left  { flex: 1;        order: 1; min-width: 0; }
+  .header-right { flex: 0 0 auto; order: 2; }
+  .header-center {
+    order: 3;
+    width: 100%;
+    justify-content: flex-start;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .header-sep { display: none; }
+
+  .kpi-strip { grid-template-columns: repeat(4, 1fr); }
   main { padding: 10px; }
 }
-@media (max-width: 600px) {
-  .kpi-strip { grid-template-columns: 1fr; }
-  .metrics-strip { padding: 6px 8px; }
-  .gpu-models-grid { grid-template-columns: 1fr; }
+
+/* ── ≤ 768px: large phone / small tablet ───────────────────── */
+@media (max-width: 768px) {
+  /* KPI: 2 × 4 grid */
+  .kpi-strip { grid-template-columns: repeat(2, 1fr); }
+  .kpi-value { font-size: 15px; }
+  .kpi-icon  { width: 28px; height: 28px; font-size: 12px; }
+
+  /* Buttons: bigger touch targets */
+  .btn-risk   { padding: 6px 10px; min-height: 36px; }
+  .btn-fear   { padding: 6px 12px; min-height: 36px; }
+  .btn-mode   { padding: 6px 14px; min-height: 36px; }
+  .btn-action { padding: 7px 14px; min-height: 36px; font-size: 12px; }
+  .btn-sm     { min-height: 34px;  padding: 5px 12px; }
+
+  /* bgproc: single column */
+  .bgproc-grid { grid-template-columns: 1fr; }
+  .bgproc-col-tasks { border-top: 1px solid var(--border); padding-top: 10px; }
+
+  /* Decision card */
+  .decision-body { grid-template-columns: 1fr; }
+
+  /* Portfolio allocation: stack chart + legend */
+  .alloc-content { flex-direction: column; align-items: center; gap: 14px; }
+  .donut-wrap { width: 160px; height: 160px; }
+  .alloc-legend { justify-content: center; }
+
+  /* Decision feed: drop confidence bar, keep essentials */
+  .feed-item {
+    grid-template-columns: auto auto 1fr auto;
+    gap: 6px;
+  }
+  .feed-conf-bg { display: none; }
+
+  /* Analytics stats: wrap */
+  .analytics-stats { flex-wrap: wrap; gap: 10px; }
+
+  /* Force-buy table: hide Signals column (too wide) */
+  #tbl-force-buy th:nth-child(5),
+  #tbl-force-buy td:nth-child(5) { display: none; }
+
+  /* General table cells: more finger-friendly */
+  td, th { padding: 10px 8px; }
+
+  /* Chart heights */
+  .chart-small { height: 75px; }
 }
+
+/* ── ≤ 480px: phone portrait ─────────────────────────────────── */
+@media (max-width: 480px) {
+  main { padding: 8px; gap: 10px; }
+  .card { padding: 14px 12px; }
+  .card-header { margin-bottom: 10px; }
+
+  /* Header: tighten up */
+  header { padding: 8px 10px; gap: 6px; }
+  .logo-text  { font-size: 14px; }
+  .logo-badge { display: none; }
+  .ws-label   { display: none; }   /* keep dot, drop text */
+  .control-label { display: none; } /* "Risk" / "Mode" labels */
+
+  .btn-risk   { padding: 5px 7px;  font-size: 10px; min-height: 34px; }
+  .btn-fear   { padding: 5px 10px; font-size: 10px; min-height: 34px; }
+  .btn-mode   { padding: 5px 10px; font-size: 10px; min-height: 34px; }
+  .btn-action { padding: 6px 10px; font-size: 11px; min-height: 34px; }
+
+  /* KPI: compact 2-col */
+  .kpi-strip { grid-template-columns: repeat(2, 1fr); }
+  .kpi-card  { padding: 10px 12px; gap: 8px; }
+  .kpi-value { font-size: 14px; }
+  .kpi-icon  { width: 24px; height: 24px; font-size: 11px; }
+  .kpi-sub   { font-size: 9px; }
+
+  /* Metrics strip: smaller pills */
+  .metrics-strip { padding: 5px 8px; gap: 4px; }
+  .metric-pill   { padding: 4px 8px; gap: 4px; }
+  .metric-label  { font-size: 9px; letter-spacing: 0; }
+  .metric-value  { font-size: 11px; }
+
+  /* Decision card */
+  .decision-top { flex-direction: column; align-items: flex-start; gap: 8px; }
+  .decision-action-badge { font-size: 16px; padding: 6px 12px; }
+
+  /* Decision feed: minimal */
+  .feed-item { grid-template-columns: auto 1fr auto; gap: 5px; }
+  .feed-time { min-width: unset; font-size: 9px; }
+  .feed-snippet { display: none; }
+
+  /* Positions table: hide less-critical columns */
+  #tbl-positions th:nth-child(2),  /* Qty */
+  #tbl-positions td:nth-child(2),
+  #tbl-positions th:nth-child(10), /* Hold */
+  #tbl-positions td:nth-child(10),
+  #tbl-positions th:nth-child(11), /* Source */
+  #tbl-positions td:nth-child(11) { display: none; }
+
+  /* Force-buy table: also hide Vol Ratio */
+  #tbl-force-buy th:nth-child(4),
+  #tbl-force-buy td:nth-child(4) { display: none; }
+  /* Full-width force-buy button */
+  .btn-force-buy { width: 100%; text-align: center; padding: 8px 12px; }
+
+  /* Chart heights — override inline style="height:Npx" on containers */
+  div:has(> #price-chart)  { height: 170px !important; }
+  div:has(> #growth-chart) { height: 155px !important; }
+  div:has(> #pnl-chart)    { height: 140px !important; }
+  .chart-small { height: 65px; }
+
+  /* GPU models: 1-col */
+  .gpu-models-grid { grid-template-columns: 1fr; }
+  .gpu-model-name { font-size: 10px; }
+
+  /* Footer */
+  footer { padding: 6px 10px; font-size: 10px; }
+  #footer-time { display: none; } /* keep footer slim */
+}
+
+/* ── ≤ 360px: very small phones ─────────────────────────────── */
+@media (max-width: 360px) {
+  .action-btns { gap: 3px; }
+  .btn-action { padding: 5px 8px; font-size: 10px; }
+
+  /* Hide aggressive/fast-profit risk buttons: keep Safe + Balanced */
+  .risk-btns .btn-risk:nth-child(3),
+  .risk-btns .btn-risk:nth-child(4) { display: none; }
+
+  /* Positions table: also hide SL / TP columns */
+  #tbl-positions th:nth-child(8),
+  #tbl-positions td:nth-child(8),
+  #tbl-positions th:nth-child(9),
+  #tbl-positions td:nth-child(9) { display: none; }
+
+  .kpi-value { font-size: 13px; }
+}
+

@@ -23,7 +23,9 @@ const PALETTE = ['#7c4dff','#00e676','#ffd740','#448aff','#ff5252','#b388ff','#1
   const box = document.getElementById('btn-tooltip');
   if (!box) return;
   let hideTimer = null;
+  let _lastTapped = null;
 
+  // ── Mouse (desktop) ──────────────────────────────────────────
   document.addEventListener('mouseover', e => {
     const el = e.target.closest('[data-tip]');
     if (!el) return;
@@ -45,12 +47,39 @@ const PALETTE = ['#7c4dff','#00e676','#ffd740','#448aff','#ff5252','#b388ff','#1
     if (el) positionTooltip(el);
   });
 
+  // ── Touch (mobile): tap the button to show/hide tooltip ──────
+  document.addEventListener('touchstart', e => {
+    const el = e.target.closest('[data-tip]');
+    if (!el) {
+      // Tap outside any data-tip element → dismiss
+      if (box.classList.contains('visible')) {
+        box.classList.remove('visible');
+        _lastTapped = null;
+      }
+      return;
+    }
+    e.preventDefault(); // prevent ghost click
+    if (_lastTapped === el && box.classList.contains('visible')) {
+      // Second tap on same element → dismiss and fire click
+      box.classList.remove('visible');
+      _lastTapped = null;
+      el.click();
+    } else {
+      // First tap → show tooltip
+      box.innerHTML = el.dataset.tip;
+      box.classList.add('visible');
+      positionTooltip(el);
+      _lastTapped = el;
+    }
+  }, { passive: false });
+
   function positionTooltip(el) {
     const r = el.getBoundingClientRect();
-    const tw = 310; // max-width
+    const tw = Math.min(310, window.innerWidth - 16);
+    box.style.maxWidth = tw + 'px';
     // Try below first, flip above if not enough space
     let top = r.bottom + 8;
-    if (top + 160 > window.innerHeight) top = r.top - 8 - box.offsetHeight;
+    if (top + 160 > window.innerHeight) top = Math.max(8, r.top - 8 - box.offsetHeight);
     let left = r.left + r.width / 2 - tw / 2;
     left = Math.max(8, Math.min(left, window.innerWidth - tw - 8));
     box.style.top  = top  + 'px';
@@ -396,7 +425,7 @@ function renderBgProcesses(bg, botRunning) {
     bg.scanner_hot_count > 0 ? 'ok' : 'muted'
   );
 
-  // Hot candidate pills
+  // Hot candidate pills (compact row inside bgproc)
   const pillsEl = $('bgproc-hot');
   if (pillsEl) {
     const top = bg.scanner_top || [];
@@ -404,6 +433,9 @@ function renderBgProcesses(bg, botRunning) {
       ? '<span class="bgproc-value muted">—</span>'
       : top.map(c => `<span class="bgproc-pill" title="score ${c.score}">${c.symbol.split('/')[0]} ${c.score}</span>`).join('');
   }
+
+  // ── Force-buy table (top 5 hot candidates) ────────────────────────────────
+  renderForceBuyTable(bg.scanner_top || [], bg.express_active || []);
 
   // asyncio task count badge
   const tasks = (bg.asyncio_tasks || []).filter(n => n && n !== 'Task-1');
@@ -424,6 +456,92 @@ function renderBgProcesses(bg, botRunning) {
         return `<div class="bgproc-task${cls}" title="${escapeHtml(name)}">${escapeHtml(name)}</div>`;
       }).join('');
     }
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════
+   Force-Buy Panel
+   ═══════════════════════════════════════════════════════════ */
+
+function renderForceBuyTable(candidates, expressActive) {
+  const tbody = $('force-buy-body');
+  const badge = $('force-buy-count');
+  if (!tbody) return;
+
+  if (badge) badge.textContent = candidates.length;
+
+  if (candidates.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="7" class="empty-msg">No hot candidates yet — scanner runs every 60s</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = candidates.map(c => {
+    const base = c.symbol.split('/')[0];
+    const isRunning = expressActive.includes(c.symbol);
+    const pct = c.pct_24h != null ? c.pct_24h : 0;
+    const pctCls = pct >= 0 ? 'pos' : 'neg';
+    const pctStr = (pct >= 0 ? '+' : '') + pct.toFixed(2) + '%';
+    const vol = c.volume_ratio != null ? c.volume_ratio.toFixed(1) + 'x' : '—';
+    const reasons = (c.reasons || []).map(r => `<span class="force-reason">${escapeHtml(r)}</span>`).join('');
+
+    let statusHtml, btnHtml;
+    if (c.held) {
+      statusHtml = '<span class="fb-status fb-held">HELD</span>';
+      btnHtml = '<button class="btn-force-buy" disabled>Already held</button>';
+    } else if (isRunning) {
+      statusHtml = '<span class="fb-status fb-running">RUNNING</span>';
+      btnHtml = '<button class="btn-force-buy btn-force-running" disabled>⟳ Analysing…</button>';
+    } else if (c.in_cooldown) {
+      statusHtml = '<span class="fb-status fb-cooldown">COOLDOWN</span>';
+      btnHtml = `<button class="btn-force-buy btn-force-override" onclick="forceBuy('${escapeHtml(c.symbol)}', this)">⚡ Force Override</button>`;
+    } else {
+      statusHtml = '<span class="fb-status fb-ready">READY</span>';
+      btnHtml = `<button class="btn-force-buy btn-force-active" onclick="forceBuy('${escapeHtml(c.symbol)}', this)">⚡ Force Buy</button>`;
+    }
+
+    const scoreCls = c.score >= 80 ? 'score-high' : c.score >= 65 ? 'score-mid' : 'score-low';
+
+    return `<tr>
+      <td class="fb-symbol"><span class="sym-badge">${escapeHtml(base)}</span></td>
+      <td><span class="fb-score ${scoreCls}">${c.score}</span></td>
+      <td class="${pctCls}">${pctStr}</td>
+      <td>${vol}</td>
+      <td class="fb-reasons">${reasons || '<span class="muted-text">—</span>'}</td>
+      <td>${statusHtml}</td>
+      <td>${btnHtml}</td>
+    </tr>`;
+  }).join('');
+}
+
+async function forceBuy(symbol, btn) {
+  if (!confirm(`Force-buy ${symbol}?\n\nThis will immediately trigger the express-lane analysis.\nAll normal risk guards (position size, max positions, cash) still apply.`)) return;
+
+  btn.disabled = true;
+  btn.textContent = '⟳ Triggering…';
+
+  try {
+    const resp = await fetch(`${API_BASE}/api/bot/force-buy`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({symbol}),
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      alert(`Force-buy failed: ${data.detail || resp.statusText}`);
+      btn.disabled = false;
+      btn.textContent = '⚡ Force Buy';
+      return;
+    }
+    if (data.status === 'already_running') {
+      btn.textContent = '⟳ Analysing…';
+    } else {
+      btn.textContent = '✓ Triggered';
+      btn.classList.add('btn-force-done');
+    }
+  } catch (e) {
+    alert('Error: ' + e.message);
+    btn.disabled = false;
+    btn.textContent = '⚡ Force Buy';
   }
 }
 
@@ -1319,4 +1437,12 @@ function updateFooterClock() {
   setInterval(loadDecisionFeed, 30_000);
   setInterval(loadExchangeAccount, 120_000);
   setInterval(loadGpuStatus, 60_000);
+
+  // Orientation change: resize all Chart.js instances so they fill new dimensions
+  window.addEventListener('orientationchange', () => {
+    setTimeout(() => {
+      [priceChart, rsiChart, macdChart, growthChart, allocChart, pnlChart]
+        .forEach(c => { if (c) c.resize(); });
+    }, 300); // wait for the browser to finish repainting
+  });
 })();

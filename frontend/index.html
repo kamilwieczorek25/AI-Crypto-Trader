@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="style.css?v=22" />
+  <link rel="stylesheet" href="style.css?v=24" />
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
 </head>
 <body>
@@ -348,6 +348,37 @@
       </div>
     </section>
 
+    <!-- ── Row 5b: Express Lane — Force Buy ── -->
+    <section class="card card-force-buy">
+      <div class="card-header">
+        <h2>⚡ Express Lane — Hot Candidates</h2>
+        <span id="force-buy-count" class="card-badge">0</span>
+      </div>
+      <p class="force-buy-note">
+        Top 5 symbols detected by the fast scanner. Click <strong>Force Buy</strong> to immediately
+        trigger the express-lane analysis and execute a trade, bypassing the regular 5-min cycle
+        and any active cooldowns. All normal risk and position-size guards still apply.
+      </p>
+      <div class="table-wrap">
+        <table id="tbl-force-buy">
+          <thead>
+            <tr>
+              <th>Symbol</th>
+              <th>Scanner Score</th>
+              <th>1h Move</th>
+              <th>Vol Ratio</th>
+              <th>Signals</th>
+              <th>Status</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="force-buy-body">
+            <tr><td colspan="7" class="empty-msg">Waiting for scanner…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
     <!-- ── Row 6: Binance Account ── -->
     <section class="card" id="exchange-card">
       <div class="card-header">
@@ -422,6 +453,6 @@
   <!-- Floating tooltip for data-tip buttons -->
   <div id="btn-tooltip" role="tooltip" aria-hidden="true"></div>
 
-  <script src="app.js?v=22"></script>
+  <script src="app.js?v=24"></script>
 </body>
 </html>

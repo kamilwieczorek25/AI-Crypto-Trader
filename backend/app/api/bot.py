@@ -229,3 +229,50 @@ async def adopt_positions(
     await bot_runner._broadcast("PORTFOLIO_UPDATE", portfolio_service.get_state().model_dump())
 
     return {"adopted": adopted, "count": len(adopted)}
+
+
+# ── Force-buy: manually trigger express-lane cycle for a hot candidate ────────
+
+class ForceBuyRequest(BaseModel):
+    symbol: str  # e.g. "PIXEL/USDC"
+
+
+@router.post("/force-buy")
+async def force_buy(req: ForceBuyRequest) -> dict:
+    """Immediately trigger the express-lane analysis & execution for a symbol.
+
+    The symbol must currently appear in the fast-scanner hot list (score ≥ 60).
+    This bypasses cooldowns and respects all normal risk/position-size guards.
+    """
+    from app.services.fast_scanner import fast_scanner
+
+    if not bot_runner.is_running:
+        raise HTTPException(status_code=409, detail="Bot is not running")
+
+    # Verify the symbol is on the hot list right now
+    hot_map = {hc.symbol: hc for hc in fast_scanner.hot_candidates}
+    if req.symbol not in hot_map:
+        raise HTTPException(
+            status_code=404,
+            detail=f"{req.symbol} is not in the current hot-candidate list",
+        )
+
+    hc = hot_map[req.symbol]
+
+    # Clear any active cooldown so the express cycle can run
+    bot_runner._express_cooldown.pop(req.symbol, None)
+    bot_runner._express_strikes.pop(req.symbol, None)
+
+    if req.symbol in bot_runner._express_tasks:
+        return {"status": "already_running", "symbol": req.symbol, "scanner_score": hc.score}
+
+    bot_runner._express_tasks.add(req.symbol)
+    bot_runner._last_express_fired = req.symbol
+    import asyncio as _asyncio
+    _asyncio.create_task(
+        bot_runner._express_cycle(req.symbol, hc.score),
+        name=f"express_{req.symbol}",
+    )
+
+    logger.info("Force-buy triggered for %s (scanner_score=%.0f)", req.symbol, hc.score)
+    return {"status": "triggered", "symbol": req.symbol, "scanner_score": round(hc.score, 1)}

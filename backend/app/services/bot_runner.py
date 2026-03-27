@@ -1388,13 +1388,22 @@ class BotRunner:
 
         # Build background-process snapshot for dashboard
         hot = fast_scanner.hot_candidates
+        held_syms = {p.symbol for p in self._portfolio.all_positions()}
         bg_processes = {
             "express_active": sorted(self._express_tasks),
             "express_last": self._last_express_fired,
             "scanner_hot_count": len(hot),
             "scanner_top": [
-                {"symbol": hc.symbol, "score": round(hc.score, 1)}
-                for hc in hot[:4]
+                {
+                    "symbol": hc.symbol,
+                    "score": round(hc.score, 1),
+                    "pct_24h": round(hc.price_change_1h * 100, 2) if hc.price_change_1h else 0.0,
+                    "volume_ratio": round(hc.volume_ratio, 1),
+                    "reasons": hc.reasons[:3],
+                    "held": hc.symbol in held_syms,
+                    "in_cooldown": hc.symbol in self._express_cooldown,
+                }
+                for hc in hot[:5]
             ],
             "startup_backtest_done": self._startup_backtest_done,
             "asyncio_tasks": [
