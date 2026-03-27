@@ -52,8 +52,9 @@ source "$VENV_DIR/bin/activate"
 # ── 3. Install dependencies ──────────────────────────────────────────────────
 echo "▶ Installing Python dependencies..."
 pip install --quiet --upgrade pip
-# Install PyTorch CPU-only first (avoids downloading the large CUDA variant)
-pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+# Install standard PyTorch build.
+# On Apple Silicon this enables Metal (MPS) acceleration when available.
+pip install --quiet torch
 pip install --quiet -r "$BACKEND_DIR/requirements.txt"
 
 # ── 3b. Kill any previous instances ──────────────────────────────────────────

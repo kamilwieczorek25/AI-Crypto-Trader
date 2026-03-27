@@ -21,6 +21,16 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+
+def _pick_torch_device() -> "torch.device":
+    """Select the best available torch backend (CUDA -> MPS -> CPU)."""
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    mps = getattr(torch.backends, "mps", None)
+    if mps and mps.is_available() and mps.is_built():
+        return torch.device("mps")
+    return torch.device("cpu")
+
 # ── Hyperparams ───────────────────────────────────────────────────────────────
 SEQ_LEN         = 20      # look-back window (candles)
 N_FEATURES      = 6       # features per candle
@@ -131,7 +141,7 @@ class LSTMPredictor:
             self.model  = None
             self._trained = False
             return
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = _pick_torch_device()
         self.model: Optional[_LSTMNet] = None
         self._trained = False
         self._load_from_disk()

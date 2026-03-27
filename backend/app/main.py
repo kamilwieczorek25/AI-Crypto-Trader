@@ -191,9 +191,9 @@ try:
     _ALLOWED_ORIGINS.append(f"http://{_ip}:9080")
 except Exception:
     pass
-# Allow user to add extra origins via env (comma-separated)
-# For Docker: set CORS_ORIGINS=* to allow all origins
-_extra = os.environ.get("CORS_ORIGINS", "")
+# Allow user to add extra origins via env/.env (comma-separated)
+# For Docker/local LAN: set CORS_ORIGINS=* to allow all origins
+_extra = settings.CORS_ORIGINS or os.environ.get("CORS_ORIGINS", "")
 if _extra == "*":
     _ALLOWED_ORIGINS = ["*"]
 elif _extra:
