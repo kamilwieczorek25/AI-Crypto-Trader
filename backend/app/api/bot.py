@@ -270,7 +270,7 @@ async def force_buy(req: ForceBuyRequest) -> dict:
     bot_runner._last_express_fired = req.symbol
     import asyncio as _asyncio
     _asyncio.create_task(
-        bot_runner._express_cycle(req.symbol, hc.score),
+        bot_runner._express_cycle(req.symbol, hc.score, force_buy=True),
         name=f"express_{req.symbol}",
     )
 

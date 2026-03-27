@@ -2010,7 +2010,7 @@ class BotRunner:
     # ------------------------------------------------------------------ #
     # Express lane — hot-candidate single-symbol mini-cycle
     # ------------------------------------------------------------------ #
-    async def _express_cycle(self, symbol: str, scanner_score: float) -> None:
+    async def _express_cycle(self, symbol: str, scanner_score: float, force_buy: bool = False) -> None:
         """Run a focused, single-symbol analysis when the fast scanner fires score > 75.
 
         This bypasses the full 5-min universe scan and goes straight to:
@@ -2020,11 +2020,16 @@ class BotRunner:
 
         The express lane is intentionally lightweight — it only confirms or
         rejects a hot candidate; it does NOT replace the full cycle.
+
+        When force_buy=True (user manually triggered via dashboard), Claude is
+        skipped entirely and the trade executes directly on quant data regardless
+        of the re-scored direction — the user's explicit intent overrides all
+        automated rejection logic.
         """
         try:
             logger.info(
-                "Express cycle: %s (scanner_score=%.0f) — starting focused analysis",
-                symbol, scanner_score,
+                "Express cycle: %s (scanner_score=%.0f) — starting focused analysis%s",
+                symbol, scanner_score, " [FORCE BUY]" if force_buy else "",
             )
 
             # Guard: don't trade if circuit breaker is active or cash is low
@@ -2154,12 +2159,13 @@ class BotRunner:
             else:
                 gate_fail = direction <= 0 or express_score < 55
 
-            if gate_fail:
+            if gate_fail and not force_buy:
                 # Only count as a structural strike when the signal is clearly bearish
                 # (composite < -0.10).  Near-neutral borderline cases (like a hot coin
                 # dragged slightly negative by a momentary BTC dip) get a short cooldown
                 # but do NOT accumulate strikes — we don't want to ban genuinely hot
                 # symbols because of a single ambiguous reading.
+                # force_buy bypasses this gate entirely — the user has made the call.
                 if composite < -0.10:
                     strikes = self._express_strikes.get(symbol, 0) + 1
                     self._express_strikes[symbol] = strikes
@@ -2233,8 +2239,11 @@ class BotRunner:
             # ── 8a. Decide whether to call Claude at all ──────────────────
             # With LESS_FEAR=True we override Claude's HOLD anyway, so calling
             # it is pure API spend.  Skip and build the decision from quant data.
+            # With force_buy=True the user has explicitly chosen to buy — skip
+            # Claude unconditionally and execute straight on quant levels.
             _skip_claude = (
-                settings.LESS_FEAR and settings.EXPRESS_SKIP_CLAUDE_WHEN_LESS_FEAR
+                force_buy
+                or (settings.LESS_FEAR and settings.EXPRESS_SKIP_CLAUDE_WHEN_LESS_FEAR)
             )
 
             # Hard per-minute rate cap even when Claude is enabled
@@ -2269,10 +2278,11 @@ class BotRunner:
                     primary_signals=candidate.signals,
                     risk_factors=[],
                 )
+                _skip_reason = "FORCE_BUY" if force_buy else "LESS_FEAR/rate-cap"
                 logger.info(
-                    "Express lane: %s — Claude skipped (LESS_FEAR/rate-cap), "
+                    "Express lane: %s — Claude skipped (%s), "
                     "executing on quant score %.0f",
-                    symbol, express_score,
+                    symbol, _skip_reason, express_score,
                 )
             else:
                 # Prepend express context so Claude knows this is a hot fast-scanner signal
@@ -2290,9 +2300,10 @@ class BotRunner:
                     return
 
             if decision.action != "BUY" or decision.symbol != symbol:
+                # force_buy: user explicitly requested this trade — always override.
                 # LESS_FEAR override: mirror the main-cycle behaviour — if Claude
                 # says HOLD but score is solid and direction is bullish, force BUY.
-                if settings.LESS_FEAR and express_score >= 55 and direction > 0:
+                if force_buy or (settings.LESS_FEAR and express_score >= 55 and direction > 0):
                     logger.info(
                         "Express lane: LESS_FEAR override — Claude said %s for %s, "
                         "forcing BUY (score=%.0f)",
@@ -2305,7 +2316,11 @@ class BotRunner:
                     decision.quantity_pct    = candidate.quantity_pct
                     decision.confidence      = candidate.score / 100.0
                     if not getattr(decision, "reasoning", ""):
-                        decision.reasoning = f"LESS_FEAR override, score={express_score:.0f}"
+                        decision.reasoning = (
+                            f"USER FORCE-BUY, score={express_score:.0f}"
+                            if force_buy else
+                            f"LESS_FEAR override, score={express_score:.0f}"
+                        )
                 else:
                     logger.info(
                         "Express lane: Claude rejected %s (action=%s) — cooldown 5 min",
