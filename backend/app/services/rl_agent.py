@@ -27,6 +27,16 @@ logger = logging.getLogger(__name__)
 if not TORCH_AVAILABLE:
     logger.warning("torch not installed — RL agent disabled (install torch to enable)")
 
+
+def _pick_torch_device() -> "torch.device":
+    """Select the best available torch backend (CUDA -> MPS -> CPU)."""
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    mps = getattr(torch.backends, "mps", None)
+    if mps and mps.is_available() and mps.is_built():
+        return torch.device("mps")
+    return torch.device("cpu")
+
 AGENT_PATH  = Path(os.environ.get("DATA_DIR", "/data")) / "rl_agent.pt"
 STATE_SIZE  = 14        # matches GPU server DuelingDQN input size
 ACTION_SIZE = 3         # 0=HOLD, 1=BUY, 2=SELL
@@ -105,7 +115,7 @@ class RLTradingAgent:
             self.buffer = _ReplayBuffer()
             return
 
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = _pick_torch_device()
         self.policy = _DQN().to(self.device)
         self.target = _DQN().to(self.device)
         self.target.load_state_dict(self.policy.state_dict())

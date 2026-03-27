@@ -165,6 +165,13 @@ class Settings(BaseSettings):
     WHALE_MIN_USDT: float = 50_000.0
     # How many minutes to remember whale events (rolling window)
     WHALE_MEMORY_MINUTES: int = 30
+    # Verify TLS certificates for whale detector Binance WebSocket.
+    # Set to false only in controlled environments where cert interception
+    # prevents validation.
+    WHALE_WS_VERIFY_SSL: bool = True
+    # If certificate validation fails and WHALE_WS_VERIFY_SSL is true,
+    # allow a one-time fallback to insecure TLS (ssl=False).
+    WHALE_WS_INSECURE_FALLBACK: bool = True
 
     # ── Fast local scanner ──────────────────────────────────────────────
     # Background scanner interval (seconds) — checks wide altcoin universe
@@ -234,6 +241,9 @@ class Settings(BaseSettings):
 
     # Logging
     LOG_LEVEL: str = "INFO"
+
+    # CORS allowlist for frontend origins (comma-separated) or "*"
+    CORS_ORIGINS: str = "*"
 
     @field_validator("CYCLE_INTERVAL_SECONDS")
     @classmethod

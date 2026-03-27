@@ -733,7 +733,14 @@ class BotRunner:
                             continue
                         sig = ml_signals.get(pos.symbol, {})
                         ind_1h = symbols_data.get(pos.symbol, {}).get("indicators", {}).get("1h", {})
-                        hold_duration = (datetime.now(timezone.utc) - pos.opened_at).total_seconds() / 3600 if hasattr(pos, 'opened_at') and pos.opened_at else 0
+                        opened_at = getattr(pos, "opened_at", None)
+                        if opened_at is not None and opened_at.tzinfo is None:
+                            opened_at = opened_at.replace(tzinfo=timezone.utc)
+                        hold_duration = (
+                            (datetime.now(timezone.utc) - opened_at).total_seconds() / 3600
+                            if opened_at is not None
+                            else 0
+                        )
                         pnl_pct = ((pos.current_price - pos.avg_entry_price) / pos.avg_entry_price * 100) if pos.avg_entry_price > 0 else 0
                         highest = getattr(pos, 'highest_price', pos.current_price) or pos.current_price
                         drawdown_from_high = ((highest - pos.current_price) / highest * 100) if highest > 0 else 0
@@ -976,6 +983,11 @@ class BotRunner:
                 # All local models agree but Claude budget is gone (or LESS_FEAR)
                 logger.info("Main cycle: auto-execute from quant/GPU — %s", _gate_reason)
                 from app.schemas.decision import TradeDecision
+                prompt = (
+                    "[NO_CLAUDE] Main cycle auto-execute path used. "
+                    f"Reason: {_gate_reason}. "
+                    f"Candidate: {top_cand.symbol} {top_cand.action} score={top_cand.score:.0f}"
+                )
                 decision = TradeDecision(
                     action=top_cand.action,
                     symbol=top_cand.symbol,

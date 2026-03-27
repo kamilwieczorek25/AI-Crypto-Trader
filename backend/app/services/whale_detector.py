@@ -11,6 +11,7 @@ Uses the public WebSocket endpoint — no API key required.
 import asyncio
 import json
 import logging
+import ssl
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -42,6 +43,8 @@ class WhaleDetector:
         self._running = False
         self._task: asyncio.Task | None = None
         self._session: aiohttp.ClientSession | None = None
+        self._ws_verify_ssl = settings.WHALE_WS_VERIFY_SSL
+        self._ws_ssl_fallback_used = False
         # Recent whale events per symbol (last WHALE_MEMORY_MINUTES minutes)
         self._events: dict[str, list[WhaleEvent]] = defaultdict(list)
         # Tracked symbols — refreshed periodically from the symbol universe
@@ -128,8 +131,42 @@ class WhaleDetector:
             except asyncio.CancelledError:
                 break
             except Exception as exc:
+                if self._maybe_enable_insecure_fallback(exc):
+                    await asyncio.sleep(1)
+                    continue
                 logger.warning("Whale WS error: %s — reconnecting in 5s", exc)
                 await asyncio.sleep(5)
+
+    def _maybe_enable_insecure_fallback(self, exc: Exception) -> bool:
+        """Switch to insecure TLS on cert errors when explicitly allowed."""
+        cert_error = isinstance(exc, ssl.SSLCertVerificationError)
+
+        if not cert_error and isinstance(exc, aiohttp.ClientConnectorCertificateError):
+            cert_error = True
+
+        if not cert_error and "certificate verify failed" in str(exc).lower():
+            cert_error = True
+
+        if not cert_error:
+            return False
+
+        if not settings.WHALE_WS_INSECURE_FALLBACK:
+            logger.warning(
+                "Whale WS TLS verification failed. Set WHALE_WS_INSECURE_FALLBACK=true "
+                "or fix your CA trust chain."
+            )
+            return False
+
+        if not self._ws_verify_ssl or self._ws_ssl_fallback_used:
+            return False
+
+        self._ws_verify_ssl = False
+        self._ws_ssl_fallback_used = True
+        logger.warning(
+            "Whale WS TLS verification failed; falling back to ssl=False. "
+            "For secure operation, install the intercepting CA and keep WHALE_WS_VERIFY_SSL=true."
+        )
+        return True
 
     async def _listen(self) -> None:
         """Subscribe to Binance aggTrade stream for top symbols."""
@@ -158,7 +195,11 @@ class WhaleDetector:
         url = f"wss://stream.binance.com:9443/stream?streams={'/'.join(streams)}"
         logger.info("Whale detector: connecting to %d trade streams", len(streams))
 
-        async with self._session.ws_connect(url, heartbeat=20) as ws:
+        async with self._session.ws_connect(
+            url,
+            heartbeat=20,
+            ssl=self._ws_verify_ssl,
+        ) as ws:
             logger.info("Whale detector: WebSocket connected")
             async for msg in ws:
                 if not self._running:

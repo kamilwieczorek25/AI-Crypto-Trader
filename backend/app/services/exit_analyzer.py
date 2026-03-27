@@ -21,6 +21,19 @@ from datetime import datetime, timezone
 logger = logging.getLogger(__name__)
 
 
+def _to_utc(dt: datetime | None) -> datetime | None:
+    """Normalize datetime to timezone-aware UTC.
+
+    DB drivers can occasionally return naive timestamps even when the column
+    is declared as timezone-aware, so we normalize defensively.
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 # ── Result dataclass ─────────────────────────────────────────────────
 @dataclass
 class ExitSignal:
@@ -60,7 +73,7 @@ def analyze_exit(
         return ExitSignal("HOLD", "no price data", 0.0, "local")
 
     # Minimum hold duration — don't evaluate freshly opened positions
-    opened_at = getattr(pos, "opened_at", None)
+    opened_at = _to_utc(getattr(pos, "opened_at", None))
     if opened_at:
         hold_min = (datetime.now(timezone.utc) - opened_at).total_seconds() / 60
         if hold_min < _MIN_HOLD_MINUTES:
