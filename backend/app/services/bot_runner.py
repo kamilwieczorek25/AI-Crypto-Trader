@@ -75,6 +75,8 @@ class BotRunner:
         # Express lane strike counter: {symbol: int} — ban after N consecutive failures
         self._express_strikes: dict[str, int] = {}
         _EXPRESS_BAN_STRIKES = 5  # ban symbol after 5 consecutive express lane failures
+        # Symbols that already used their one-time high-conviction override
+        self._express_override_used: set[str] = set()
         # Per-symbol beta vs BTC: {symbol: {"beta": float, "correlation": float}}
         # Computed from 1h OHLCV each cycle and passed to quant scorer
         self._beta_data: dict[str, dict] = {}
@@ -173,7 +175,11 @@ class BotRunner:
                     try:
                         held_now = {p.symbol for p in self._portfolio.all_positions()}
                         now = datetime.now(timezone.utc)
-                        # Purge expired cooldowns (older than 5 min)
+                        # Purge expired cooldowns and reset override flags
+                        expired = {s for s, t in self._express_cooldown.items() if now >= t}
+                        for s in expired:
+                            self._express_override_used.discard(s)
+                            self._express_strikes.pop(s, None)
                         self._express_cooldown = {
                             s: t for s, t in self._express_cooldown.items()
                             if now < t
@@ -192,19 +198,22 @@ class BotRunner:
                                 cd = self._express_cooldown[hc.symbol]
                                 remaining = (cd - now).total_seconds() / 60
                                 strikes = self._express_strikes.get(hc.symbol, 0)
-                                # High-conviction override: score ≥ 80 bypasses cooldown
-                                if hc.score >= 80:
+                                # High-conviction override: score ≥ 80 bypasses cooldown ONCE
+                                already_overridden = hc.symbol in self._express_override_used
+                                if hc.score >= 80 and not already_overridden:
                                     del self._express_cooldown[hc.symbol]
-                                    self._express_strikes.pop(hc.symbol, None)
+                                    self._express_override_used.add(hc.symbol)
                                     logger.info(
                                         "Express OVERRIDE %s (score=%.0f): bypassing cooldown "
-                                        "(was %.0f min left, strikes=%d) — high conviction",
+                                        "(was %.0f min left, strikes=%d) — one-time override",
                                         hc.symbol, hc.score, remaining, strikes,
                                     )
+                                    # falls through to trigger express lane below
                                 else:
                                     logger.info(
-                                        "Express skip %s (score=%.0f): cooldown %.0f min left, strikes=%d/5",
+                                        "Express skip %s (score=%.0f): cooldown %.0f min left, strikes=%d/5%s",
                                         hc.symbol, hc.score, remaining, strikes,
+                                        " (override spent)" if already_overridden else "",
                                     )
                                     continue
                             if hc.symbol in self._banned_symbols:
