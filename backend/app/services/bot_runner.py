@@ -192,11 +192,21 @@ class BotRunner:
                                 cd = self._express_cooldown[hc.symbol]
                                 remaining = (cd - now).total_seconds() / 60
                                 strikes = self._express_strikes.get(hc.symbol, 0)
-                                logger.info(
-                                    "Express skip %s (score=%.0f): cooldown %.0f min left, strikes=%d/5",
-                                    hc.symbol, hc.score, remaining, strikes,
-                                )
-                                continue
+                                # High-conviction override: score ≥ 80 bypasses cooldown
+                                if hc.score >= 80:
+                                    del self._express_cooldown[hc.symbol]
+                                    self._express_strikes.pop(hc.symbol, None)
+                                    logger.info(
+                                        "Express OVERRIDE %s (score=%.0f): bypassing cooldown "
+                                        "(was %.0f min left, strikes=%d) — high conviction",
+                                        hc.symbol, hc.score, remaining, strikes,
+                                    )
+                                else:
+                                    logger.info(
+                                        "Express skip %s (score=%.0f): cooldown %.0f min left, strikes=%d/5",
+                                        hc.symbol, hc.score, remaining, strikes,
+                                    )
+                                    continue
                             if hc.symbol in self._banned_symbols:
                                 logger.debug("Express skip %s (score=%.0f): banned", hc.symbol, hc.score)
                                 continue
