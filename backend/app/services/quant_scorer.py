@@ -745,6 +745,11 @@ def score_symbol(
     if active_total < 3 and abs(composite) < 0.15:
         composite = 0.0
 
+    # Require at least 2 bullish factors for a BUY signal — one factor alone
+    # (e.g., single MACD divergence) is not enough conviction to buy
+    if composite > 0 and active_bullish < 2:
+        composite = 0.0
+
     # Normalize to 0–100 scale (50 = neutral)
     score = max(0, min(100, 50 + composite * 50))
 
