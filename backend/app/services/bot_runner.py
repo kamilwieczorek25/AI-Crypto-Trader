@@ -216,7 +216,7 @@ class BotRunner:
                                     )
                                     # falls through to trigger express lane below
                                 else:
-                                    logger.info(
+                                    logger.debug(
                                         "Express skip %s (score=%.0f): cooldown %.0f min left, strikes=%d/5%s",
                                         hc.symbol, hc.score, remaining, strikes,
                                         f" (override used at {prev_override:.0f})" if prev_override else "",
@@ -226,7 +226,7 @@ class BotRunner:
                                 logger.debug("Express skip %s (score=%.0f): banned", hc.symbol, hc.score)
                                 continue
                             if self._portfolio.cash_usdt < 10.0:
-                                logger.info("Express skip %s (score=%.0f): low cash ($%.2f)", hc.symbol, hc.score, self._portfolio.cash_usdt)
+                                logger.debug("Express skip %s (score=%.0f): low cash ($%.2f)", hc.symbol, hc.score, self._portfolio.cash_usdt)
                                 continue
 
                             self._express_tasks.add(hc.symbol)
