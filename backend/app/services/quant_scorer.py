@@ -733,6 +733,18 @@ def score_symbol(
     # Weighted composite using regime-adjusted weights: sum(factor * weight) → [-1, +1]
     composite = sum(factors[k] * weights.get(k, 0.0) for k in factors)
 
+    # ── Range-bound / low-conviction filter ──────────────────────────
+    # Count how many factors have a meaningful opinion (|value| >= 0.2)
+    # If too few factors are active, the signal is just noise.
+    active_bullish = sum(1 for v in factors.values() if v >= 0.2)
+    active_bearish = sum(1 for v in factors.values() if v <= -0.2)
+    active_total = active_bullish + active_bearish
+
+    # Require at least 3 active factors for any directional signal;
+    # otherwise force neutral — prevents buying flat/range-bound coins
+    if active_total < 3 and abs(composite) < 0.15:
+        composite = 0.0
+
     # Normalize to 0–100 scale (50 = neutral)
     score = max(0, min(100, 50 + composite * 50))
 
@@ -755,6 +767,7 @@ def score_symbol(
         "factors":   {k: round(v, 3) for k, v in factors.items()},
         "signals":   signals,
         "regime_weights_used": market_regime,
+        "conviction": {"bullish": active_bullish, "bearish": active_bearish, "total": active_total},
     }
 
 
@@ -779,6 +792,11 @@ def compute_trade_levels(
         atr_1h = price * 0.02
 
     atr_pct = (atr_1h / price) * 100
+
+    # Reject coins with ATR < 0.5% — too flat, SL/TP will whipsaw
+    if atr_pct < 0.5 and action == "BUY":
+        logger.debug("Rejecting %s: ATR %.2f%% too low (range-bound)", symbol, atr_pct)
+        return None
 
     sl_multiplier = settings.SL_ATR_MULTIPLIER
     sl_pct = round(atr_pct * sl_multiplier, 2)
