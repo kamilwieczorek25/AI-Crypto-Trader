@@ -2121,34 +2121,67 @@ class BotRunner:
 
             express_score = result["score"]
             direction = result["direction"]
+            composite = result.get("composite", 0.0)
 
             logger.info(
-                "Express lane: %s re-scored %.0f (direction=%+d, was %.0f from scanner)",
-                symbol, express_score, direction, scanner_score,
+                "Express lane: %s re-scored %.0f (direction=%+d, composite=%.3f, was %.0f from scanner)",
+                symbol, express_score, direction, composite, scanner_score,
             )
 
-            # 6. Only proceed if re-scored high enough
-            if direction <= 0 or express_score < 55:
-                # Track consecutive failures — ban symbol after too many
-                strikes = self._express_strikes.get(symbol, 0) + 1
-                self._express_strikes[symbol] = strikes
-                if strikes >= 5:
-                    self._banned_symbols.add(symbol)
-                    self._express_strikes.pop(symbol, None)
-                    logger.warning(
-                        "Express lane: %s BANNED after %d consecutive re-score failures "
-                        "(last score=%.0f) — will not be re-evaluated",
-                        symbol, strikes, express_score,
-                    )
+            # 6. Only proceed if re-scored high enough.
+            #
+            # High-conviction scanner signals (scanner_score ≥ 75) get a relaxed gate:
+            # the fast scanner detected real price/volume momentum, so a barely-negative
+            # composite (-0.02) should NOT block the trade.  We use the raw composite
+            # (continuous) instead of the binned direction (+1/0/-1) to distinguish
+            # "clearly bearish" from "near-neutral".
+            #
+            # Gate rules:
+            #   scanner_score >= 75  →  reject only if composite < -0.10 or score < 48
+            #   scanner_score <  75  →  existing strict gate: direction > 0 and score ≥ 55
+            _high_conviction = scanner_score >= 75
+            if _high_conviction:
+                gate_fail = composite < -0.10 or express_score < 48
+            else:
+                gate_fail = direction <= 0 or express_score < 55
+
+            if gate_fail:
+                # Only count as a structural strike when the signal is clearly bearish
+                # (composite < -0.10).  Near-neutral borderline cases (like a hot coin
+                # dragged slightly negative by a momentary BTC dip) get a short cooldown
+                # but do NOT accumulate strikes — we don't want to ban genuinely hot
+                # symbols because of a single ambiguous reading.
+                if composite < -0.10:
+                    strikes = self._express_strikes.get(symbol, 0) + 1
+                    self._express_strikes[symbol] = strikes
+                    if strikes >= 5:
+                        self._banned_symbols.add(symbol)
+                        self._express_strikes.pop(symbol, None)
+                        logger.warning(
+                            "Express lane: %s BANNED after %d consecutive re-score failures "
+                            "(last score=%.0f, composite=%.3f) — will not be re-evaluated",
+                            symbol, strikes, express_score, composite,
+                        )
+                    else:
+                        cooldown_min = min(5 * strikes, 30)  # escalating: 5, 10, 15…
+                        self._express_cooldown[symbol] = (
+                            datetime.now(timezone.utc) + timedelta(minutes=cooldown_min)
+                        )
+                        logger.info(
+                            "Express lane: %s clearly bearish (composite=%.3f, score=%.0f) — "
+                            "strike %d/5, cooldown %d min",
+                            symbol, composite, express_score, strikes, cooldown_min,
+                        )
                 else:
-                    cooldown_min = min(5 * strikes, 30)  # escalating: 5, 10, 15, 20 min
+                    # Near-neutral: short fixed cooldown, no strike accumulation
+                    cooldown_min = 3
                     self._express_cooldown[symbol] = (
                         datetime.now(timezone.utc) + timedelta(minutes=cooldown_min)
                     )
                     logger.info(
-                        "Express lane: %s score %.0f below 55 or bearish — "
-                        "strike %d/5, cooldown %d min",
-                        symbol, express_score, strikes, cooldown_min,
+                        "Express lane: %s near-neutral (composite=%.3f, score=%.0f, "
+                        "scanner=%.0f) — short cooldown %d min, no strike",
+                        symbol, composite, express_score, scanner_score, cooldown_min,
                     )
                 return
 
