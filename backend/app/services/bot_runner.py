@@ -77,6 +77,9 @@ class BotRunner:
         _EXPRESS_BAN_STRIKES = 5  # ban symbol after 5 consecutive express lane failures
         # Track high-conviction override: {symbol: last_override_score}
         self._express_override_used: dict[str, float] = {}
+        # Force-buy hold shield: {symbol: datetime} — suppress SL/smart-exit for 30 min
+        # after a user-triggered force-buy so the position isn't ejected immediately.
+        self._force_buy_holds: dict[str, datetime] = {}
         # Per-symbol beta vs BTC: {symbol: {"beta": float, "correlation": float}}
         # Computed from 1h OHLCV each cycle and passed to quant scorer
         self._beta_data: dict[str, dict] = {}
@@ -1472,6 +1475,15 @@ class BotRunner:
 
         for pos in positions:
             sym = pos.symbol
+
+            # Force-buy shield: skip smart-exit evaluation for the first 30 min
+            if sym in self._force_buy_holds:
+                _fb_age_min = (datetime.now(timezone.utc) - self._force_buy_holds[sym]).total_seconds() / 60
+                if _fb_age_min < 30:
+                    continue
+                else:
+                    self._force_buy_holds.pop(sym, None)
+
             ind_1h = symbols_data.get(sym, {}).get("indicators", {}).get("1h", {})
             sig = ml_signals.get(sym, {})
 
@@ -1607,6 +1619,24 @@ class BotRunner:
             (sym, reason, price) for sym, reason, price in triggers
             if getattr(self._portfolio.get_position(sym), "source", "bot") == "bot"
         ]
+
+        # Force-buy shield: suppress stop-loss for 30 min after a user force-buy
+        _FORCE_BUY_PROTECT_MIN = 30
+        _now = datetime.now(timezone.utc)
+        shielded = []
+        for sym, reason, price in triggers:
+            if reason == "stop_loss" and sym in self._force_buy_holds:
+                age_min = (_now - self._force_buy_holds[sym]).total_seconds() / 60
+                if age_min < _FORCE_BUY_PROTECT_MIN:
+                    logger.debug(
+                        "Force-buy shield: %s — stop_loss suppressed (%.0fm / %dm window)",
+                        sym, age_min, _FORCE_BUY_PROTECT_MIN,
+                    )
+                    continue
+                else:
+                    self._force_buy_holds.pop(sym, None)
+            shielded.append((sym, reason, price))
+        triggers = shielded
 
         # Time-based exit: close stagnant BOT positions after MAX_HOLD_HOURS
         max_hold = settings.MAX_HOLD_HOURS
@@ -2414,6 +2444,12 @@ class BotRunner:
                         "Express lane EXECUTED: BUY %s @ $%.6f (qty=%.6f)",
                         symbol, trade.price, trade.quantity,
                     )
+                    if force_buy:
+                        self._force_buy_holds[symbol] = datetime.now(timezone.utc)
+                        logger.info(
+                            "Force-buy shield activated for %s — SL/smart-exit suppressed for 30 min",
+                            symbol,
+                        )
                     await self._broadcast("TRADE_EXECUTED", {
                         "id": trade.id, "symbol": trade.symbol,
                         "direction": trade.direction, "mode": trade.mode,
