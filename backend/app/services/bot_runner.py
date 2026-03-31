@@ -139,23 +139,43 @@ class BotRunner:
     # Main loop
     # ------------------------------------------------------------------ #
     async def _loop(self) -> None:
-        # Maximum time a single cycle is allowed to run before it's forcibly cancelled.
-        # Prevents hangs from unresponsive Binance / GPU / Claude calls locking up the bot.
+        # Maximum time a single cycle is allowed to run before it's abandoned.
+        # Uses create_task + asyncio.wait so a hung cancellation can't freeze _loop().
+        # If _cycle() hangs (e.g. DB/network), we abandon the task and move on.
         _CYCLE_TIMEOUT = 4 * 60  # 4 minutes — well above any normal cycle time
         while self._running:
+            cycle_task = asyncio.create_task(
+                self._cycle(), name=f"cycle_{self._cycle_count + 1}"
+            )
             try:
-                await asyncio.wait_for(self._cycle(), timeout=_CYCLE_TIMEOUT)
-            except asyncio.TimeoutError:
-                logger.error(
-                    "Cycle timeout after %ds — possible hung API call. "
-                    "Skipping cycle and resuming next interval.",
-                    _CYCLE_TIMEOUT,
+                done, pending = await asyncio.wait(
+                    {cycle_task}, timeout=_CYCLE_TIMEOUT
                 )
-                await self._broadcast_error(f"Cycle timeout ({_CYCLE_TIMEOUT}s) — skipped")
+                if pending:
+                    # Timeout — cancel the task but do NOT await it.
+                    # Awaiting a stuck task's cancellation can itself hang forever.
+                    cycle_task.cancel()
+                    logger.error(
+                        "Cycle %d timeout after %ds — abandoned hung task, "
+                        "resuming next interval.",
+                        self._cycle_count + 1, _CYCLE_TIMEOUT,
+                    )
+                    await self._broadcast_error(
+                        f"Cycle timeout ({_CYCLE_TIMEOUT}s) — skipped"
+                    )
+                else:
+                    # Task completed — check for exceptions
+                    exc = cycle_task.exception()
+                    if exc is not None:
+                        logger.exception(
+                            "Cycle error: %s", exc, exc_info=exc
+                        )
+                        await self._broadcast_error(str(exc))
             except asyncio.CancelledError:
+                cycle_task.cancel()
                 break
             except Exception as exc:
-                logger.exception("Cycle error: %s", exc)
+                logger.exception("Cycle error (outer): %s", exc)
                 await self._broadcast_error(str(exc))
 
             self._next_cycle_at = datetime.now(timezone.utc).replace(
