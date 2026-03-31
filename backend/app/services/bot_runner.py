@@ -194,7 +194,13 @@ class BotRunner:
                 if self._running:
                     try:
                         await self._broadcast_status()
-                        await self._broadcast_price_tick()
+                        # Wrap price tick in a hard timeout — a hung exchange
+                        # API call must not freeze the entire sleep loop.
+                        await asyncio.wait_for(
+                            self._broadcast_price_tick(), timeout=20
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning("Price tick timed out (20 s) — skipping this tick")
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:
@@ -229,7 +235,7 @@ class BotRunner:
                                 continue
                             if hc.symbol in self._express_cooldown:
                                 cd = self._express_cooldown[hc.symbol]
-                                remaining = (cd - now).total_seconds() / 60
+                                _cd_remaining_min = (cd - now).total_seconds() / 60
                                 strikes = self._express_strikes.get(hc.symbol, 0)
                                 # High-conviction override: score ≥ 80 bypasses cooldown
                                 # Allow re-override only if score jumped ≥ 10 from last override
@@ -244,14 +250,14 @@ class BotRunner:
                                     logger.info(
                                         "Express OVERRIDE %s (score=%.0f): bypassing cooldown "
                                         "(was %.0f min left, strikes=%d)%s",
-                                        hc.symbol, hc.score, remaining, strikes,
+                                        hc.symbol, hc.score, _cd_remaining_min, strikes,
                                         f" — score jumped from {prev_override:.0f}" if prev_override else "",
                                     )
                                     # falls through to trigger express lane below
                                 else:
                                     logger.debug(
                                         "Express skip %s (score=%.0f): cooldown %.0f min left, strikes=%d/5%s",
-                                        hc.symbol, hc.score, remaining, strikes,
+                                        hc.symbol, hc.score, _cd_remaining_min, strikes,
                                         f" (override used at {prev_override:.0f})" if prev_override else "",
                                     )
                                     continue
