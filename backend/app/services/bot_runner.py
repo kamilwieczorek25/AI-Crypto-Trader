@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -26,10 +27,14 @@ from app.services.technical import compute_indicators, detect_market_regime, com
 
 logger = logging.getLogger(__name__)
 
+# Persistent state file — survives container restarts (stored on the /data volume)
+_STATE_FILE = Path("/data/bot_state.json")
+
 
 class BotRunner:
     def __init__(self) -> None:
         self._running = False
+        self._started_at: datetime = datetime.now(timezone.utc)
         self._task: asyncio.Task | None = None
         self._cycle_count = 0
         self._last_cycle_at: datetime | None = None
@@ -115,6 +120,9 @@ class BotRunner:
         # Auto-backtest on startup (non-blocking — runs in background)
         if settings.AUTO_BACKTEST:
             asyncio.create_task(self._run_startup_backtest(), name="startup_backtest")
+
+        # Restore guard rails persisted from the previous run
+        self._load_state()
 
         self._task = asyncio.create_task(self._loop(), name="bot_loop")
         logger.info("Bot started in %s mode", settings.MODE)
@@ -1189,6 +1197,22 @@ class BotRunner:
                 else:
                     del self._sl_cooldown[decision.symbol]
 
+            # 7d. Startup warmup — block new BUY entries until OHLCV caches and
+            #     ML signals have had one full cycle to warm up.  SELL decisions
+            #     and existing-position management are unaffected.
+            if decision.action == "BUY" and self._is_warming_up():
+                warmup_left = max(
+                    0,
+                    settings.STARTUP_WARMUP_SECONDS
+                    - (datetime.now(timezone.utc) - self._started_at).total_seconds(),
+                )
+                logger.info(
+                    "Startup warmup: blocking BUY %s — %.0fs left (caches warming up)",
+                    decision.symbol, warmup_left,
+                )
+                decision.action = "HOLD"
+                decision.quantity_pct = 0.0
+
             # 8. Log decision to DB (executed=False)
             db_decision = ClaudeDecision(
                 raw_prompt=prompt[:50_000],  # safety truncation
@@ -1353,6 +1377,7 @@ class BotRunner:
 
         self._cycle_count += 1
         self._last_cycle_at = datetime.now(timezone.utc)
+        self._save_state()
         logger.info("=== Cycle %d complete ===", self._cycle_count)
 
     # ------------------------------------------------------------------ #
@@ -1407,6 +1432,91 @@ class BotRunner:
     def _add_sl_cooldown(self, symbol: str, minutes: int = 20) -> None:
         """Prevent re-buying a symbol for N minutes after stop-loss hit."""
         self._sl_cooldown[symbol] = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+
+    # ------------------------------------------------------------------ #
+    # Startup warmup & persistent state
+    # ------------------------------------------------------------------ #
+
+    def _is_warming_up(self) -> bool:
+        """True while within the post-start warmup window (no new BUY trades)."""
+        if settings.STARTUP_WARMUP_SECONDS <= 0:
+            return False
+        elapsed = (datetime.now(timezone.utc) - self._started_at).total_seconds()
+        return elapsed < settings.STARTUP_WARMUP_SECONDS
+
+    def _save_state(self) -> None:
+        """Persist cooldown/ban state to the /data volume.
+
+        Called at the end of every cycle and every express lane pass so that
+        guard rails survive container restarts.  The write is atomic (write to
+        .tmp then rename) to avoid partial reads on crash.
+        """
+        try:
+            state = {
+                "sl_cooldown": {
+                    sym: dt.isoformat()
+                    for sym, dt in self._sl_cooldown.items()
+                },
+                "express_cooldown": {
+                    sym: dt.isoformat()
+                    for sym, dt in self._express_cooldown.items()
+                },
+                "express_strikes": dict(self._express_strikes),
+                "banned_symbols": list(self._banned_symbols),
+                "recent_results": list(self._recent_results),
+            }
+            _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = _STATE_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(state, indent=2))
+            tmp.replace(_STATE_FILE)
+        except Exception as exc:
+            logger.warning("Failed to save bot state: %s", exc)
+
+    def _load_state(self) -> None:
+        """Load persisted state from the /data volume, ignoring expired entries.
+
+        Called once in start() so every restart inherits its guard rails.
+        """
+        if not _STATE_FILE.exists():
+            return
+        try:
+            state = json.loads(_STATE_FILE.read_text())
+            now = datetime.now(timezone.utc)
+            loaded_sl = loaded_ex = 0
+
+            for sym, iso in state.get("sl_cooldown", {}).items():
+                dt = datetime.fromisoformat(iso)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                if dt > now:
+                    self._sl_cooldown[sym] = dt
+                    loaded_sl += 1
+
+            for sym, iso in state.get("express_cooldown", {}).items():
+                dt = datetime.fromisoformat(iso)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                if dt > now:
+                    self._express_cooldown[sym] = dt
+                    loaded_ex += 1
+
+            for sym, n in state.get("express_strikes", {}).items():
+                self._express_strikes[sym] = int(n)
+
+            for sym in state.get("banned_symbols", []):
+                self._banned_symbols.add(sym)
+
+            self._recent_results = [bool(r) for r in state.get("recent_results", [])][-10:]
+
+            logger.info(
+                "Loaded persisted bot state: %d SL cooldowns, %d express cooldowns, "
+                "%d strikes, %d banned, %d recent results",
+                loaded_sl, loaded_ex,
+                len(self._express_strikes), len(self._banned_symbols),
+                len(self._recent_results),
+            )
+        except Exception as exc:
+            logger.warning("Failed to load bot state (starting fresh): %s", exc)
 
     # ------------------------------------------------------------------ #
     # Helpers
@@ -2269,6 +2379,18 @@ class BotRunner:
             # Re-score passed — reset strike counter
             self._express_strikes.pop(symbol, None)
 
+            # Startup warmup: OHLCV was fetched (warms the cache), but don't
+            # execute trades yet — ML signals need one full main cycle first.
+            # force_buy always bypasses warmup (user explicitly requested it).
+            if self._is_warming_up() and not force_buy:
+                logger.info(
+                    "Startup warmup: %s scored %.0f — cache warmed, no trade yet (%.0fs left)",
+                    symbol, express_score,
+                    max(0, settings.STARTUP_WARMUP_SECONDS
+                        - (datetime.now(timezone.utc) - self._started_at).total_seconds()),
+                )
+                return
+
             # 7. Compute trade levels
             levels = compute_trade_levels(symbol, symbol_data, "BUY", express_score)
             if levels is None:
@@ -2508,6 +2630,7 @@ class BotRunner:
             logger.warning("Express lane failed for %s (non-fatal): %s", symbol, exc)
             self._express_cooldown[symbol] = datetime.now(timezone.utc) + timedelta(minutes=5)
         finally:
+            self._save_state()
             self._express_tasks.discard(symbol)
 
     # ------------------------------------------------------------------ #

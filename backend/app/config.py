@@ -204,6 +204,11 @@ class Settings(BaseSettings):
     # Minimum holding value (USDT) to import as position (filters dust)
     SYNC_MIN_VALUE_USDT: float = 5.0
 
+    # Startup warmup: block new BUY trades for this many seconds after start/restart
+    # so OHLCV caches and ML signals can warm up before any entry decisions are made.
+    # 0 = disabled (trade immediately).  Default: 90 s (one sleep-loop pass + margin).
+    STARTUP_WARMUP_SECONDS: int = 90
+
     # Bot behaviour
     CYCLE_INTERVAL_SECONDS: int = 300
     DEMO_INITIAL_BALANCE: float = 10_000.0
