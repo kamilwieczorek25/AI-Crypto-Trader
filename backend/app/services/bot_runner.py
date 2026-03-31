@@ -139,9 +139,19 @@ class BotRunner:
     # Main loop
     # ------------------------------------------------------------------ #
     async def _loop(self) -> None:
+        # Maximum time a single cycle is allowed to run before it's forcibly cancelled.
+        # Prevents hangs from unresponsive Binance / GPU / Claude calls locking up the bot.
+        _CYCLE_TIMEOUT = 4 * 60  # 4 minutes — well above any normal cycle time
         while self._running:
             try:
-                await self._cycle()
+                await asyncio.wait_for(self._cycle(), timeout=_CYCLE_TIMEOUT)
+            except asyncio.TimeoutError:
+                logger.error(
+                    "Cycle timeout after %ds — possible hung API call. "
+                    "Skipping cycle and resuming next interval.",
+                    _CYCLE_TIMEOUT,
+                )
+                await self._broadcast_error(f"Cycle timeout ({_CYCLE_TIMEOUT}s) — skipped")
             except asyncio.CancelledError:
                 break
             except Exception as exc:
