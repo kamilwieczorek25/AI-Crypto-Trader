@@ -233,6 +233,14 @@ async def call_local_llm(
 
         raw_content: str = data["message"]["content"]
         parsed = json.loads(raw_content)
+        # Sanitise numeric fields before Pydantic validation — the LLM sometimes
+        # returns negative percentages (e.g. stop_loss_pct=-10.0) which would
+        # fail the ge=0 constraint before the post-construction fixups run.
+        for _pct_field in ("stop_loss_pct", "take_profit_pct", "quantity_pct", "sell_pct"):
+            if _pct_field in parsed and isinstance(parsed[_pct_field], (int, float)):
+                parsed[_pct_field] = abs(float(parsed[_pct_field]))
+        if "confidence" in parsed and isinstance(parsed["confidence"], (int, float)):
+            parsed["confidence"] = max(0.0, min(1.0, float(parsed["confidence"])))
         decision = TradeDecision(**parsed)
 
         # Enforce profile position-size cap (mirrors claude_engine behaviour)
