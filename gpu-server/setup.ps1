@@ -206,6 +206,33 @@ if (-not $SkipOllama) {
         }
     }
 
+    # Ollama defaults to 127.0.0.1 (localhost only).
+    # Set OLLAMA_HOST=0.0.0.0 so the trading bot container can reach it over the network.
+    $currentHost = [System.Environment]::GetEnvironmentVariable("OLLAMA_HOST", "Machine")
+    if ($currentHost -ne "0.0.0.0") {
+        Write-Step "Setting OLLAMA_HOST=0.0.0.0 (machine-wide, requires restart of Ollama)"
+        [System.Environment]::SetEnvironmentVariable("OLLAMA_HOST", "0.0.0.0", "Machine")
+        $env:OLLAMA_HOST = "0.0.0.0"
+        Write-Ok "OLLAMA_HOST=0.0.0.0 set"
+    } else {
+        Write-Ok "OLLAMA_HOST already set to 0.0.0.0"
+    }
+
+    # Ensure Windows Firewall allows inbound connections on port 11434
+    $fwRule = Get-NetFirewallRule -DisplayName "Ollama API" -ErrorAction SilentlyContinue
+    if (-not $fwRule) {
+        Write-Step "Adding Windows Firewall rule for Ollama (TCP 11434 inbound)"
+        try {
+            New-NetFirewallRule -DisplayName "Ollama API" -Direction Inbound `
+                -Protocol TCP -LocalPort 11434 -Action Allow | Out-Null
+            Write-Ok "Firewall rule added"
+        } catch {
+            Write-Warn "Could not add firewall rule (run as Administrator): $_"
+        }
+    } else {
+        Write-Ok "Firewall rule for Ollama already exists"
+    }
+
     # ── Step 6 — Model Pull ───────────────────────────────────────────────────
 
     if (-not $SkipModelPull) {
