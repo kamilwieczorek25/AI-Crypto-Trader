@@ -200,7 +200,7 @@ class Settings(BaseSettings):
     #   (same host, port 11434).  Set explicitly to override.
     USE_LOCAL_LLM: bool = True
     LOCAL_LLM_URL: str = ""              # blank = derive from GPU_SERVER_URL
-    LOCAL_LLM_MODEL: str = "qwen2.5:14b"
+    LOCAL_LLM_MODEL: str = "qwen2.5:7b"
     # GPU inference: ~5–15 s.  CPU-only (7B): ~60–120 s.  CPU-only (14B): ~180 s.
     LOCAL_LLM_TIMEOUT: int = 120         # seconds per inference call
 
