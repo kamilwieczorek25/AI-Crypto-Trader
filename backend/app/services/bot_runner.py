@@ -1111,7 +1111,18 @@ class BotRunner:
 
                 model_provider = "unknown"
                 try:
-                    if settings.USE_LOCAL_LLM and local_llm_engine.is_available():
+                    # SELL decisions always use Claude Sonnet — exit timing is too
+                    # critical for a local model.  LocalLLM only handles BUY validation.
+                    if _has_sell:
+                        logger.info(
+                            "SELL candidate detected — forcing Claude Sonnet (bypassing LocalLLM)"
+                        )
+                        decision, raw_response = await claude_engine.call_claude(
+                            prompt, use_haiku=False, validation_mode=True,
+                        )
+                        model_provider = "claude-sonnet-4-6"
+                        self._main_claude_calls.append(datetime.now(timezone.utc))
+                    elif settings.USE_LOCAL_LLM and local_llm_engine.is_available():
                         logger.info("Calling LocalLLM [%s] for validation...", settings.LOCAL_LLM_MODEL)
                         try:
                             decision, raw_response = await local_llm_engine.call_local_llm(

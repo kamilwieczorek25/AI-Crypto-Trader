@@ -241,6 +241,17 @@ async def call_local_llm(
                 parsed[_pct_field] = abs(float(parsed[_pct_field]))
         if "confidence" in parsed and isinstance(parsed["confidence"], (int, float)):
             parsed["confidence"] = max(0.0, min(1.0, float(parsed["confidence"])))
+        # Confidence discount: local models tend to be overconfident compared to
+        # Claude.  Apply a 0.7× multiplier so that marginal BUY decisions are
+        # more likely to fall below the profile's min_confidence threshold and
+        # get downgraded to HOLD.
+        if "confidence" in parsed:
+            _raw_conf = parsed["confidence"]
+            parsed["confidence"] = round(parsed["confidence"] * 0.7, 4)
+            logger.info(
+                "LocalLLM: confidence discount 0.7× applied: %.2f → %.2f",
+                _raw_conf, parsed["confidence"],
+            )
         decision = TradeDecision(**parsed)
 
         # Enforce profile position-size cap (mirrors claude_engine behaviour)
