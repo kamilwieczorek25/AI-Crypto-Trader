@@ -57,6 +57,9 @@ _available: bool | None = None          # None = never checked
 _available_checked_at: float = 0.0      # epoch seconds
 _AVAILABLE_CACHE_TTL: float = 30.0      # re-check interval
 
+# ── Pull deduplication guard ──────────────────────────────────────────────────
+_pull_in_progress: bool = False         # prevents concurrent model pulls
+
 
 def is_available() -> bool:
     """Return whether Ollama is reachable (cached 30 s, non-blocking)."""
@@ -281,14 +284,22 @@ async def call_local_llm(
 async def check_and_pull_model() -> None:
     """Check whether the configured model is already pulled; pull it if not.
 
-    Designed to run as a non-blocking asyncio task at startup.
+    Designed to run as a non-blocking asyncio task at startup or when a 404 is
+    detected.  A global flag prevents concurrent pulls from racing.
     The download can take 5–30 min; the bot falls back to Claude during that time.
     """
+    global _pull_in_progress
+    if _pull_in_progress:
+        logger.debug("Ollama: pull already in progress — skipping duplicate request")
+        return
+    _pull_in_progress = True
+
     model = settings.LOCAL_LLM_MODEL
     url   = _get_ollama_url()
 
     if not url:
         logger.info("Ollama: no URL configured (LOCAL_LLM_URL and GPU_SERVER_URL both unset) — skipping")
+        _pull_in_progress = False
         return
 
     # Brief pause to let the GPU VM's Ollama process finish booting
@@ -357,3 +368,5 @@ async def check_and_pull_model() -> None:
     except Exception as exc:
         logger.warning("Ollama pull '%s' failed (%s: %r) — Claude fallback active",
                        model, type(exc).__name__, exc)
+    finally:
+        _pull_in_progress = False
