@@ -2497,9 +2497,14 @@ class BotRunner:
                         )
                         _skip_claude = True
 
-            # Hard rate caps — checked and reserved atomically before any await
-            # so concurrent express tasks cannot all pass the same check together.
-            if not _skip_claude:
+            # Determine LLM backend for this express cycle.
+            # Ollama is local/free — rate caps only apply when falling back to Claude.
+            _use_local_llm = settings.USE_LOCAL_LLM and local_llm_engine.is_available()
+
+            # Hard rate caps — only apply when using Claude (Ollama is free).
+            # Checked and reserved atomically before any await so concurrent express
+            # tasks cannot all pass the same check at once.
+            if not _skip_claude and not _use_local_llm:
                 _now = datetime.now(timezone.utc)
                 # Purge timestamps older than 60 s (per-minute window)
                 while self._express_claude_calls and \
@@ -2515,29 +2520,33 @@ class BotRunner:
                     )
                     _skip_claude = True
 
-            if not _skip_claude and settings.EXPRESS_MAX_CLAUDE_PER_HOUR > 0:
-                _now = datetime.now(timezone.utc)
-                # Purge timestamps older than 3600 s (hourly window)
-                while self._express_claude_calls and \
-                      (_now - self._express_claude_calls[0]).total_seconds() > 3600:
-                    self._express_claude_calls.popleft()
-                _hour_calls = len(self._express_claude_calls)
-                if _hour_calls >= settings.EXPRESS_MAX_CLAUDE_PER_HOUR:
-                    logger.info(
-                        "Express lane: Claude hourly cap hit (%d/%d) — "
-                        "skipping Claude for %s",
-                        _hour_calls,
-                        settings.EXPRESS_MAX_CLAUDE_PER_HOUR,
-                        symbol,
-                    )
-                    _skip_claude = True
+                if not _skip_claude and settings.EXPRESS_MAX_CLAUDE_PER_HOUR > 0:
+                    _now = datetime.now(timezone.utc)
+                    # Purge timestamps older than 3600 s (hourly window)
+                    while self._express_claude_calls and \
+                          (_now - self._express_claude_calls[0]).total_seconds() > 3600:
+                        self._express_claude_calls.popleft()
+                    _hour_calls = len(self._express_claude_calls)
+                    if _hour_calls >= settings.EXPRESS_MAX_CLAUDE_PER_HOUR:
+                        logger.info(
+                            "Express lane: Claude hourly cap hit (%d/%d) — "
+                            "skipping Claude for %s",
+                            _hour_calls,
+                            settings.EXPRESS_MAX_CLAUDE_PER_HOUR,
+                            symbol,
+                        )
+                        _skip_claude = True
 
-            if not _skip_claude:
-                # Reserve the slot NOW — before the await — so other concurrent
-                # express tasks see the updated count and don't bypass the cap.
-                _now = datetime.now(timezone.utc)
-                self._express_claude_calls.append(_now)
-                self._express_claude_by_symbol[symbol] = _now
+                if not _skip_claude:
+                    # Reserve the slot NOW — before the await — so other concurrent
+                    # express tasks see the updated count and don't bypass the cap.
+                    _now = datetime.now(timezone.utc)
+                    self._express_claude_calls.append(_now)
+                    self._express_claude_by_symbol[symbol] = _now
+            elif not _skip_claude:
+                # Ollama path — no rate cap, but still record per-symbol timestamp
+                # to prevent rapid-fire re-evaluation of the same symbol.
+                self._express_claude_by_symbol[symbol] = datetime.now(timezone.utc)
 
             if _skip_claude:
                 # Build decision directly from quant candidate — no API call needed
@@ -2561,17 +2570,32 @@ class BotRunner:
                     symbol, _skip_reason, express_score,
                 )
             else:
-                # Prepend express context so Claude knows this is a hot fast-scanner signal
+                # Prepend express context so the LLM knows this is a hot fast-scanner signal
                 prompt = (
                     f"[EXPRESS LANE] Fast scanner score={scanner_score:.0f}, "
                     f"re-scored={express_score:.0f}. Evaluate quickly.\n\n{prompt}"
                 )
                 try:
-                    decision, _ = await claude_engine.call_claude(
-                        prompt, use_haiku=True, validation_mode=True
-                    )
+                    if _use_local_llm:
+                        try:
+                            decision, _ = await local_llm_engine.call_local_llm(
+                                prompt, validation_mode=True
+                            )
+                        except local_llm_engine.LLMUnavailableError as llm_err:
+                            logger.warning(
+                                "Express lane: LocalLLM unavailable (%s) — falling back to Claude",
+                                llm_err,
+                            )
+                            decision, _ = await claude_engine.call_claude(
+                                prompt, use_haiku=True, validation_mode=True
+                            )
+                            self._express_claude_calls.append(datetime.now(timezone.utc))
+                    else:
+                        decision, _ = await claude_engine.call_claude(
+                            prompt, use_haiku=True, validation_mode=True
+                        )
                 except Exception as exc:
-                    logger.warning("Express lane: Claude validation failed: %s", exc)
+                    logger.warning("Express lane: LLM validation failed: %s", exc)
                     return
 
             if decision.action != "BUY" or decision.symbol != symbol:
@@ -2620,6 +2644,9 @@ class BotRunner:
             async with AsyncSessionLocal() as db:
                 from app.models.decision import ClaudeDecision
                 import json
+                _express_provider = (
+                    settings.LOCAL_LLM_MODEL if _use_local_llm else "claude-haiku-4-5-20251001"
+                ) if not _skip_claude else "quant"
                 db_decision = ClaudeDecision(
                     raw_prompt=prompt[:10_000],
                     raw_response="[express_lane]",
@@ -2635,6 +2662,7 @@ class BotRunner:
                     reasoning=f"[EXPRESS LANE] scanner={scanner_score:.0f} quant={express_score:.0f}. "
                                + decision.reasoning,
                     risk_profile=settings.RISK_PROFILE,
+                    model_provider=_express_provider,
                     executed=False,
                 )
                 db.add(db_decision)
