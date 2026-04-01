@@ -72,6 +72,7 @@ def is_available() -> bool:
 
 
 async def _refresh_availability() -> None:
+    """Check Ollama reachability AND that the configured model is present."""
     global _available, _available_checked_at
     url = _get_ollama_url()
     if not url:
@@ -84,11 +85,30 @@ async def _refresh_availability() -> None:
                 f"{url}/api/tags",
                 timeout=aiohttp.ClientTimeout(total=5),
             ) as resp:
-                _available = resp.status == 200
+                if resp.status != 200:
+                    _available = False
+                else:
+                    data = await resp.json()
+                    pulled = [m["name"] for m in data.get("models", [])]
+                    model = settings.LOCAL_LLM_MODEL
+                    # Exact match or "<model>:<digest>" suffix — do NOT match on
+                    # just the base name (e.g. "qwen2.5") so qwen2.5:7b does NOT
+                    # satisfy a requirement for qwen2.5:14b.
+                    _available = any(
+                        name == model or name.startswith(model + ":")
+                        for name in pulled
+                    )
+                    if not _available:
+                        logger.warning(
+                            "Ollama: model '%s' not in tag list (available: %s) — "
+                            "scheduling pull",
+                            model, pulled or "none",
+                        )
+                        asyncio.ensure_future(check_and_pull_model())
     except Exception:
         _available = False
     _available_checked_at = time.monotonic()
-    logger.debug("Ollama availability: %s", _available)
+    logger.debug("Ollama availability (model=%s): %s", settings.LOCAL_LLM_MODEL, _available)
 
 
 # ── JSON schema for constrained generation ───────────────────────────────────
@@ -189,6 +209,14 @@ async def call_local_llm(
                 ) as resp:
                     if resp.status != 200:
                         body = await resp.text()
+                        # 404 = model not loaded — mark unavailable immediately so
+                        # subsequent calls skip Ollama and fall back to Claude while
+                        # the pull runs in the background.
+                        if resp.status == 404:
+                            global _available, _available_checked_at
+                            _available = False
+                            _available_checked_at = time.monotonic()
+                            asyncio.ensure_future(_refresh_availability())
                         raise LLMUnavailableError(
                             f"Ollama returned HTTP {resp.status}: {body[:200]}"
                         )
@@ -294,9 +322,10 @@ async def check_and_pull_model() -> None:
         return
 
     pulled_names: list[str] = [m["name"] for m in tags_data.get("models", [])]
-    # Ollama stores names as "qwen2.5:14b" — match by prefix in case of digest suffix
+    # Exact match OR "<model>:<digest>" suffix only — do NOT match on just the
+    # base name so "qwen2.5:7b" does NOT satisfy "qwen2.5:14b".
     already_pulled = any(
-        name == model or name.startswith(model + ":") or name.startswith(model.split(":")[0])
+        name == model or name.startswith(model + ":")
         for name in pulled_names
     )
 
