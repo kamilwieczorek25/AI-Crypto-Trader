@@ -2253,6 +2253,16 @@ class BotRunner:
                 logger.debug("Express lane: %s already held — skipping", symbol)
                 return
 
+            # Guard: don't waste LLM calls when the position cap is already reached
+            if not force_buy:
+                _n_open = len(self._portfolio.all_positions())
+                if settings.MAX_OPEN_POSITIONS > 0 and _n_open >= settings.MAX_OPEN_POSITIONS:
+                    logger.debug(
+                        "Express lane: %s skipped — position cap full (%d/%d)",
+                        symbol, _n_open, settings.MAX_OPEN_POSITIONS,
+                    )
+                    return
+
             # 1. Fetch fresh OHLCV for this symbol + BTC anchor
             try:
                 sym_ohlcv = await self._market.get_multi_timeframe_ohlcv(symbol)
