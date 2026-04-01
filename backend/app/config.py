@@ -66,6 +66,8 @@ class Settings(BaseSettings):
     EXPRESS_SKIP_CLAUDE_WHEN_LESS_FEAR: bool = True
     # Hard cap: max Claude calls the express lane may make per 60-second window.
     EXPRESS_MAX_CLAUDE_PER_MINUTE: int = 1
+    # Hard cap: max Claude calls the express lane may make per hour. 0 = unlimited.
+    EXPRESS_MAX_CLAUDE_PER_HOUR: int = 4
     # Per-symbol express Claude cooldown (minutes) — don't re-call Claude for the
     # same symbol within this window even if it stays hot.  0 = disabled.
     EXPRESS_CLAUDE_SYMBOL_COOLDOWN_MIN: int = 15

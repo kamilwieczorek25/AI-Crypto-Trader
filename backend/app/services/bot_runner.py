@@ -2497,22 +2497,47 @@ class BotRunner:
                         )
                         _skip_claude = True
 
-            # Hard per-minute rate cap even when Claude is enabled
+            # Hard rate caps — checked and reserved atomically before any await
+            # so concurrent express tasks cannot all pass the same check together.
             if not _skip_claude:
                 _now = datetime.now(timezone.utc)
-                # Purge timestamps older than 60 s
+                # Purge timestamps older than 60 s (per-minute window)
                 while self._express_claude_calls and \
                       (_now - self._express_claude_calls[0]).total_seconds() > 60:
                     self._express_claude_calls.popleft()
                 if len(self._express_claude_calls) >= settings.EXPRESS_MAX_CLAUDE_PER_MINUTE:
                     logger.info(
-                        "Express lane: Claude rate cap hit (%d/%d per min) — "
+                        "Express lane: Claude per-minute cap hit (%d/%d) — "
                         "skipping Claude for %s",
                         len(self._express_claude_calls),
                         settings.EXPRESS_MAX_CLAUDE_PER_MINUTE,
                         symbol,
                     )
                     _skip_claude = True
+
+            if not _skip_claude and settings.EXPRESS_MAX_CLAUDE_PER_HOUR > 0:
+                _now = datetime.now(timezone.utc)
+                # Purge timestamps older than 3600 s (hourly window)
+                while self._express_claude_calls and \
+                      (_now - self._express_claude_calls[0]).total_seconds() > 3600:
+                    self._express_claude_calls.popleft()
+                _hour_calls = len(self._express_claude_calls)
+                if _hour_calls >= settings.EXPRESS_MAX_CLAUDE_PER_HOUR:
+                    logger.info(
+                        "Express lane: Claude hourly cap hit (%d/%d) — "
+                        "skipping Claude for %s",
+                        _hour_calls,
+                        settings.EXPRESS_MAX_CLAUDE_PER_HOUR,
+                        symbol,
+                    )
+                    _skip_claude = True
+
+            if not _skip_claude:
+                # Reserve the slot NOW — before the await — so other concurrent
+                # express tasks see the updated count and don't bypass the cap.
+                _now = datetime.now(timezone.utc)
+                self._express_claude_calls.append(_now)
+                self._express_claude_by_symbol[symbol] = _now
 
             if _skip_claude:
                 # Build decision directly from quant candidate — no API call needed
@@ -2545,9 +2570,6 @@ class BotRunner:
                     decision, _ = await claude_engine.call_claude(
                         prompt, use_haiku=True, validation_mode=True
                     )
-                    _now_expr = datetime.now(timezone.utc)
-                    self._express_claude_calls.append(_now_expr)
-                    self._express_claude_by_symbol[symbol] = _now_expr
                 except Exception as exc:
                     logger.warning("Express lane: Claude validation failed: %s", exc)
                     return
