@@ -83,6 +83,9 @@ class TradeExecutor:
             age_hours = (now - order.created_at).total_seconds() / 3600
             if age_hours > 24:
                 expired.append(sym)
+                # Return reserved cash for expired DCA order
+                self._portfolio.set_cash(self._portfolio.cash_usdt + order.usdt_amount)
+                logger.info("[DCA EXPIRED] %s: returning $%.2f reserved cash", sym, order.usdt_amount)
                 continue
 
             # Fill if price dipped to target
@@ -95,7 +98,13 @@ class TradeExecutor:
                 if order.usdt_amount > self._portfolio.cash_usdt:
                     logger.warning("DCA fill skipped: insufficient cash for %s", sym)
                     expired.append(sym)
+                    # Return whatever was reserved (cash may have been lost to sync)
+                    self._portfolio.set_cash(self._portfolio.cash_usdt + order.usdt_amount)
                     continue
+
+                # Cash was reserved at DCA creation — return it so open_position's
+                # own deduction (qty*price + fee) doesn't double-count.
+                self._portfolio.set_cash(self._portfolio.cash_usdt + order.usdt_amount)
 
                 await self._portfolio.open_position(
                     db, sym, quantity, price,
@@ -259,8 +268,11 @@ class TradeExecutor:
                     take_profit_price=take_profit_price,
                     decision_id=decision_id,
                 )
+                # Reserve second-tranche cash immediately so other BUY trades
+                # can't spend it before the DCA limit triggers.
+                self._portfolio.set_cash(self._portfolio.cash_usdt - second_usdt)
                 logger.info(
-                    "[DCA] %s: tranche1=$%.2f now, tranche2=$%.2f pending @ $%.6f (-%s%%)",
+                    "[DCA] %s: tranche1=$%.2f now, tranche2=$%.2f reserved pending @ $%.6f (-%s%%)",
                     decision.symbol, first_usdt, second_usdt, dca_target_price,
                     settings.DCA_DIP_PCT,
                 )
@@ -346,10 +358,14 @@ class TradeExecutor:
             if price <= 0:
                 logger.error("Cannot get price for %s — real trade skipped", decision.symbol)
                 return None
-            quantity = usdt_amount / price
+            # Deduct fee before sizing so order doesn't overspend available cash
+            usdt_after_fee = usdt_amount * (1 - _FEE_RATE)
+            quantity = usdt_after_fee / price
 
             order = await exchange.create_market_buy_order(decision.symbol, quantity)
             fill_price = float(order.get("average") or order.get("price") or price)
+            # Use exchange-reported fill quantity as authoritative (handles partial fills)
+            quantity = float(order.get("filled", quantity))
             fee_usdt = _extract_fee(order, usdt_amount)
             stop_loss_price = fill_price * (1 - decision.stop_loss_pct / 100)
             take_profit_price = fill_price * (1 + decision.take_profit_pct / 100)

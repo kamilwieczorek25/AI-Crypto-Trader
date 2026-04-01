@@ -459,6 +459,7 @@ def build_validation_prompt(
     btc_anchor: "dict | None" = None,
     correlation_info: "dict | None" = None,
     market_intel: "dict | None" = None,
+    ml_signals: "dict | None" = None,
 ) -> str:
     """Build a compact validation prompt for Claude to approve/reject pre-scored candidates.
 
@@ -583,6 +584,26 @@ def build_validation_prompt(
         ls = ls_map.get(c.symbol)
         if ls:
             lines.append(f"  L/S: ratio={ls['ratio']:.2f} long={ls['long_pct']}% ({ls['signal']})")
+
+        # ML ensemble signals for this symbol (GPU models)
+        _ml = (ml_signals or {}).get(c.symbol, {})
+        if _ml:
+            _ens = _ml.get("ensemble", {})
+            _mtf = _ml.get("mtf", {})
+            _anom = _ml.get("anomaly", {})
+            _parts = []
+            if _ens:
+                _parts.append(
+                    f"ensemble={_ens.get('signal', '?')}"
+                    f"(conf={_ens.get('confidence', 0):.2f}"
+                    f" agree={_ens.get('agreement', 0):.2f})"
+                )
+            if _mtf:
+                _parts.append(f"MTF={_mtf.get('signal', '?')}")
+            if _anom.get("is_anomaly"):
+                _parts.append(f"ANOMALY(score={_anom.get('anomaly_score', 0):.2f})")
+            if _parts:
+                lines.append(f"  ML: {' '.join(_parts)}")
 
     lines.append(
         f"\nApprove the best candidate, or HOLD if all have disqualifying risks."

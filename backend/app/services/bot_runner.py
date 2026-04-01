@@ -1100,6 +1100,7 @@ class BotRunner:
                     btc_anchor=btc_anchor,
                     correlation_info=correlation_info,
                     market_intel=market_intel,
+                    ml_signals=ml_signals,
                 )
 
                 # 6a. Model tier: Haiku for BUY-only, Sonnet for SELL decisions (Claude fallback)
@@ -1227,6 +1228,15 @@ class BotRunner:
                         "Kelly sizing: %.1f%% -> %.1f%% (kelly=%.2f)",
                         original_pct, decision.quantity_pct, kelly_mult,
                     )
+
+            # 7b3. Final position size cap — dynamic sizing (win-streak 1.2×) or
+            #      rounding can push quantity_pct above MAX_POSITION_PCT.
+            if decision.action == "BUY" and decision.quantity_pct > settings.MAX_POSITION_PCT:
+                logger.info(
+                    "Post-sizing cap: %.1f%% -> %.1f%% (MAX_POSITION_PCT)",
+                    decision.quantity_pct, settings.MAX_POSITION_PCT,
+                )
+                decision.quantity_pct = settings.MAX_POSITION_PCT
 
             # 7c. Cooldown after stop-loss — reject BUY on symbols recently stopped out
             now = datetime.now(timezone.utc)
@@ -2033,10 +2043,10 @@ class BotRunner:
                 opened = opened.replace(tzinfo=timezone.utc)
             hold_h = float(np.clip((now - opened).total_seconds() / 3600.0 / 48.0, 0.0, 1.0))
 
-        ep   = _safe(getattr(pos, "entry_price", 0))
+        ep   = _safe(getattr(pos, "avg_entry_price", 0))
         cur  = _safe(getattr(pos, "current_price", ep))
-        sl   = _safe(getattr(pos, "stop_loss", 0))
-        tp   = _safe(getattr(pos, "take_profit", 0))
+        sl   = _safe(getattr(pos, "stop_loss_price", 0))
+        tp   = _safe(getattr(pos, "take_profit_price", 0))
         sl_d = float(np.clip(abs(cur - sl) / max(ep, 1e-9), 0.0, 1.0)) if sl else 0.0
         tp_d = float(np.clip(abs(tp - cur) / max(ep, 1e-9), 0.0, 1.0)) if tp else 0.0
 
@@ -2195,6 +2205,24 @@ class BotRunner:
                 "[PYRAMID] %s: added $%.2f (%.6f qty) @ $%.6f (P&L=+%.1f%%, score=%.0f)",
                 sym, add_usdt, qty, fill_price, pos.pnl_pct, result["score"],
             )
+            # Record Trade row for audit trail (pyramid buys were invisible before)
+            from app.models.trade import Trade as _Trade
+            _pyr_trade = _Trade(
+                symbol=sym,
+                direction="BUY",
+                mode="demo" if settings.is_demo else "real",
+                quantity=qty,
+                price=fill_price,
+                quantity_pct=0,
+                stop_loss_pct=0,
+                take_profit_pct=0,
+                pnl_usdt=None,
+                pnl_pct=None,
+                fee_usdt=fee,
+                notes=f"pyramid add (P&L=+{pos.pnl_pct:.1f}%, score={result['score']:.0f})",
+            )
+            db.add(_pyr_trade)
+            await db.commit()
             await self._broadcast("TRADE_EXECUTED", {
                 "symbol": sym,
                 "direction": "BUY",
@@ -2480,6 +2508,7 @@ class BotRunner:
                 btc_anchor=btc_anchor,
                 correlation_info={},
                 market_intel=intel,
+                ml_signals={},
             )
             # ── 8a. Decide whether to call Claude at all ──────────────────
             # With LESS_FEAR=True we override Claude's HOLD anyway, so calling
