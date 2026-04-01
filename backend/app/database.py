@@ -53,6 +53,7 @@ async def _apply_migrations() -> None:
         ("positions", "source", "VARCHAR(10) DEFAULT 'bot'"),
         ("positions", "tp_activated", "INTEGER DEFAULT 0"),
         ("positions", "tp_peak_price", "DOUBLE PRECISION DEFAULT 0.0" if not _is_sqlite else "REAL DEFAULT 0.0"),
+        ("claude_decisions", "model_provider", "VARCHAR(50)"),
     ]
     for table, column, col_def in migrations:
         try:
