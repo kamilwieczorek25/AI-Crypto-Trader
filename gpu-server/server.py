@@ -25,8 +25,11 @@ import logging
 import math
 import os
 import platform
+import shutil
+import subprocess
 import threading
 import time
+import urllib.request
 from pathlib import Path
 
 import numpy as np
@@ -917,6 +920,107 @@ async def auth_middleware(request, call_next):
     return await call_next(request)
 
 
+# ── Ollama / local LLM management ─────────────────────────────────────────────
+
+# Model to serve for trade decisions.
+# On GPU: qwen2.5:14b (~9.4 GB VRAM) — best quality.
+# On CPU: qwen2.5:7b (~4.1 GB RAM)  — much faster without GPU.
+_HAS_GPU = torch.cuda.is_available()
+_OLLAMA_MODEL = os.environ.get(
+    "LOCAL_LLM_MODEL",
+    "qwen2.5:14b" if _HAS_GPU else "qwen2.5:7b",
+)
+_OLLAMA_PORT  = int(os.environ.get("OLLAMA_PORT", "11434"))
+_ollama_proc: subprocess.Popen | None = None
+
+
+def _ollama_reachable() -> bool:
+    """Return True if Ollama API is already listening."""
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{_OLLAMA_PORT}/api/tags", timeout=3
+        ):
+            return True
+    except Exception:
+        return False
+
+
+def _pull_model_bg() -> None:
+    """Pull the LLM model in a background thread (non-blocking at startup)."""
+    # Wait for ollama serve to be ready
+    for _ in range(30):
+        if _ollama_reachable():
+            break
+        time.sleep(2)
+    else:
+        logger.warning("Ollama: serve did not become ready — skipping model pull")
+        return
+
+    # Check if model already present
+    try:
+        result = subprocess.run(
+            ["ollama", "list"], capture_output=True, text=True, timeout=10
+        )
+        if _OLLAMA_MODEL.split(":")[0] in result.stdout:
+            logger.info("Ollama: model '%s' already present", _OLLAMA_MODEL)
+            return
+    except Exception:
+        pass
+
+    logger.info(
+        "Ollama: pulling '%s' — this may take several minutes…", _OLLAMA_MODEL
+    )
+    try:
+        subprocess.run(
+            ["ollama", "pull", _OLLAMA_MODEL],
+            timeout=3600,  # up to 1 h for large models
+            check=True,
+        )
+        logger.info("Ollama: model '%s' ready", _OLLAMA_MODEL)
+    except subprocess.CalledProcessError as exc:
+        logger.warning("Ollama: model pull failed: %s", exc)
+    except subprocess.TimeoutExpired:
+        logger.warning("Ollama: model pull timed out after 1 hour")
+
+
+def _start_ollama() -> None:
+    """Start `ollama serve` as a background subprocess if not already running.
+
+    Safe to call even if Ollama is not installed — logs a warning and returns.
+    Falls back gracefully: the trading bot will use Claude if Ollama is absent.
+    """
+    global _ollama_proc
+
+    if not shutil.which("ollama"):
+        logger.warning(
+            "Ollama not found in PATH — local LLM disabled.\n"
+            "  Install: curl -fsSL https://ollama.com/install.sh | sh\n"
+            "  Then restart server.py to enable local LLM trade decisions."
+        )
+        return
+
+    if _ollama_reachable():
+        logger.info(
+            "Ollama already running on port %d — skipping start", _OLLAMA_PORT
+        )
+    else:
+        env = {**os.environ, "OLLAMA_HOST": f"0.0.0.0:{_OLLAMA_PORT}"}
+        _ollama_proc = subprocess.Popen(
+            ["ollama", "serve"],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        logger.info(
+            "Ollama: started (pid=%d, port=%d, model=%s, gpu=%s)",
+            _ollama_proc.pid, _OLLAMA_PORT, _OLLAMA_MODEL,
+            torch.cuda.get_device_name(0) if _HAS_GPU else "CPU",
+        )
+
+    # Pull model in background — server continues booting, Claude is fallback
+    threading.Thread(target=_pull_model_bg, daemon=True, name="ollama-pull").start()
+
+
 @app.on_event("startup")
 async def startup():
     _load_models()
@@ -925,6 +1029,8 @@ async def startup():
     _init_sentiment_anchors()
     # Start continuous background training loop
     asyncio.create_task(_background_training_loop())
+    # Start Ollama LLM server (non-blocking — Claude fallback active during pull)
+    threading.Thread(target=_start_ollama, daemon=True, name="ollama-start").start()
 
 
 @app.get("/health")
@@ -2328,3 +2434,6 @@ if __name__ == "__main__":
         uvicorn.run(app, host="0.0.0.0", port=port)
     finally:
         _allow_sleep()
+        if _ollama_proc and _ollama_proc.poll() is None:
+            logger.info("Stopping Ollama subprocess (pid=%d)…", _ollama_proc.pid)
+            _ollama_proc.terminate()

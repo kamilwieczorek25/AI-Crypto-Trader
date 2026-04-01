@@ -34,4 +34,5 @@ class ClaudeDecision(Base):
 
     executed: Mapped[bool] = mapped_column(Boolean, default=False)
     risk_profile: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    model_provider: Mapped[str | None] = mapped_column(String(50), nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)

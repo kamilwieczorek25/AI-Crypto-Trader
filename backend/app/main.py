@@ -149,6 +149,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         else:
             _log.warning("GPU_SERVER_URL is set but server is unreachable — ML will run on local CPU")
 
+    # Check Ollama / local LLM (pull model if not yet downloaded)
+    if settings.USE_LOCAL_LLM:
+        from app.services.local_llm_engine import check_and_pull_model
+        asyncio.create_task(check_and_pull_model(), name="ollama_model_pull")
+
     # Start fast local scanner (background, zero API cost)
     from app.services.fast_scanner import fast_scanner
     asyncio.create_task(fast_scanner.start(), name="fast_scanner_start")

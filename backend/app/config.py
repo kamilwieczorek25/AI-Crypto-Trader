@@ -191,6 +191,17 @@ class Settings(BaseSettings):
     # Independent of MIN_VOLUME_USDT so USDC pairs with lower liquidity still get caught.
     GAINER_MIN_VOLUME_USDT: float = 50_000.0
 
+    # ── Local LLM (Ollama) ────────────────────────────────────────────
+    # When USE_LOCAL_LLM=True the bot prefers Ollama on the GPU VM for
+    # trade validation and falls back to Claude if Ollama is unavailable.
+    # LOCAL_LLM_URL: leave blank to auto-derive from GPU_SERVER_URL
+    #   (same host, port 11434).  Set explicitly to override.
+    USE_LOCAL_LLM: bool = True
+    LOCAL_LLM_URL: str = ""              # blank = derive from GPU_SERVER_URL
+    LOCAL_LLM_MODEL: str = "qwen2.5:14b"
+    # GPU inference: ~5–15 s.  CPU-only (7B): ~60–120 s.  CPU-only (14B): ~180 s.
+    LOCAL_LLM_TIMEOUT: int = 120         # seconds per inference call
+
     # ── Remote GPU server (optional) ─────────────────────────────────
     # URL of the GPU inference server (e.g. http://192.168.1.50:9090)
     # When set, LSTM/RL training and prediction are offloaded to that machine.

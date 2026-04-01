@@ -13,7 +13,7 @@ from app.database import AsyncSessionLocal
 from app.models.decision import ClaudeDecision
 from app.schemas.dashboard import BotStatusData
 from app.schemas.decision import TradeDecision
-from app.services import claude_engine, news
+from app.services import claude_engine, local_llm_engine, news
 from app.services.discord import send_trade_notification, send_alert
 from app.services.fast_scanner import fast_scanner
 from app.services.quant_scorer import rank_symbols
@@ -1102,22 +1102,42 @@ class BotRunner:
                     market_intel=market_intel,
                 )
 
-                # 6a. Model tier: Haiku for BUY-only, Sonnet for SELL decisions
+                # 6a. Model tier: Haiku for BUY-only, Sonnet for SELL decisions (Claude fallback)
                 use_haiku = (
                     settings.USE_HAIKU_FOR_HOLD
                     and not _has_sell
                 )
+                _claude_tier = "haiku" if use_haiku else "sonnet"
 
-                tier_label = "haiku" if use_haiku else "sonnet"
-                logger.info("Calling Claude [%s] for validation...", tier_label)
+                model_provider = "unknown"
                 try:
-                    decision, raw_response = await claude_engine.call_claude(
-                        prompt, use_haiku=use_haiku, validation_mode=True,
-                    )
-                    # Record timestamp for hourly budget tracking
-                    self._main_claude_calls.append(datetime.now(timezone.utc))
+                    if settings.USE_LOCAL_LLM and local_llm_engine.is_available():
+                        logger.info("Calling LocalLLM [%s] for validation...", settings.LOCAL_LLM_MODEL)
+                        try:
+                            decision, raw_response = await local_llm_engine.call_local_llm(
+                                prompt, validation_mode=True,
+                            )
+                            model_provider = settings.LOCAL_LLM_MODEL
+                        except local_llm_engine.LLMUnavailableError as llm_err:
+                            logger.warning(
+                                "LocalLLM unavailable (%s) — falling back to Claude [%s]",
+                                llm_err, _claude_tier,
+                            )
+                            decision, raw_response = await claude_engine.call_claude(
+                                prompt, use_haiku=use_haiku, validation_mode=True,
+                            )
+                            model_provider = "claude-haiku-4-5-20251001" if use_haiku else "claude-sonnet-4-6"
+                            self._main_claude_calls.append(datetime.now(timezone.utc))
+                    else:
+                        logger.info("Calling Claude [%s] for validation...", _claude_tier)
+                        decision, raw_response = await claude_engine.call_claude(
+                            prompt, use_haiku=use_haiku, validation_mode=True,
+                        )
+                        model_provider = "claude-haiku-4-5-20251001" if use_haiku else "claude-sonnet-4-6"
+                        # Record timestamp for hourly budget tracking
+                        self._main_claude_calls.append(datetime.now(timezone.utc))
                 except Exception as exc:
-                    logger.error("Claude validation failed: %s", exc)
+                    logger.error("LLM validation failed: %s", exc)
                     raise
 
             # 7a. Override SL/TP with quant model values (Claude validates, not sets levels)
@@ -1243,6 +1263,7 @@ class BotRunner:
                 risk_factors=json.dumps(decision.risk_factors),
                 reasoning=decision.reasoning,
                 risk_profile=settings.RISK_PROFILE,
+                model_provider=model_provider,
                 executed=False,
             )
             db.add(db_decision)
