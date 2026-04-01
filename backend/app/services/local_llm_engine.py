@@ -266,6 +266,8 @@ async def check_and_pull_model() -> None:
     # Brief pause to let the GPU VM's Ollama process finish booting
     await asyncio.sleep(5)
 
+    logger.info("Ollama: checking %s/api/tags for model '%s'", url, model)
+
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(
@@ -273,42 +275,56 @@ async def check_and_pull_model() -> None:
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
                 if resp.status != 200:
-                    logger.warning("Ollama /api/tags returned %d — skipping model pull", resp.status)
+                    logger.warning("Ollama /api/tags returned HTTP %d — Claude fallback active", resp.status)
                     return
                 tags_data = await resp.json()
 
-        pulled_names: list[str] = [m["name"] for m in tags_data.get("models", [])]
-        # Ollama stores names as "qwen2.5:14b" — match by prefix in case of digest suffix
-        already_pulled = any(
-            name == model or name.startswith(model + ":") or name.startswith(model.split(":")[0])
-            for name in pulled_names
+    except aiohttp.ClientConnectorError as exc:
+        logger.warning(
+            "Ollama unreachable at %s — not installed or not yet started "
+            "(Claude fallback active). Detail: %r", url, exc,
         )
+        return
+    except asyncio.TimeoutError:
+        logger.warning("Ollama /api/tags timed out at %s — Claude fallback active", url)
+        return
+    except Exception as exc:
+        logger.warning("Ollama /api/tags unexpected error (%s: %r) — Claude fallback active",
+                       type(exc).__name__, exc)
+        return
 
-        if already_pulled:
-            logger.info("Ollama: model '%s' already present — no pull needed", model)
-            # Mark as available immediately
-            global _available, _available_checked_at
-            _available = True
-            _available_checked_at = time.monotonic()
-            return
+    pulled_names: list[str] = [m["name"] for m in tags_data.get("models", [])]
+    # Ollama stores names as "qwen2.5:14b" — match by prefix in case of digest suffix
+    already_pulled = any(
+        name == model or name.startswith(model + ":") or name.startswith(model.split(":")[0])
+        for name in pulled_names
+    )
 
-        logger.info(
-            "Ollama: model '%s' not found — starting pull (~8 GB, may take several minutes)…",
-            model,
-        )
+    if already_pulled:
+        logger.info("Ollama: model '%s' already present — no pull needed", model)
+        global _available, _available_checked_at
+        _available = True
+        _available_checked_at = time.monotonic()
+        return
+
+    logger.info(
+        "Ollama: model '%s' not found (available: %s) — starting pull (~8 GB)…",
+        model, pulled_names or "none",
+    )
+    try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 f"{url}/api/pull",
                 json={"name": model, "stream": False},
-                timeout=aiohttp.ClientTimeout(total=3600),  # up to 1 h for large models
+                timeout=aiohttp.ClientTimeout(total=3600),
             ) as resp:
                 pull_data = await resp.json()
                 status = pull_data.get("status", "unknown")
                 logger.info("Ollama pull '%s' completed — status: %s", model, status)
 
-        # Mark as available after successful pull
         _available = True
         _available_checked_at = time.monotonic()
 
     except Exception as exc:
-        logger.warning("Ollama model pull failed (non-fatal, Claude fallback active): %s", exc)
+        logger.warning("Ollama pull '%s' failed (%s: %r) — Claude fallback active",
+                       model, type(exc).__name__, exc)
