@@ -62,6 +62,9 @@ class BotRunner:
         # Express lane Claude rate-limiter: timestamps of recent Haiku calls
         from collections import deque as _deque
         self._express_claude_calls: _deque = _deque()   # deque of call datetimes
+        # Per-symbol express Claude cooldown: don't re-call Claude for same symbol
+        # within EXPRESS_CLAUDE_SYMBOL_COOLDOWN_MIN minutes
+        self._express_claude_by_symbol: dict[str, datetime] = {}
         # Main-cycle Claude rate-limiter: timestamps within the last 3600 s
         self._main_claude_calls: _deque = _deque()      # deque of call datetimes
         # Circuit breaker: track peak portfolio value (set properly on start())
@@ -1014,6 +1017,18 @@ class BotRunner:
                         f"local models disagree — HOLD "
                         f"(gpu={_gpu_sig} conf={_gpu_conf:.2f} agree={_gpu_agree:.2f} "
                         f"mtf={_mtf_sig} anomaly={_is_anomaly})"
+                    )
+                elif (
+                    settings.SKIP_CLAUDE_ABOVE_SCORE > 0
+                    and top_cand.score >= settings.SKIP_CLAUDE_ABOVE_SCORE
+                ):
+                    # Tier 2: High-conviction bypass — score is high enough that
+                    # Claude would agree in >90% of cases.  Save the API call.
+                    _auto_execute = True
+                    _gate_reason  = (
+                        f"high-conviction score bypass (score={top_cand.score:.0f} "
+                        f">= {settings.SKIP_CLAUDE_ABOVE_SCORE:.0f}) — "
+                        f"all local models agree, executing from quant"
                     )
                 else:
                     # Local models agree — check hourly Claude budget
@@ -2434,6 +2449,33 @@ class BotRunner:
                 or (settings.LESS_FEAR and settings.EXPRESS_SKIP_CLAUDE_WHEN_LESS_FEAR)
             )
 
+            # Tier 2: High-conviction score bypass — same logic as main cycle.
+            # When express_score is very high Claude would agree in >90% of cases.
+            if not _skip_claude and settings.SKIP_CLAUDE_ABOVE_SCORE > 0 \
+                    and express_score >= settings.SKIP_CLAUDE_ABOVE_SCORE:
+                logger.info(
+                    "Express lane: score bypass (score=%.0f >= %.0f) — "
+                    "skipping Claude for %s",
+                    express_score, settings.SKIP_CLAUDE_ABOVE_SCORE, symbol,
+                )
+                _skip_claude = True
+
+            # Per-symbol cooldown: don't re-call Claude for the same symbol
+            # within EXPRESS_CLAUDE_SYMBOL_COOLDOWN_MIN minutes.
+            if not _skip_claude and settings.EXPRESS_CLAUDE_SYMBOL_COOLDOWN_MIN > 0:
+                _last_sym_call = self._express_claude_by_symbol.get(symbol)
+                if _last_sym_call is not None:
+                    _elapsed_sym = (datetime.now(timezone.utc) - _last_sym_call).total_seconds()
+                    if _elapsed_sym < settings.EXPRESS_CLAUDE_SYMBOL_COOLDOWN_MIN * 60:
+                        logger.info(
+                            "Express lane: per-symbol Claude cooldown (%.0fs / %dm) — "
+                            "skipping Claude for %s",
+                            _elapsed_sym,
+                            settings.EXPRESS_CLAUDE_SYMBOL_COOLDOWN_MIN,
+                            symbol,
+                        )
+                        _skip_claude = True
+
             # Hard per-minute rate cap even when Claude is enabled
             if not _skip_claude:
                 _now = datetime.now(timezone.utc)
@@ -2466,7 +2508,7 @@ class BotRunner:
                     primary_signals=candidate.signals,
                     risk_factors=[],
                 )
-                _skip_reason = "FORCE_BUY" if force_buy else "LESS_FEAR/rate-cap"
+                _skip_reason = "FORCE_BUY" if force_buy else "LESS_FEAR/score-bypass/cooldown/rate-cap"
                 logger.info(
                     "Express lane: %s — Claude skipped (%s), "
                     "executing on quant score %.0f",
@@ -2482,7 +2524,9 @@ class BotRunner:
                     decision, _ = await claude_engine.call_claude(
                         prompt, use_haiku=True, validation_mode=True
                     )
-                    self._express_claude_calls.append(datetime.now(timezone.utc))
+                    _now_expr = datetime.now(timezone.utc)
+                    self._express_claude_calls.append(_now_expr)
+                    self._express_claude_by_symbol[symbol] = _now_expr
                 except Exception as exc:
                     logger.warning("Express lane: Claude validation failed: %s", exc)
                     return

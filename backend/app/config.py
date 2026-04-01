@@ -65,7 +65,10 @@ class Settings(BaseSettings):
     # With LESS_FEAR on we override Claude's HOLD anyway, so the call is pure waste.
     EXPRESS_SKIP_CLAUDE_WHEN_LESS_FEAR: bool = True
     # Hard cap: max Claude calls the express lane may make per 60-second window.
-    EXPRESS_MAX_CLAUDE_PER_MINUTE: int = 3
+    EXPRESS_MAX_CLAUDE_PER_MINUTE: int = 1
+    # Per-symbol express Claude cooldown (minutes) — don't re-call Claude for the
+    # same symbol within this window even if it stays hot.  0 = disabled.
+    EXPRESS_CLAUDE_SYMBOL_COOLDOWN_MIN: int = 15
 
     # Main-cycle Claude bypass — let GPU model take the decision directly.
     # Tier 1: LESS_FEAR bypass — if LESS_FEAR=True and we'd override Claude's HOLD
@@ -79,7 +82,7 @@ class Settings(BaseSettings):
     SKIP_CLAUDE_GPU_MIN_CONFIDENCE: float = 0.65
     # Tier 3: Hard hourly cap on main-cycle Claude calls (0 = unlimited).
     #   Even if tiers 1+2 miss, this prevents a call storm in active markets.
-    MAIN_CYCLE_MAX_CLAUDE_PER_HOUR: int = 4
+    MAIN_CYCLE_MAX_CLAUDE_PER_HOUR: int = 2
 
     # ── Quant scorer ────────────────────────────────────────────────────────
     # Minimum composite score (0-100) to consider a trade candidate
