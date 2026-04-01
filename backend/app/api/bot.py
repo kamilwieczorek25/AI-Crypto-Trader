@@ -113,6 +113,7 @@ async def bot_status() -> dict:
         "market_regime": bot_runner._last_regime,
         "circuit_breaker_tripped": bot_runner._circuit_breaker_tripped,
         "less_fear": settings.LESS_FEAR,
+        "lock_risk_profile": settings.LOCK_RISK_PROFILE,
     }
 
 
@@ -194,6 +195,32 @@ async def set_less_fear(req: LessFearRequest) -> dict:
         "less_fear": settings.LESS_FEAR,
     })
     return {"enabled": settings.LESS_FEAR}
+
+
+class LockRiskProfileRequest(BaseModel):
+    enabled: bool
+
+
+@router.get("/lock-risk-profile")
+async def get_lock_risk_profile() -> dict:
+    return {"enabled": settings.LOCK_RISK_PROFILE}
+
+
+@router.post("/lock-risk-profile")
+async def set_lock_risk_profile(req: LockRiskProfileRequest) -> dict:
+    settings.LOCK_RISK_PROFILE = req.enabled
+    await save_bot_state("lock_risk_profile", str(req.enabled).lower())
+    logger.info("Lock risk profile %s", "ENABLED" if req.enabled else "DISABLED")
+    from app.services.claude_engine import get_profile_info
+    await bot_runner._broadcast("BOT_STATUS", {
+        "running": bot_runner.is_running,
+        "mode": settings.MODE,
+        "risk_profile": get_profile_info(),
+        "cycle_count": bot_runner._cycle_count,
+        "less_fear": settings.LESS_FEAR,
+        "lock_risk_profile": settings.LOCK_RISK_PROFILE,
+    })
+    return {"enabled": settings.LOCK_RISK_PROFILE}
 
 
 class AdoptRequest(BaseModel):

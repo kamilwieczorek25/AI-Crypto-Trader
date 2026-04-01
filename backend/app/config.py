@@ -48,6 +48,10 @@ class Settings(BaseSettings):
     # When enabled: lowers quant threshold, disables auto-risk downgrade, forces Claude to approve high-score candidates
     LESS_FEAR: bool = False
 
+    # Lock risk profile: prevent AUTO_RISK_PROFILE from auto-switching the profile.
+    # The manually selected profile is kept regardless of market regime.
+    LOCK_RISK_PROFILE: bool = False
+
     # Max drawdown circuit breaker (% of initial balance — pauses bot if exceeded)
     MAX_DRAWDOWN_PCT: float = 15.0
 

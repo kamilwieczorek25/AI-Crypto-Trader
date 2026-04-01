@@ -757,6 +757,10 @@ def auto_adjust_risk_profile(regime: str) -> str | None:
     if not settings.AUTO_RISK_PROFILE:
         return None
 
+    # User has pinned the profile — no auto-switch
+    if settings.LOCK_RISK_PROFILE:
+        return None
+
     # Less-fear mode: prevent auto-downgrade to conservative
     if settings.LESS_FEAR:
         return None

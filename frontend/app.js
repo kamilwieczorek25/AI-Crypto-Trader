@@ -373,6 +373,11 @@ function renderBotStatus(s) {
     syncLessFearButton(s.less_fear);
   }
 
+  // Lock risk profile sync
+  if (s.lock_risk_profile !== undefined) {
+    syncLockProfileButton(s.lock_risk_profile);
+  }
+
   // Background processes panel
   if (s.bg_processes) {
     renderBgProcesses(s.bg_processes, s.running);
@@ -607,6 +612,46 @@ async function loadLessFear() {
     if (resp.ok) {
       const data = await resp.json();
       syncLessFearButton(data.enabled);
+    }
+  } catch (_) {}
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Lock Risk Profile Toggle
+   ═══════════════════════════════════════════════════════════════ */
+let lockProfileActive = false;
+
+function syncLockProfileButton(enabled) {
+  lockProfileActive = enabled;
+  const btn = $('btn-lock-profile');
+  if (!btn) return;
+  if (enabled) {
+    btn.classList.add('active');
+    btn.textContent = '🔒 Profile Locked';
+  } else {
+    btn.classList.remove('active');
+    btn.textContent = '🔒 Lock Profile';
+  }
+}
+
+async function toggleLockRiskProfile() {
+  try {
+    const resp = await fetch(`${API_BASE}/api/bot/lock-risk-profile`, {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({enabled: !lockProfileActive}),
+    });
+    if (!resp.ok) { const e = await resp.json(); alert(e.detail || 'Failed'); return; }
+    const data = await resp.json();
+    syncLockProfileButton(data.enabled);
+  } catch (e) { alert('Error: ' + e.message); }
+}
+
+async function loadLockRiskProfile() {
+  try {
+    const resp = await fetch(`${API_BASE}/api/bot/lock-risk-profile`);
+    if (resp.ok) {
+      const data = await resp.json();
+      syncLockProfileButton(data.enabled);
     }
   } catch (_) {}
 }
@@ -1421,6 +1466,7 @@ function updateFooterClock() {
     loadExchangeAccount(),
     loadChartSymbols(),
     loadLessFear(),
+    loadLockRiskProfile(),
     loadGpuStatus(),
   ]);
 

@@ -42,6 +42,8 @@
       <div class="header-sep"></div>
       <button id="btn-less-fear" class="btn-fear" onclick="toggleLessFear()"
         data-tip="<b>😱 Less Fear</b><br>Reduces Claude's conservative bias in two ways:<br>① Auto-approves BUY when quant score ≥ 45 (skips Claude on main cycle)<br>② Skips Claude entirely in the express lane — saves API cost<br>③ Blocks auto-downgrade to Conservative profile<br><span class='tip-warn'>Use in uptrends. Disable in downtrends/choppy markets.</span>">😱 Less Fear</button>
+      <button id="btn-lock-profile" class="btn-fear" onclick="toggleLockRiskProfile()"
+        data-tip="<b>🔒 Lock Profile</b><br>Prevents AUTO_RISK_PROFILE from switching the risk profile automatically.<br>Your current profile is kept regardless of market regime changes.<br><span class='tip-warn'>Enable when you want to stay in Aggressive/Fast mode even if the bot detects a downtrend.</span>">🔒 Lock Profile</button>
     </div>
     <div class="header-right">
       <div class="mode-group">

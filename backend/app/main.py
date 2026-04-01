@@ -128,6 +128,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             "ENABLED" if settings.LESS_FEAR else "disabled",
             settings.LESS_FEAR, db_val,
         )
+    if "lock_risk_profile" in state:
+        db_val = state["lock_risk_profile"].lower() == "true"
+        settings.LOCK_RISK_PROFILE = db_val or settings.LOCK_RISK_PROFILE
+        _log.info(
+            "Lock risk profile: %s (env=%s db=%s)",
+            "ENABLED" if settings.LOCK_RISK_PROFILE else "disabled",
+            settings.LOCK_RISK_PROFILE, db_val,
+        )
 
     # Warn early if Anthropic key is missing
     if not settings.ANTHROPIC_API_KEY:
