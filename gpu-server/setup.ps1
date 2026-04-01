@@ -168,23 +168,18 @@ if (-not $allOk) {
     exit 1
 }
 
-# Detect GPU from the existing torch installation
-$torchInfo = & $VenvPy -c @"
-import torch
-cuda = torch.cuda.is_available()
-if cuda:
-    p = torch.cuda.get_device_properties(0)
-    vram = round((getattr(p,'total_memory',None) or getattr(p,'total_mem',0))/1e9, 1)
-    print(f'cuda=True gpu={torch.cuda.get_device_name(0)} vram={vram}GB ver={torch.__version__}')
-else:
-    print(f'cuda=False ver={torch.__version__}')
-"@ 2>&1
+# Detect GPU via nvidia-smi — reliable regardless of venv/torch state
+$HasGpu = $false
+try {
+    $smiOut = & nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>&1
+    if ($LASTEXITCODE -eq 0 -and $smiOut -match '\S') {
+        $HasGpu = $true
+        Write-Ok "GPU detected: $($smiOut.Trim())"
+    }
+} catch { }
 
-if ($torchInfo -match "cuda=True") {
-    $HasGpu = $true
-    Write-Ok "PyTorch: $torchInfo"
-} else {
-    Write-Warn "PyTorch: $torchInfo (CPU-only — Ollama will use smaller model)"
+if (-not $HasGpu) {
+    Write-Warn "nvidia-smi not found or returned no GPU — Ollama will use CPU model"
 }
 
 # ── Step 5 — Ollama ───────────────────────────────────────────────────────────
