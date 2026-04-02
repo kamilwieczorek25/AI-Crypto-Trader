@@ -1269,6 +1269,23 @@ class BotRunner:
                 decision.action = "HOLD"
                 decision.quantity_pct = 0.0
 
+            # 7e. Profile confidence gate — final safety net.
+            #     The LLM confidence checks use `validation_mode=True` which bypasses
+            #     their internal min_confidence gate, and then bot_runner overrides
+            #     confidence with the quant score.  This check catches low-confidence
+            #     BUY decisions that slip through all earlier gates.
+            if decision.action == "BUY":
+                from app.services.claude_engine import _get_profile
+                _profile = _get_profile()
+                if decision.confidence < _profile.min_confidence:
+                    logger.info(
+                        "Confidence gate: %.2f < profile min %.2f (%s) — overriding to HOLD for %s",
+                        decision.confidence, _profile.min_confidence,
+                        _profile.label, decision.symbol,
+                    )
+                    decision.action = "HOLD"
+                    decision.quantity_pct = 0.0
+
             # 8. Log decision to DB (executed=False)
             db_decision = ClaudeDecision(
                 raw_prompt=prompt[:50_000],  # safety truncation
@@ -2683,6 +2700,20 @@ class BotRunner:
             decision.take_profit_pct = candidate.take_profit_pct
             decision.quantity_pct   = min(decision.quantity_pct, candidate.quantity_pct)
             decision.confidence     = candidate.score / 100.0
+
+            # Profile confidence gate — same as main cycle step 7e.
+            # Exempts force_buy (user explicitly requested the trade).
+            from app.services.claude_engine import _get_profile
+            _profile = _get_profile()
+            if not force_buy and decision.action == "BUY" and decision.confidence < _profile.min_confidence:
+                logger.info(
+                    "Express lane: confidence gate — %.2f < profile min %.2f (%s) — "
+                    "rejecting %s",
+                    decision.confidence, _profile.min_confidence,
+                    _profile.label, symbol,
+                )
+                self._express_cooldown[symbol] = datetime.now(timezone.utc) + timedelta(minutes=5)
+                return
 
             # Cooldown guard
             if symbol in self._sl_cooldown:
