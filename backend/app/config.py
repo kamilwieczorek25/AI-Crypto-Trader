@@ -191,6 +191,13 @@ class Settings(BaseSettings):
     SCANNER_HOT_LIST_SIZE: int = 10
     # Minimum scanner score (0-100) to qualify as "hot"
     SCANNER_MIN_SCORE: float = 15.0
+    # Maximum 24h price change (%) to consider a coin. Tokens already up >X%
+    # are likely near the top of a pump — buying them is extremely risky.
+    # 0 = disabled.  Recommended: 50-100.
+    SCANNER_MAX_24H_PCT: float = 80.0
+    # Require positive short-term momentum for the scanner to flag a coin.
+    # When enabled, coins with falling price get score halved.
+    SCANNER_PREFER_UPTREND: bool = True
 
     # ── Gainer injection ─────────────────────────────────────────────────
     # Minimum 24h volume for a gainer to be injected into the main cycle.

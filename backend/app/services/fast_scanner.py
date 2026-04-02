@@ -185,6 +185,13 @@ class FastScanner:
             score = 0.0
             reasons: list[str] = []
 
+            # 0. Pump filter — skip tokens already up >MAX in 24h (buying the top)
+            if settings.SCANNER_MAX_24H_PCT > 0 and pct_24h > settings.SCANNER_MAX_24H_PCT:
+                continue  # likely near peak of a parabolic pump
+
+            # Track whether short-term direction is negative (used for penalty)
+            _is_falling = False
+
             # 1. Short-term momentum from our own ticker diff (~60s delta)
             pct_short = 0.0
             if self._prev_tickers and sym in self._prev_tickers:
@@ -193,9 +200,14 @@ class FastScanner:
                     pct_short = (price - prev_p) / prev_p * 100
 
             if abs(pct_short) >= 1.0:
-                score += min(abs(pct_short) * 10, 30)
-                direction = "up" if pct_short > 0 else "down"
-                reasons.append(f"short_move_{direction}_{abs(pct_short):.1f}%")
+                if pct_short > 0:
+                    score += min(pct_short * 10, 30)
+                    reasons.append(f"short_move_up_{pct_short:.1f}%")
+                else:
+                    # Downward moves get reduced score — we're looking for BUY candidates
+                    score += min(abs(pct_short) * 3, 10)
+                    reasons.append(f"short_move_down_{abs(pct_short):.1f}%")
+                    _is_falling = True
 
             # 1b. Momentum acceleration — is speed of move increasing?
             accel = self._momentum_acceleration(sym)
@@ -203,13 +215,19 @@ class FastScanner:
                 score += min(accel * 15, 12)
                 reasons.append(f"accel_up_{accel:.2f}")
             elif accel < -0.3:
-                score += min(abs(accel) * 8, 8)  # downward accel = also notable
+                score += min(abs(accel) * 3, 5)  # downward accel = minor signal
                 reasons.append(f"accel_dn_{accel:.2f}")
+                _is_falling = True
 
-            # 2. 24h momentum — big movers (cap raised to 45 to catch explosive gainers)
-            if abs(pct_24h) >= 5:
-                score += min(abs(pct_24h) * 1.5, 45)
+            # 2. 24h momentum — reward gainers, penalize losers
+            if pct_24h >= 5:
+                score += min(pct_24h * 1.5, 45)
                 reasons.append(f"24h_{pct_24h:+.1f}%")
+            elif pct_24h <= -5:
+                # Tokens dumping get minimal score — we don't want to buy falling knives
+                score += min(abs(pct_24h) * 0.5, 10)
+                reasons.append(f"24h_{pct_24h:+.1f}%")
+                _is_falling = True
 
             # 3a. Volume Z-score — statistically unusual volume for THIS coin
             vol_zscore = self._vol_zscore(sym, vol)
@@ -294,6 +312,11 @@ class FastScanner:
                     if abs(net_flow) > whale_vol * 0.3:
                         score += 10
                         reasons.append(f"whale_bias_{flow_dir}")
+
+            # Penalise overall score when short-term direction is negative
+            if _is_falling and settings.SCANNER_PREFER_UPTREND:
+                score *= 0.5
+                reasons.append("penalty:falling")
 
             # Only keep if score is meaningful
             if score >= settings.SCANNER_MIN_SCORE:

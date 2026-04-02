@@ -2701,6 +2701,27 @@ class BotRunner:
             decision.quantity_pct   = min(decision.quantity_pct, candidate.quantity_pct)
             decision.confidence     = candidate.score / 100.0
 
+            # ── Fresh-price direction check ──────────────────────────────
+            # Minutes may have passed since OHLCV fetch. Get a real-time
+            # ticker and abort if price has dropped since our snapshot.
+            if not force_buy:
+                try:
+                    live_price = await self._market.get_price(symbol)
+                    if live_price and price > 0:
+                        drift_pct = (live_price - price) / price * 100
+                        if drift_pct < -2.0:
+                            logger.info(
+                                "Express lane: %s price dropped %.1f%% since snapshot "
+                                "(%.6f → %.6f) — aborting buy",
+                                symbol, drift_pct, price, live_price,
+                            )
+                            self._express_cooldown[symbol] = (
+                                datetime.now(timezone.utc) + timedelta(minutes=5)
+                            )
+                            return
+                except Exception as _price_err:
+                    logger.debug("Express lane: fresh price check failed: %s", _price_err)
+
             # Profile confidence gate — same as main cycle step 7e.
             # Exempts force_buy (user explicitly requested the trade).
             from app.services.claude_engine import _get_profile
