@@ -94,7 +94,9 @@ class PortfolioService:
         """
         from app.services.market_data import market_data_service
 
-        changes: dict[str, Any] = {"imported": [], "updated": [], "usdt_synced": False}
+        changes: dict[str, Any] = {
+            "imported": [], "updated": [], "removed": [], "usdt_synced": False,
+        }
 
         # 1. Fetch real balances
         try:
@@ -106,6 +108,15 @@ class PortfolioService:
         if not balances:
             logger.warning("Exchange sync: no balances returned (check API key permissions)")
             return changes
+
+        # Snapshot base assets that exist on the exchange BEFORE we mutate
+        # the balances dict (the stablecoin loop pops from it).  Used later
+        # to detect ghost positions — positions tracked locally that have
+        # been sold or transferred away on Binance.
+        live_assets: set[str] = {
+            asset for asset, info in balances.items()
+            if info.get("total", 0.0) > 0
+        }
 
         # 2. Sync cash balance (USDT + USDC + other stablecoins → treated as cash)
         _STABLECOINS = ("USDT", "USDC", "BUSD", "TUSD", "FDUSD", "DAI")
@@ -229,14 +240,51 @@ class PortfolioService:
 
         await db.commit()
 
+        # 4. Reconcile: remove ghost positions — anything we track locally
+        # whose base asset is no longer on the exchange (or has dropped to
+        # dust) was sold/transferred away outside the bot.  Clean it out so
+        # the dashboard and bot logic match reality.
+        from app.models.position import Position as PosModel
+        from sqlalchemy import delete
+        for sym in list(self._positions.keys()):
+            base = sym.split("/")[0]
+            # Skip stablecoin-quoted positions where the base happens to be
+            # one we treat as cash — shouldn't normally happen but be safe.
+            if base in _STABLECOINS:
+                continue
+            if base in live_assets:
+                continue
+            pos = self._positions.pop(sym, None)
+            if pos is None:
+                continue
+            try:
+                await db.execute(delete(PosModel).where(PosModel.symbol == sym))
+            except Exception as exc:
+                logger.warning("Ghost-close DB delete failed for %s: %s", sym, exc)
+            changes["removed"].append({
+                "symbol": sym,
+                "reason": "missing_on_exchange",
+                "qty": pos.quantity,
+                "source": pos.source,
+            })
+            logger.info(
+                "Exchange sync: ghost-closed %s (%.6f units, source=%s) — "
+                "no longer present on Binance",
+                sym, pos.quantity, pos.source,
+            )
+        if changes["removed"]:
+            await db.commit()
+
         # Update initial value to reflect full portfolio
         self._initial_value = self.total_value
 
         n_imp = len(changes["imported"])
         n_upd = len(changes["updated"])
+        n_rem = len(changes["removed"])
         logger.info(
-            "Exchange sync complete: USDT=$%.2f, %d imported, %d updated, %d total positions",
-            self._cash_usdt, n_imp, n_upd, len(self._positions),
+            "Exchange sync complete: USDT=$%.2f, %d imported, %d updated, "
+            "%d ghost-closed, %d total positions",
+            self._cash_usdt, n_imp, n_upd, n_rem, len(self._positions),
         )
         return changes
 

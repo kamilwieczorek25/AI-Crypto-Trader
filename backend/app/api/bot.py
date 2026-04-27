@@ -229,6 +229,40 @@ class AdoptRequest(BaseModel):
     tp_pct: float | None = None
 
 
+@router.post("/sync-portfolio")
+async def sync_portfolio(db: AsyncSession = Depends(get_db)) -> dict:
+    """Force an immediate exchange-balance sync (real mode only).
+
+    Reconciles local portfolio with Binance: imports new holdings, updates
+    quantities, and removes ghost positions that no longer exist on the
+    exchange (e.g. sold manually outside the bot).
+    """
+    from app.services.portfolio import portfolio_service
+
+    if settings.is_demo:
+        raise HTTPException(
+            status_code=400,
+            detail="Sync is only available in real mode (demo uses simulated portfolio).",
+        )
+    if not settings.BINANCE_API_KEY:
+        raise HTTPException(
+            status_code=400,
+            detail="BINANCE_API_KEY not configured \u2014 cannot sync.",
+        )
+
+    try:
+        result = await portfolio_service.sync_from_exchange(db)
+    except Exception as exc:
+        logger.exception("Manual portfolio sync failed")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    # Broadcast so the dashboard refreshes immediately
+    await bot_runner._broadcast(
+        "PORTFOLIO_UPDATE", portfolio_service.get_state().model_dump(),
+    )
+    return result
+
+
 @router.post("/adopt-positions")
 async def adopt_positions(
     req: AdoptRequest,

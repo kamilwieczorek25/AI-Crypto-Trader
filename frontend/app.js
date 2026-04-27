@@ -672,6 +672,30 @@ async function adoptPosition(symbol) {
   } catch (e) { alert('Error: ' + e.message); }
 }
 
+/* ─── Manual portfolio sync (real mode) ─── */
+async function syncPortfolio() {
+  if (!confirm('Sync portfolio with Binance now?\n\nImports new holdings, refreshes quantities, and removes positions sold outside the bot.')) return;
+  const btn = document.getElementById('btn-sync');
+  if (btn) { btn.disabled = true; btn.textContent = '⟳ Syncing...'; }
+  try {
+    const resp = await fetch(`${API_BASE}/api/bot/sync-portfolio`, { method: 'POST' });
+    const data = await resp.json();
+    if (!resp.ok) { alert(data.detail || 'Sync failed'); return; }
+    const imp = (data.imported || []).length;
+    const upd = (data.updated || []).length;
+    const rem = (data.removed || []).length;
+    const removedList = (data.removed || []).map(r => r.symbol).join(', ');
+    let msg = `Sync complete:\n  Imported: ${imp}\n  Updated:  ${upd}\n  Removed:  ${rem}`;
+    if (rem) msg += `\n\nGhost-closed: ${removedList}`;
+    alert(msg);
+    loadPortfolio();
+  } catch (e) {
+    alert('Sync error: ' + e.message);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '⟳ Sync'; }
+  }
+}
+
 /* ═══════════════════════════════════════════════════════════
    Price tick / Market update
    ═══════════════════════════════════════════════════════════ */

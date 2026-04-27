@@ -177,6 +177,7 @@ header {
 .btn-action:active { transform: translateY(0); }
 .btn-start { background: var(--green); color: #000; }
 .btn-stop { background: var(--red); color: #fff; }
+.btn-sync { background: var(--blue-dim); color: var(--blue); border: 1px solid #448aff44; }
 .btn-reset { background: var(--surface-2); color: var(--muted); border: 1px solid var(--border); }
 
 /* ═══════════════════════════════════════════════════════════
