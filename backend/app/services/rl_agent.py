@@ -42,6 +42,9 @@ STATE_SIZE  = 14        # matches GPU server DuelingDQN input size
 ACTION_SIZE = 3         # 0=HOLD, 1=BUY, 2=SELL
 ACTION_MAP  = {0: "HOLD", 1: "BUY", 2: "SELL"}
 ACTION_INV  = {"HOLD": 0, "BUY": 1, "SELL": 2}
+# Bump whenever the state vector or feature set changes meaning.
+# v2 = fix for rsi_14/vwap_dist_pct \u2192 rsi14/price_vs_vwap (Apr 2026).
+_SCHEMA_VERSION = 2
 
 
 # ── Neural network ────────────────────────────────────────────────────────────
@@ -129,6 +132,18 @@ class RLTradingAgent:
             return
         try:
             ckpt = torch.load(AGENT_PATH, map_location=self.device, weights_only=True)
+            # Schema version check — the bot_runner exit-state used buggy
+            # feature names (rsi_14/vwap_dist_pct) prior to v2; older
+            # checkpoints were trained on garbage features and must be
+            # discarded.  Bump _SCHEMA_VERSION whenever the state vector
+            # changes shape or semantics.
+            ver = int(ckpt.get("schema_version", 0))
+            if ver < _SCHEMA_VERSION:
+                logger.warning(
+                    "RL checkpoint schema v%d < required v%d — discarding "
+                    "stale weights and starting fresh.", ver, _SCHEMA_VERSION,
+                )
+                return
             self.policy.load_state_dict(ckpt["policy"])
             self.target.load_state_dict(ckpt["target"])
             self.epsilon  = ckpt.get("epsilon", 0.3)
@@ -148,6 +163,7 @@ class RLTradingAgent:
                 "target":  self.target.state_dict(),
                 "epsilon": self.epsilon,
                 "steps":   self._steps,
+                "schema_version": _SCHEMA_VERSION,
             }, AGENT_PATH)
         except Exception as exc:
             logger.warning("RL save failed: %s", exc)

@@ -167,6 +167,73 @@ if [ -f "$PROJECT_DIR/.env.example" ]; then
   fi
 fi
 
+# ── 3c. Apply recommended trading-strategy values ─────────────────────────
+# These knobs control the bot's risk/reward profile. The historical defaults
+# produced a bot that earned in strong uptrends but bled in flat/down markets.
+# We FORCE the recommended values on every deploy so existing servers get the
+# fix automatically.  Set FORCE_TRADING_PARAMS=0 in your shell to opt out.
+FORCE_TRADING_PARAMS=${FORCE_TRADING_PARAMS:-1}
+if [ "$FORCE_TRADING_PARAMS" = "1" ] && [ -f "$PROJECT_DIR/.env" ]; then
+  echo ""
+  echo "▶ Applying recommended trading-strategy parameters..."
+
+  # key=value pairs to enforce. Anything missing is appended; anything
+  # present is updated in place. Lines that match exactly are left alone.
+  declare -A RECOMMENDED=(
+    # Asymmetric exit fix \u2014 the #1 leak in flat markets
+    [PROFIT_LOCK_ACTIVATE_PCT]="6.0"
+    [PROFIT_LOCK_FLOOR_PCT]="2.0"
+    [PROFIT_LOCK_KEEP_PCT]="75.0"
+    [TRAILING_TP_PULLBACK_PCT]="4.0"
+    # Risk:reward + stop range
+    [MIN_REWARD_RISK_RATIO]="2.5"
+    [MIN_SL_PCT]="3.0"
+    [MAX_SL_PCT]="8.0"
+    [MIN_QUANT_SCORE]="60"
+    [QUANT_SELL_THRESHOLD_DELTA]="10"
+    # Cash regime / trend filter / chop guard
+    [REGIME_BLOCK_BUYS_IN_DOWNTREND]="true"
+    [EMA_TREND_FILTER_ENABLED]="true"
+    [MIN_ADX_FOR_BREAKOUT]="20"
+    # Loss-streak circuit breaker
+    [LOSS_STREAK_PAUSE_THRESHOLD]="3"
+    [LOSS_STREAK_PAUSE_HOURS]="6"
+    # De-bias the buy side
+    [LESS_FEAR]="false"
+    [RISK_PROFILE]="balanced"
+    [GAINER_INJECT_COUNT]="4"
+    [GAINER_MAX_PCT]="30.0"
+    [SCANNER_MAX_24H_PCT]="50.0"
+    # Per-trade concentration cap — vol-adjusted sizing keeps it lower
+    # in volatile markets but caps at this for low-ATR setups.
+    [MAX_POSITION_PCT]="25.0"
+  )
+
+  CHANGED=0
+  for key in "${!RECOMMENDED[@]}"; do
+    val="${RECOMMENDED[$key]}"
+    # Skip if exact line already present (no change needed)
+    if grep -qE "^${key}=${val}$" "$PROJECT_DIR/.env"; then
+      continue
+    fi
+    if grep -qE "^${key}=" "$PROJECT_DIR/.env"; then
+      # Replace existing value (escape & and / in val for sed)
+      esc_val=$(printf '%s' "$val" | sed -e 's/[\\/&|]/\\&/g')
+      sed -i -E "s|^${key}=.*|${key}=${esc_val}|" "$PROJECT_DIR/.env"
+    else
+      # Append at end of file
+      printf '\n%s=%s\n' "$key" "$val" >> "$PROJECT_DIR/.env"
+    fi
+    echo "  ~ ${key}=${val}"
+    CHANGED=$((CHANGED + 1))
+  done
+  if [ "$CHANGED" -gt 0 ]; then
+    echo "✔ Applied $CHANGED recommended trading parameter(s)"
+  else
+    echo "✔ All recommended trading parameters already match"
+  fi
+fi
+
 # ── 3d. Check ANTHROPIC_API_KEY is set ───────────────────────────────────────
 ANTHROPIC_KEY=$(grep -E '^ANTHROPIC_API_KEY=' "$PROJECT_DIR/.env" | cut -d'=' -f2 | tr -d ' ')
 if [ -z "$ANTHROPIC_KEY" ] || [ "$ANTHROPIC_KEY" = "sk-ant-..." ]; then
@@ -204,6 +271,39 @@ for i in {1..20}; do
   sleep 3
   echo "  Waiting... ($((i*3))s)"
 done
+
+# ── 5b. Optional: run a 30-day backtest as a sanity check ────────────────────
+# Set RUN_BACKTEST=0 to skip (e.g. on a slow network or low-power host).
+RUN_BACKTEST=${RUN_BACKTEST:-1}
+BACKTEST_DAYS=${BACKTEST_DAYS:-30}
+BACKTEST_SYMBOLS=${BACKTEST_SYMBOLS:-10}
+if [ "$RUN_BACKTEST" = "1" ]; then
+  echo ""
+  echo "▶ Running ${BACKTEST_DAYS}-day backtest (top ${BACKTEST_SYMBOLS} symbols)..."
+  echo "  (set RUN_BACKTEST=0 to skip, BACKTEST_DAYS=N to change window)"
+  # Copy backtest.py into the running container (it isn't part of the image
+  # because the Dockerfile only ships the backend/ tree).
+  if docker compose -f "$COMPOSE_FILE" cp "$PROJECT_DIR/backtest.py" trader:/app/backtest.py; then
+    # Run inside the container so all Python deps are available.  Output goes
+    # to /data/last_backtest.json which is bind-mounted to the trader-data
+    # volume, so it persists across restarts and is visible from the dashboard.
+    if docker compose -f "$COMPOSE_FILE" exec -T trader \
+        python /app/backtest.py \
+          --days "$BACKTEST_DAYS" \
+          --symbols "$BACKTEST_SYMBOLS" \
+          --output /data/last_backtest.json; then
+      echo "✔ Backtest complete \u2014 results saved to /data/last_backtest.json"
+      echo "  View summary in the dashboard's 'Backtest' tab, or:"
+      echo "    docker compose -f $COMPOSE_FILE exec trader cat /data/last_backtest.json | head -50"
+    else
+      echo "⚠ Backtest exited non-zero \u2014 deployment will continue."
+      echo "  You can re-run later with:"
+      echo "    docker compose -f $COMPOSE_FILE exec trader python /app/backtest.py --days 30"
+    fi
+  else
+    echo "⚠ Could not copy backtest.py into container \u2014 skipping backtest."
+  fi
+fi
 
 # ── 6. Optional: install systemd service for auto-start on reboot ───────────
 SERVICE_FILE="/etc/systemd/system/ai-trader.service"

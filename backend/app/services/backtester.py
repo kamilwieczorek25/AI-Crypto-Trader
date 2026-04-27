@@ -44,7 +44,11 @@ logger = logging.getLogger(__name__)
 # ── Configuration ────────────────────────────────────────────────────────────
 
 FEE_PCT = 0.10  # Binance spot taker fee (0.1%)
-SLIPPAGE_PCT = 0.05  # Simulated slippage per trade
+# Realistic average slippage per side. Live executor randomises 0.03-0.12%
+# AND DCA splits create two entries, so the live cost is closer to ~0.10%
+# average per fill. Old 0.05% caused the auto-tuner to over-fit on cheap
+# fills and ship strategies that lose to costs in flat markets.
+SLIPPAGE_PCT = 0.10  # Simulated slippage per trade (per side)
 MIN_CANDLES_REQUIRED = 50  # Need at least this many 1h candles before first trade
 BTC_SYMBOL = f"BTC/{settings.QUOTE_CURRENCY}"
 

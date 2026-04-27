@@ -88,8 +88,14 @@ class MarketDataService:
             if vol >= vol_floor:
                 quote_pairs.append((sym, t))
 
-            # Top gainers: significant move + minimum liquidity
-            if abs(pct) >= settings.GAINER_MIN_PCT and vol >= gainer_vol_floor:
+            # Top gainers: significant move + minimum liquidity, but skip
+            # already-extended moves to avoid buying the top.
+            gmax = float(getattr(settings, "GAINER_MAX_PCT", 0.0) or 0.0)
+            if (
+                abs(pct) >= settings.GAINER_MIN_PCT
+                and vol >= gainer_vol_floor
+                and (gmax <= 0 or abs(pct) <= gmax)
+            ):
                 top_gainers.append((sym, t, pct))
 
         # ── New listing detection ──

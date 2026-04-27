@@ -73,20 +73,21 @@ RISK PROFILE: AGGRESSIVE
     ),
     "fast_profit": RiskProfile(
         label="Fast Profit",
-        min_confidence=0.38,
+        min_confidence=0.45,
         max_position_pct=5.0,
         system_addendum="""\
 
-RISK PROFILE: FAST PROFIT (maximum aggression)
-- Trade when confidence ≥ 0.38. Bias strongly toward BUY/SELL over HOLD.
+RISK PROFILE: FAST PROFIT (high aggression, but disciplined)
+- Trade when confidence ≥ 0.45.  HOLD is a perfectly valid answer when no
+  setup clears the bar — missed trades cost nothing, bad trades cost money.
 - Maximum position size: 5% of portfolio.
-- PRIMARY timeframes: 15m and 1h only. Use 4h/1d only as trend filter.
-- Chase momentum: if RSI is rising + MACD histogram is positive + volume ratio > 1.5, BUY.
-- Use tight stop-losses (2–4%) and ambitious take-profits (15–30%).
+- PRIMARY timeframes: 15m and 1h.  4h/1d are trend filters — do NOT BUY
+  when the 4h trend is bearish unless an explicit reversal signal is present.
+- Momentum entries (RSI rising + MACD positive + volume > 1.5×) are good
+  IF the higher-timeframe trend agrees and the coin is not already +20%/24h.
+- Use stop-losses 3-5% and take-profits 6-15% (R:R ≥ 2).
 - Sell quickly when momentum stalls — do not hold losing positions.
-- Look for coins with the highest volume ratio and strongest short-term trend.
-- Speed is the priority: capture short-term swings, not long-term holds.
-- HOLD is a last resort. Always look for the best available opportunity.
+- In ranging or downtrending markets, default to HOLD/CASH.
 """,
     ),
 }
@@ -174,13 +175,15 @@ DECISION RULES:
 
 _LESS_FEAR_ADDENDUM = """
 
-OVERRIDE: LESS FEAR MODE ACTIVE
-- The operator has explicitly enabled less-fear mode. STRONG BIAS toward APPROVE.
-- Extreme fear markets often produce the best buying opportunities (contrarian edge).
-- The quant model has already applied strict filtering. Trust the numbers.
-- Only REJECT if there is a concrete, verifiable catastrophic risk (hack, delisting, rug-pull).
-- General bearishness, negative sentiment, or "market is down" are NOT valid rejection reasons.
-- When in doubt, APPROVE. The stop-loss will manage downside risk.
+NOTE: LESS-FEAR MODE ACTIVE
+- The operator has enabled less-fear mode — lean toward APPROVE on borderline
+  candidates that have strong quant scores AND a constructive market regime.
+- This does NOT override risk discipline:
+    * In confirmed downtrend / strong_downtrend / choppy regimes, the default
+      action is still HOLD.  Approve only on clear bullish reversal evidence.
+    * REJECT any candidate already up >20% / 24h unless news/flow justifies it.
+    * REJECT candidates whose 4h or 1d trend is bearish.
+- Concrete catastrophic risks (hack, delisting, rug-pull, anomaly) always REJECT.
 """
 
 

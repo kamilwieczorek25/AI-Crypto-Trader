@@ -123,22 +123,31 @@ _REGIME_WEIGHT_OVERRIDES: dict[str, dict[str, float]] = {
         "momentum_accel_signal": 0.4,
     },
     "downtrend": {
-        # Falling market: only take very high-conviction setups
-        "squeeze_signal":        1.8,   # squeezes still fire in downtrends
-        "news_burst_signal":     1.4,   # catalyst breaks beat the trend
-        "ml_signal":             1.3,
-        # Dampen weak momentum signals
-        "breakout_signal":       0.6,
+        # Falling market: only take very high-conviction reversal setups.
+        # Heavily dampen all momentum/breakout/squeeze signals — in a downtrend
+        # most "squeezes" and "news bursts" are dead-cat bounces.
+        "squeeze_signal":        0.6,
+        "news_burst_signal":     0.7,
+        "ml_signal":             1.2,
+        "macd_div_signal":       1.3,   # bullish divergence is the only edge
+        "rsi_signal":            1.2,   # RSI extremes for mean-reversion
+        "breakout_signal":       0.4,
         "trend_signal":          0.5,
+        "momentum_accel_signal": 0.5,
+        "pct_24h_signal":        0.4,
     },
     "strong_downtrend": {
-        "squeeze_signal":        2.0,
-        "ml_signal":             1.5,
-        "whale_signal":          1.4,
-        # Strongly dampen momentum
-        "breakout_signal":       0.2,
-        "trend_signal":          0.2,
-        "gpu_momentum_signal":   0.4,
+        # Capital preservation mode — effectively rule out new BUYs unless an
+        # exceptionally strong divergence + ML signal lines up.
+        "ml_signal":             1.3,
+        "macd_div_signal":       1.5,
+        "squeeze_signal":        0.3,
+        "news_burst_signal":     0.5,
+        "breakout_signal":       0.1,
+        "trend_signal":          0.1,
+        "gpu_momentum_signal":   0.3,
+        "momentum_accel_signal": 0.2,
+        "pct_24h_signal":        0.2,
     },
 }
 
@@ -274,10 +283,18 @@ def _score_breakout(ind: dict) -> float:
 
     breakout_48h = +1 (above 48-bar high), -1 (below 48-bar low), 0 (inside).
     Combine with momentum acceleration for a stronger confirmation.
+
+    Gated by ADX: a \"breakout\" in a low-ADX (chop) regime is overwhelmingly
+    a whipsaw.  When ADX is below `MIN_ADX_FOR_BREAKOUT` the bullish branch
+    is suppressed so we don't BUY into chop; bearish breakdowns still count.
     """
     bo = ind.get("breakout_48h", 0.0)
     accel = ind.get("momentum_accel", 0.0)
+    adx = ind.get("adx", 0.0) or 0.0
+    min_adx = float(getattr(settings, "MIN_ADX_FOR_BREAKOUT", 0.0) or 0.0)
     if bo > 0:
+        if min_adx > 0 and adx < min_adx:
+            return 0.0  # chop \u2014 ignore the breakout
         # Breakout above prior range + accelerating momentum = very bullish
         return min(1.0, 0.7 + accel * 0.3)
     elif bo < 0:
@@ -577,12 +594,14 @@ def _score_news_burst(symbol: str, news_data: dict | None) -> float:
 def _score_pct_24h(pct_24h: float) -> float:
     """24-hour price change momentum signal.
 
-    Strong gainers (+10%+) are more likely to be in a trending move.
-    Strong losers (-10%+) are bearish — only enter on squeeze/reversal setups.
-    Moderate positive moves (+5-10%) get a mild boost; flat = neutral.
+    Mild positive drift is rewarded, but coins already up >20% are *penalised*
+    — chasing parabolic moves is a primary loss source in flat/down markets.
+    Strong losers (-10%+) stay bearish unless rescued by a divergence/squeeze
+    setup elsewhere in the score.
     """
-    if pct_24h >= 20:    return 0.9   # explosive gainer — very bullish
-    elif pct_24h >= 10:  return 0.7   # strong uptrend
+    if pct_24h >= 30:    return -0.6  # blow-off top — likely buying the peak
+    elif pct_24h >= 20:  return -0.2  # already extended
+    elif pct_24h >= 10:  return 0.4   # healthy uptrend
     elif pct_24h >= 5:   return 0.4   # moderate gainer
     elif pct_24h >= 2:   return 0.2   # mild positive drift
     elif pct_24h <= -20: return -0.8  # severe dump
@@ -833,6 +852,14 @@ def compute_trade_levels(
     else:
         qty_pct = base_pct * 0.3
 
+    # Volatility-adjusted sizing: shrink position when ATR% is large.
+    # An ATR of 2% is "normal" — use that as the reference.  At 6% ATR the
+    # position is ~33% of nominal; at 1% ATR it can ride at 1.0× (capped).
+    # This reduces $ risk per trade in choppy/volatile markets without
+    # requiring a separate regime gate.
+    vol_scale = min(1.0, 2.0 / max(atr_pct, 0.5))
+    qty_pct = qty_pct * vol_scale
+
     qty_pct = round(min(qty_pct, base_pct), 2)
 
     return {
@@ -946,6 +973,14 @@ def rank_symbols(
     regime = regime_dict.get("regime", "unknown")
     min_score = settings.MIN_QUANT_SCORE
 
+    # Cash regime: in confirmed downtrend / chop, do NOT generate BUY
+    # candidates at all.  Existing positions are still scored so SELL signals
+    # can fire normally.
+    block_buys_due_to_regime = (
+        getattr(settings, "REGIME_BLOCK_BUYS_IN_DOWNTREND", True)
+        and regime in {"downtrend", "strong_downtrend", "choppy"}
+    )
+
     # Regime-aware threshold adjustment
     regime_adjustments = {
         "strong_uptrend":   -8,
@@ -1024,6 +1059,35 @@ def rank_symbols(
         signals = result["signals"]
 
         if direction > 0 and score >= adjusted_min and sym not in held:
+            if block_buys_due_to_regime:
+                # Skip new BUYs in confirmed downtrends/chop — cash is the
+                # winning trade in these regimes.
+                continue
+            # EMA50 > EMA200 trend filter (1h timeframe).  When indicators are
+            # missing we let it through; when present and bearish we block.
+            if getattr(settings, "EMA_TREND_FILTER_ENABLED", True):
+                ind_1h = data.get("indicators", {}).get("1h", {}) if isinstance(data, dict) else {}
+                ema50  = ind_1h.get("ema50", 0.0)
+                ema200 = ind_1h.get("ema200", 0.0)
+                # Allow override on strong bullish RSI divergence (catches
+                # genuine reversals at downtrend bottoms).
+                rsi_div = ind_1h.get("rsi_divergence", 0.0)
+                if ema50 and ema200 and ema50 < ema200 and rsi_div < 0.5:
+                    continue
+                # Higher-timeframe confirmation: when 4h indicators exist and
+                # show a clear bear (EMA50 < EMA200 AND price below EMA50 by
+                # >2%), block the BUY regardless.  Avoids buying counter-trend
+                # rallies inside a 4h downtrend.
+                ind_4h = data.get("indicators", {}).get("4h", {}) if isinstance(data, dict) else {}
+                ema50_4h  = ind_4h.get("ema50", 0.0)
+                ema200_4h = ind_4h.get("ema200", 0.0)
+                close_4h  = ind_4h.get("close", 0.0)
+                if (
+                    ema50_4h and ema200_4h and close_4h
+                    and ema50_4h < ema200_4h
+                    and close_4h < ema50_4h * 0.98
+                ):
+                    continue
             levels = compute_trade_levels(sym, data, "BUY", score)
             if levels:
                 price = data.get("price", 0)
@@ -1043,7 +1107,7 @@ def rank_symbols(
                     factor_scores=result["factors"],
                 ))
 
-        elif sym in held and score < 45:
+        elif sym in held and score < (adjusted_min - settings.QUANT_SELL_THRESHOLD_DELTA):
             candidates.append(TradeCandidate(
                 symbol=sym,
                 action="SELL",

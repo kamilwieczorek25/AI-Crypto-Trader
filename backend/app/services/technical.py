@@ -292,6 +292,58 @@ def compute_indicators(ohlcv: list[list[float]]) -> dict[str, float]:
         ema20 = ta.ema(close, length=20)
         indicators["ema20"] = _safe_float(ema20.iloc[-1] if ema20 is not None else None)
 
+        # EMA 50 / EMA 200 — trend filter (golden/death cross)
+        if len(close) >= 50:
+            ema50 = ta.ema(close, length=50)
+            indicators["ema50"] = _safe_float(ema50.iloc[-1] if ema50 is not None else None)
+        else:
+            indicators["ema50"] = 0.0
+        if len(close) >= 200:
+            ema200 = ta.ema(close, length=200)
+            indicators["ema200"] = _safe_float(ema200.iloc[-1] if ema200 is not None else None)
+        else:
+            indicators["ema200"] = 0.0
+        # Trend-up flag: EMA50 > EMA200 — used as a hard BUY filter.
+        # When EMA200 is unavailable (insufficient history) we set 1.0 so
+        # the filter does not block trading on freshly-listed coins.
+        if indicators["ema50"] > 0 and indicators["ema200"] > 0:
+            indicators["trend_up"] = 1.0 if indicators["ema50"] > indicators["ema200"] else 0.0
+        else:
+            indicators["trend_up"] = 1.0
+
+        # ADX 14 — trend strength (>20 = trending, <20 = chop / no edge for breakouts)
+        try:
+            adx_df = ta.adx(high, low, close, length=14)
+            if adx_df is not None and not adx_df.empty:
+                adx_col = [c for c in adx_df.columns if "adx" in c.lower()]
+                indicators["adx"] = _safe_float(adx_df[adx_col[0]].iloc[-1] if adx_col else None)
+            else:
+                indicators["adx"] = 0.0
+        except Exception:
+            indicators["adx"] = 0.0
+
+        # Choppiness Index 14 — 100*log10(sum(TR)/(maxH-minL)) / log10(N)
+        # >= 61.8 = strong chop (whipsaw zone), <= 38.2 = strong trend
+        try:
+            n_chop = 14
+            if len(close) > n_chop:
+                tr = pd.concat([
+                    (high - low),
+                    (high - close.shift()).abs(),
+                    (low  - close.shift()).abs(),
+                ], axis=1).max(axis=1)
+                sum_tr  = tr.rolling(n_chop).sum()
+                rng_hi  = high.rolling(n_chop).max()
+                rng_lo  = low.rolling(n_chop).min()
+                ci = 100.0 * np.log10(
+                    (sum_tr / (rng_hi - rng_lo).replace(0, np.nan))
+                ) / np.log10(n_chop)
+                indicators["choppiness"] = _safe_float(ci.iloc[-1])
+            else:
+                indicators["choppiness"] = 50.0
+        except Exception:
+            indicators["choppiness"] = 50.0
+
         # ATR 14
         atr = ta.atr(high, low, close, length=14)
         indicators["atr"] = _safe_float(atr.iloc[-1] if atr is not None else None)
@@ -322,6 +374,11 @@ def compute_indicators(ohlcv: list[list[float]]) -> dict[str, float]:
         indicators["bb_squeeze"] = 0.0
         indicators["bb_bandwidth"] = 0.0
         indicators["ema20"] = _safe_float(close.ewm(span=20).mean().iloc[-1])
+        indicators["ema50"] = _safe_float(close.ewm(span=50).mean().iloc[-1]) if len(close) >= 50 else 0.0
+        indicators["ema200"] = _safe_float(close.ewm(span=200).mean().iloc[-1]) if len(close) >= 200 else 0.0
+        indicators["trend_up"] = 1.0 if (indicators["ema50"] == 0 or indicators["ema200"] == 0 or indicators["ema50"] > indicators["ema200"]) else 0.0
+        indicators["adx"] = 0.0
+        indicators["choppiness"] = 50.0
         indicators["atr"] = _safe_float(
             (high - low).rolling(14).mean().iloc[-1]
         )
@@ -433,6 +490,11 @@ def _empty_indicators(status: str = "ok") -> dict[str, float]:
         "bb_squeeze": 0.0,
         "bb_bandwidth": 0.0,
         "ema20": 0.0,
+        "ema50": 0.0,
+        "ema200": 0.0,
+        "trend_up": 1.0,
+        "adx": 0.0,
+        "choppiness": 50.0,
         "atr": 0.0,
         "volume_ratio": 1.0,
         "volume_zscore": 0.0,

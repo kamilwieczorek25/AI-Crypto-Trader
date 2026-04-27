@@ -95,11 +95,33 @@ class Settings(BaseSettings):
     MIN_QUANT_SCORE: float = 60.0
     # ATR multiplier for stop-loss (2.5 = 2.5x ATR — gives room for noise)
     SL_ATR_MULTIPLIER: float = 2.5
-    # Minimum reward-to-risk ratio (2.0 = TP must be 2x SL distance)
-    MIN_REWARD_RISK_RATIO: float = 2.0
+    # Minimum reward-to-risk ratio (2.5 = TP must be 2.5x SL distance — ensures
+    # winners outpace losers; raised from 2.0 to fix asymmetric R:R bleed.)
+    MIN_REWARD_RISK_RATIO: float = 2.5
     # Min/max stop-loss % (clamp ATR-based SL to sane range)
     MIN_SL_PCT: float = 3.0
-    MAX_SL_PCT: float = 12.0
+    MAX_SL_PCT: float = 8.0
+    # SELL trigger for held positions: emit SELL when score drops this many
+    # points below the regime-adjusted BUY threshold (was hard-coded to 45).
+    # Smaller value = more eager to sell weak positions in flat markets.
+    QUANT_SELL_THRESHOLD_DELTA: float = 10.0
+
+    # ── Trend / regime filters (stop trading in chop & downtrends) ────────
+    # When True, no new BUY candidates are produced when market regime is
+    # downtrend / strong_downtrend / choppy.  Existing positions are still
+    # managed (SELL/exit logic stays active).
+    REGIME_BLOCK_BUYS_IN_DOWNTREND: bool = True
+    # When True, require EMA50 > EMA200 on the 1h timeframe before approving a
+    # BUY.  Prevents knife-catching in confirmed downtrends.
+    EMA_TREND_FILTER_ENABLED: bool = True
+    # Minimum ADX value for momentum/breakout BUYs (filters whipsaws in chop).
+    # 0 = disabled.  Recommended: 18-22.
+    MIN_ADX_FOR_BREAKOUT: float = 20.0
+    # Pause new BUYs after N losing trades inside the rolling 5-trade window.
+    # Resets when a winner appears.  0 = disabled.  Recommended: 3.
+    LOSS_STREAK_PAUSE_THRESHOLD: int = 3
+    # How long to pause BUYs after the loss-streak threshold fires (hours).
+    LOSS_STREAK_PAUSE_HOURS: float = 6.0
 
     # ── Auto-backtest & tuning ─────────────────────────────────────────────
     # Run backtest on bot startup and auto-tune scorer settings
@@ -128,7 +150,7 @@ class Settings(BaseSettings):
     # ── Trailing take-profit ──────────────────────────────────────────────
     # When price hits TP, don't sell immediately — let it run.
     # Sell only when price pulls back this % from the peak above TP.
-    TRAILING_TP_PULLBACK_PCT: float = 6.0
+    TRAILING_TP_PULLBACK_PCT: float = 4.0
     # Safety floor: if price drops back below original TP, sell immediately.
     TRAILING_TP_FLOOR: bool = True
     # Minutes to block re-entry after a take-profit exit.
@@ -146,14 +168,15 @@ class Settings(BaseSettings):
     # a sliding floor is placed.  The floor = max(FLOOR_PCT, peak × KEEP_PCT).
     # If the gain drops to that floor, the position is sold — locking in
     # profit instead of riding all the way back to stop-loss.
-    # Examples with defaults (activate=3, floor=1, keep=50%):
-    #   peaked +3%  → floor = max(1%, 3%×0.5)  = +1.5% → sell at +1.5%
-    #   peaked +5%  → floor = max(1%, 5%×0.5)  = +2.5% → sell at +2.5%
-    #   peaked +10% → floor = max(1%, 10%×0.5) = +5.0% → sell at +5.0%
-    # Set PROFIT_LOCK_ACTIVATE_PCT = 0 to disable.
-    PROFIT_LOCK_ACTIVATE_PCT: float = 3.0   # activate when PnL >= +3%
-    PROFIT_LOCK_FLOOR_PCT: float = 1.0      # minimum floor (absolute %)
-    PROFIT_LOCK_KEEP_PCT: float = 50.0      # keep this % of peak gains
+    # Examples with current defaults (activate=6, floor=2, keep=75%):
+    #   peaked +6%  → floor = max(2%, 6%×0.75)  = +4.5% → sell at +4.5%
+    #   peaked +10% → floor = max(2%, 10%×0.75) = +7.5% → sell at +7.5%
+    #   peaked +20% → floor = max(2%, 20%×0.75) = +15%  → sell at +15%
+    # Tightened from old 3/1/50 (which clipped winners to net <1% after fees,
+    # producing negative EV in flat markets).  Set ACTIVATE = 0 to disable.
+    PROFIT_LOCK_ACTIVATE_PCT: float = 6.0   # activate when PnL >= +6%
+    PROFIT_LOCK_FLOOR_PCT: float = 2.0      # minimum floor (absolute %)
+    PROFIT_LOCK_KEEP_PCT: float = 75.0      # keep this % of peak gains
 
     # ── Time-based exit ──────────────────────────────────────────────────
     # Max hours to hold a stagnant position (0 = disabled)
@@ -193,8 +216,8 @@ class Settings(BaseSettings):
     SCANNER_MIN_SCORE: float = 15.0
     # Maximum 24h price change (%) to consider a coin. Tokens already up >X%
     # are likely near the top of a pump — buying them is extremely risky.
-    # 0 = disabled.  Recommended: 50-100.
-    SCANNER_MAX_24H_PCT: float = 80.0
+    # 0 = disabled.  Recommended: 30-60 (tightened from 80 to reduce FOMO).
+    SCANNER_MAX_24H_PCT: float = 50.0
     # Require positive short-term momentum for the scanner to flag a coin.
     # When enabled, coins with falling price get score halved.
     SCANNER_PREFER_UPTREND: bool = True
@@ -260,8 +283,13 @@ class Settings(BaseSettings):
     FETCH_CONCURRENCY: int = 10
     # Top gainers: min 24h price change % to qualify as a "gainer"
     GAINER_MIN_PCT: float = 5.0
-    # How many top gainers to inject into the symbol universe each cycle
-    GAINER_INJECT_COUNT: int = 10
+    # How many top gainers to inject into the symbol universe each cycle.
+    # Lowered from 10 → 4 because gainer injection was the prime FOMO source
+    # (chasing already-pumped coins gave the bot a strong buy-side bias).
+    GAINER_INJECT_COUNT: int = 4
+    # Skip gainers whose 24h move is already above this %, to avoid buying tops.
+    # 0 = disabled.
+    GAINER_MAX_PCT: float = 30.0
     # How many hours to keep watching a newly listed coin (auto-inject into universe)
     NEW_LISTING_WATCH_HOURS: float = 48.0
 

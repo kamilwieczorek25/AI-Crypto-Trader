@@ -44,10 +44,16 @@ class ExitSignal:
 
 
 # ── Thresholds (tuned for crypto 1h TF) ─────────────────────────────
-# How many local reversal signals must fire before we act
-_MIN_REVERSAL_SIGNALS = 3   # out of ~8 checks → strong confirmation
-_MIN_PARTIAL_SIGNALS  = 2   # weaker → partial exit
-_MIN_HOLD_MINUTES     = 15  # don't exit positions held less than this
+# How many local reversal signals must fire before we act.  Raised from
+# 3/2 to 4/3 because the old thresholds + tiny absolute MACD/OBV cutoffs
+# made partial exits fire constantly in normal market noise, locking in
+# tiny gains while losers ran to full SL.
+_MIN_REVERSAL_SIGNALS = 4   # full close requires strong confirmation
+_MIN_PARTIAL_SIGNALS  = 3   # weaker → partial exit
+# Don't exit positions held less than this (1h TF needs at least one full
+# bar to form, plus margin).  Old 15-minute window allowed exits inside a
+# single noisy candle.
+_MIN_HOLD_MINUTES     = 60
 
 
 def analyze_exit(
@@ -171,9 +177,14 @@ def _count_reversal_signals(
         # RSI crashed while we're still in profit — momentum gone
         fired.append(f"RSI crashed ({rsi:.0f})")
 
-    # 2. MACD histogram flipping negative (bearish momentum shift)
+    # 2. MACD histogram flipping negative (bearish momentum shift).
+    # Use a price-relative threshold instead of an absolute 0.001 — for low-
+    # priced alts (e.g. $0.50) MACD swings of ±0.01 are pure noise and the old
+    # absolute cutoff fired constantly.
     macd_hist = ind_1h.get("macd_hist", 0)
-    if macd_hist < -0.001:  # small threshold to avoid noise
+    close_px  = ind_1h.get("close", 0) or 1.0
+    macd_floor = max(0.001, abs(close_px) * 0.0005)  # 0.05% of price
+    if macd_hist < -macd_floor:
         fired.append(f"MACD bearish ({macd_hist:.4f})")
 
     # 3. Price below VWAP — selling pressure dominates
@@ -195,11 +206,15 @@ def _count_reversal_signals(
     if obv_trend < 0:
         fired.append("OBV bearish")
 
-    # 7. BTC dragging market down
+    # 7. BTC dragging market down — require BTC to be both negative AND
+    # showing a meaningful (>0.1% of BTC price) negative MACD histogram so
+    # we don't drag the whole portfolio out on minor BTC dips.
     btc_1h = btc_anchor.get("1h", {}) if isinstance(btc_anchor, dict) else {}
-    btc_macd = btc_1h.get("macd_hist", 0)
+    btc_macd  = btc_1h.get("macd_hist", 0)
     btc_trend = btc_1h.get("trend", 0)
-    if btc_macd < -0.001 and btc_trend < 0:
+    btc_close = btc_1h.get("close", 0) or 1.0
+    btc_floor = max(0.5, abs(btc_close) * 0.001)  # 0.1% of BTC price
+    if btc_macd < -btc_floor and btc_trend < 0:
         fired.append("BTC bearish")
 
     # 8. GPU ensemble says SELL

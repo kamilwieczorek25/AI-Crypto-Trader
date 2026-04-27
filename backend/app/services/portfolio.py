@@ -446,7 +446,14 @@ class PortfolioService:
 
         existing = self._positions.get(symbol)
         if existing:
-            # Average into existing position
+            # Average into existing position (pyramiding).
+            # IMPORTANT: keep the ORIGINAL stop-loss in absolute price terms.
+            # Recomputing SL from the new (higher) average entry would ratchet
+            # the stop upward into market noise after every add-up, turning
+            # winners into losers on the first dip.  The take-profit, however,
+            # is widened proportionally so R:R stays healthy.
+            original_sl_price = existing.stop_loss_price
+            original_entry    = existing.avg_entry_price
             total_qty = existing.quantity + quantity
             new_avg = (
                 existing.avg_entry_price * existing.quantity + price * quantity
@@ -454,14 +461,19 @@ class PortfolioService:
             existing.avg_entry_price = new_avg
             existing.quantity = total_qty
             existing.current_price = price
-            # Recalculate SL/TP based on new averaged entry price
-            # Preserve the same percentage distances as the new trade's SL/TP
-            if price > 0:
-                sl_pct = (price - stop_loss_price) / price
+            # Keep original SL absolute price (do NOT re-anchor to new avg).
+            if original_sl_price > 0:
+                existing.stop_loss_price = original_sl_price
+            # Recompute TP from the *new* trade's TP percentage so reward
+            # scales with the higher avg entry; falls back to provided value.
+            if price > 0 and take_profit_price > 0:
                 tp_pct = (take_profit_price - price) / price
-                existing.stop_loss_price = new_avg * (1 - sl_pct)
                 existing.take_profit_price = new_avg * (1 + tp_pct)
-                existing.trailing_stop_pct = sl_pct * 100
+            # Trailing-stop %: anchor to original entry-to-SL distance.
+            if original_entry > 0 and original_sl_price > 0:
+                existing.trailing_stop_pct = (
+                    (original_entry - original_sl_price) / original_entry * 100
+                )
             existing.highest_price = max(existing.highest_price, price)
             existing.updated_at = datetime.now(timezone.utc)
             db.add(existing)

@@ -55,6 +55,8 @@ class BotRunner:
         self._sector_heat: dict[str, float] = {}
         # Dynamic sizing: recent trade streak tracking
         self._recent_results: list[bool] = []  # True=win, False=loss (last 10)
+        # Loss-streak circuit breaker: if set, no new BUYs until this datetime
+        self._buy_pause_until: datetime | None = None
         # Kelly criterion: cached fraction from backtest results
         self._kelly_fraction: float = 1.0  # 1.0 = no adjustment (full quant sizing)
         # Cooldown: symbols that recently hit stop-loss or took profit
@@ -236,6 +238,26 @@ class BotRunner:
                         }
                         for hc in fast_scanner.hot_candidates:
                             if hc.score < 60:
+                                continue
+                            # Cash regime: skip express lane in confirmed
+                            # downtrend / chop — the express lane was a prime
+                            # FOMO source there.
+                            _regime = (self._last_regime or {}).get("regime", "unknown")
+                            if (
+                                getattr(settings, "REGIME_BLOCK_BUYS_IN_DOWNTREND", True)
+                                and _regime in {"downtrend", "strong_downtrend", "choppy"}
+                            ):
+                                logger.debug(
+                                    "Express skip %s (score=%.0f): regime=%s blocks new BUYs",
+                                    hc.symbol, hc.score, _regime,
+                                )
+                                continue
+                            # Loss-streak pause: also blocks express BUYs
+                            if self._is_loss_streak_paused():
+                                logger.debug(
+                                    "Express skip %s (score=%.0f): loss-streak pause active",
+                                    hc.symbol, hc.score,
+                                )
                                 continue
                             # Log why high-scoring symbols are skipped
                             if hc.symbol in held_now:
@@ -1240,6 +1262,16 @@ class BotRunner:
 
             # 7c. Cooldown after stop-loss — reject BUY on symbols recently stopped out
             now = datetime.now(timezone.utc)
+            if decision.action == "BUY" and self._is_loss_streak_paused():
+                logger.warning(
+                    "Loss-streak pause active \u2014 downgrading %s BUY \u2192 HOLD",
+                    decision.symbol,
+                )
+                decision.action = "HOLD"
+                decision.quantity_pct = 0.0
+                decision.reasoning = (
+                    "[LOSS-STREAK PAUSE] " + (decision.reasoning or "")
+                )
             if decision.action == "BUY" and decision.symbol in self._sl_cooldown:
                 cool_until = self._sl_cooldown[decision.symbol]
                 if now < cool_until:
@@ -1502,6 +1534,37 @@ class BotRunner:
             return "none"
         recent = self._recent_results[-5:]
         return "".join("W" if r else "L" for r in recent)
+
+    def _is_loss_streak_paused(self) -> bool:
+        """Pause new BUYs when the loss-streak circuit-breaker has tripped.
+
+        Triggers when at least LOSS_STREAK_PAUSE_THRESHOLD of the last 5
+        trades were losers.  Pause lasts LOSS_STREAK_PAUSE_HOURS, then
+        resets automatically.  Set LOSS_STREAK_PAUSE_THRESHOLD = 0 to
+        disable.
+        """
+        threshold = int(getattr(settings, "LOSS_STREAK_PAUSE_THRESHOLD", 0) or 0)
+        if threshold <= 0:
+            return False
+        # If a pause is currently active, honour it.
+        until = getattr(self, "_buy_pause_until", None)
+        if until is not None:
+            if datetime.now(timezone.utc) < until:
+                return True
+            # expired \u2014 clear so the next loss-streak event can re-arm it
+            self._buy_pause_until = None
+        # Otherwise check window.
+        window = self._recent_results[-5:]
+        losses = sum(1 for r in window if not r)
+        if losses >= threshold:
+            hours = float(getattr(settings, "LOSS_STREAK_PAUSE_HOURS", 6.0) or 0.0)
+            self._buy_pause_until = datetime.now(timezone.utc) + timedelta(hours=hours)
+            logger.warning(
+                "Loss-streak circuit breaker: %d/5 recent trades were losses "
+                "\u2014 pausing new BUYs for %.1f h", losses, hours,
+            )
+            return True
+        return False
 
     def _add_sl_cooldown(self, symbol: str, minutes: int = 20) -> None:
         """Prevent re-buying a symbol for N minutes after stop-loss hit."""
@@ -1875,11 +1938,13 @@ class BotRunner:
                 age_hours = (now - opened).total_seconds() / 3600
                 if age_hours < max_hold:
                     continue
-                # Only time-exit if P&L is stagnant (-1% to +1%)
-                if -1.0 <= pos.pnl_pct <= 1.0:
+                # Time-exit any stagnant or losing position past max_hold.
+                # Old behaviour required -1.0 ≤ pnl_pct ≤ 1.0, which let
+                # underwater positions sit indefinitely waiting for recovery.
+                if pos.pnl_pct <= 1.0:
                     triggers.append((pos.symbol, "time_exit", pos.current_price))
                     logger.info(
-                        "Time-based exit: %s held %.0fh (P&L=%.2f%%) — closing stagnant position",
+                        "Time-based exit: %s held %.0fh (P&L=%.2f%%) — closing stagnant/losing position",
                         pos.symbol, age_hours, pos.pnl_pct,
                     )
 
@@ -1891,7 +1956,7 @@ class BotRunner:
             # Add cooldown after stop-loss to prevent revenge trading,
             # and after take-profit to prevent churning back into trending coins.
             if reason == "stop_loss":
-                self._add_sl_cooldown(symbol, minutes=20)
+                self._add_sl_cooldown(symbol, minutes=45)
                 self._recent_results.append(False)
                 self._recent_results = self._recent_results[-10:]
             elif reason == "take_profit":
@@ -2068,12 +2133,17 @@ class BotRunner:
         tp_d = float(np.clip(abs(tp - cur) / max(ep, 1e-9), 0.0, 1.0)) if tp else 0.0
 
         # Technical indicators for this symbol
-        rsi  = float(np.clip(_safe(ind.get("rsi_14", 50)) / 100.0, 0.0, 1.0))
+        # NOTE: technical.compute_indicators emits keys `rsi14` and
+        # `price_vs_vwap` (no underscore / different name).  Older code used
+        # `rsi_14` / `vwap_dist_pct` here which always defaulted — the Exit
+        # RL never saw real RSI/VWAP.  Falling back to legacy names for
+        # backwards compat with any cached state.
+        rsi  = float(np.clip(_safe(ind.get("rsi14", ind.get("rsi_14", 50))) / 100.0, 0.0, 1.0))
         macd = float(np.tanh(_safe(ind.get("macd_hist", 0)) * 5.0))
         bbsq = float(np.clip(_safe(ind.get("bb_squeeze", 0)), 0.0, 1.0))
         vol  = float(np.clip(math.log1p(max(_safe(ind.get("volume_ratio", 1.0)) - 1.0, 0.0)), 0.0, 1.0))
         obv  = float(np.clip(_safe(ind.get("obv_trend", 0)) * 0.5 + 0.5, 0.0, 1.0))
-        vwap = float(np.tanh(_safe(ind.get("vwap_dist_pct", 0)) / 3.0))
+        vwap = float(np.tanh(_safe(ind.get("price_vs_vwap", ind.get("vwap_dist_pct", 0))) / 3.0))
 
         # BTC anchor context
         btc_1h  = btc_anchor.get("1h", {}) if btc_anchor else {}
