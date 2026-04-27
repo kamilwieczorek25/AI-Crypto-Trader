@@ -93,6 +93,24 @@ class BotRunner:
         # Per-symbol beta vs BTC: {symbol: {"beta": float, "correlation": float}}
         # Computed from 1h OHLCV each cycle and passed to quant scorer
         self._beta_data: dict[str, dict] = {}
+        # Per-symbol cooldown after profit-take (POST_TP_SYMBOL_COOLDOWN_MIN)
+        # Distinct from _sl_cooldown: TP cooldown is longer, prevents churning
+        # back into a coin that just paid out.
+        self._post_tp_cooldown: dict[str, datetime] = {}
+        # Daily loss circuit breaker:
+        #   _daily_baseline_value = total_value at first cycle of current UTC day
+        #   _daily_baseline_date  = the UTC date that baseline was set on
+        #   _daily_loss_paused    = True if breaker has tripped today
+        self._daily_baseline_value: float = 0.0
+        self._daily_baseline_date: str = ""   # YYYY-MM-DD UTC
+        self._daily_loss_paused: bool = False
+        # Stablecoin depeg latch — separate from the daily-loss breaker so a
+        # brief USDC/USDT blip doesn't lock trading until 00:00 UTC.
+        # Cleared automatically once the spread comes back inside threshold.
+        self._depeg_paused: bool = False
+        # Per-symbol returns cache for correlation cluster guard:
+        # {symbol: np.ndarray of last 20 1h returns}.  Rebuilt each cycle.
+        self._returns_cache: dict = {}
         # Last market_intel snapshot (for express lane access)
         self._last_market_intel: dict = {}
         # Background task status flags (for dashboard)
@@ -256,6 +274,19 @@ class BotRunner:
                             if self._is_loss_streak_paused():
                                 logger.debug(
                                     "Express skip %s (score=%.0f): loss-streak pause active",
+                                    hc.symbol, hc.score,
+                                )
+                                continue
+                            # Stablecoin depeg / daily-loss breakers also gate express
+                            if self._depeg_paused:
+                                logger.debug(
+                                    "Express skip %s (score=%.0f): depeg breaker active",
+                                    hc.symbol, hc.score,
+                                )
+                                continue
+                            if self._check_daily_loss_breaker():
+                                logger.debug(
+                                    "Express skip %s (score=%.0f): daily-loss breaker active",
                                     hc.symbol, hc.score,
                                 )
                                 continue
@@ -444,6 +475,65 @@ class BotRunner:
             market_regime = detect_market_regime(all_ohlcv)
             correlation_info = compute_correlation_matrix(all_ohlcv, top_n=15)
             self._last_regime = market_regime
+
+            # 4a-bis. Build per-symbol 1h returns cache (used by correlation
+            # cluster guard at BUY decision time).  Includes both the current
+            # cycle universe AND any currently held positions, even if they've
+            # dropped out of today's top-N \u2014 otherwise the guard would
+            # silently skip held legacy positions.
+            try:
+                import numpy as _np
+                self._returns_cache = {}
+                for _sym, _tf in all_ohlcv.items():
+                    _candles = _tf.get("1h", [])
+                    if len(_candles) >= 21:
+                        _c = _np.array([float(_b[4]) for _b in _candles[-21:]])
+                        _r = _np.diff(_c) / (_c[:-1] + 1e-10)
+                        self._returns_cache[_sym] = _r
+                # Backfill returns for held positions missing from the cache.
+                _held_syms = [p.symbol for p in self._portfolio.all_positions()]
+                for _hsym in _held_syms:
+                    if _hsym in self._returns_cache:
+                        continue
+                    try:
+                        _hmtf = await self._market.get_multi_timeframe_ohlcv(_hsym)
+                        _hc = _hmtf.get("1h", [])
+                        if len(_hc) >= 21:
+                            _arr = _np.array([float(_b[4]) for _b in _hc[-21:]])
+                            self._returns_cache[_hsym] = _np.diff(_arr) / (_arr[:-1] + 1e-10)
+                    except Exception as _ex:
+                        logger.debug("returns_cache backfill failed for %s: %s", _hsym, _ex)
+            except Exception as _exc:
+                logger.debug("returns_cache build failed: %s", _exc)
+
+            # 4a-ter. Stablecoin depeg health check \u2014 trip a soft circuit
+            # breaker when USDC drifts > STABLECOIN_DEPEG_THRESHOLD vs USDT.
+            # Self-clears as soon as the spread recovers; independent of the
+            # daily-loss breaker so a brief blip does NOT lock trading until
+            # 00:00 UTC.
+            try:
+                _depeg_th = float(getattr(settings, "STABLECOIN_DEPEG_THRESHOLD", 0.0) or 0.0)
+                if _depeg_th > 0:
+                    _usdc_usdt = await self._market.get_price("USDC/USDT")
+                    if _usdc_usdt:
+                        _drift = abs(1.0 - _usdc_usdt)
+                        if _drift > _depeg_th:
+                            if not self._depeg_paused:
+                                logger.error(
+                                    "Stablecoin depeg detected: USDC/USDT=%.4f "
+                                    "(drift %.3f > %.3f) \u2014 halting BUYs",
+                                    _usdc_usdt, _drift, _depeg_th,
+                                )
+                            self._depeg_paused = True
+                        elif self._depeg_paused:
+                            logger.warning(
+                                "Stablecoin depeg cleared: USDC/USDT=%.4f "
+                                "(drift %.3f <= %.3f) \u2014 resuming BUYs",
+                                _usdc_usdt, _drift, _depeg_th,
+                            )
+                            self._depeg_paused = False
+            except Exception as _exc:
+                logger.debug("depeg check skipped: %s", _exc)
 
             # 4a2. Auto-adjust risk profile based on regime
             new_profile = claude_engine.auto_adjust_risk_profile(
@@ -1285,6 +1375,79 @@ class BotRunner:
                 else:
                     del self._sl_cooldown[decision.symbol]
 
+            # 7c-bis. Post-TP per-symbol cooldown
+            if decision.action == "BUY" and self._is_post_tp_cooldown_active(decision.symbol):
+                until = self._post_tp_cooldown[decision.symbol]
+                left = (until - datetime.now(timezone.utc)).total_seconds() / 60
+                logger.info(
+                    "Post-TP cooldown on %s (%.0f min left) \u2014 HOLD",
+                    decision.symbol, left,
+                )
+                decision.action = "HOLD"
+                decision.quantity_pct = 0.0
+                decision.reasoning = "[POST-TP COOLDOWN] " + (decision.reasoning or "")
+
+            # 7c-ter. Daily loss circuit breaker
+            if decision.action == "BUY" and self._check_daily_loss_breaker():
+                logger.warning(
+                    "Daily loss breaker active \u2014 %s BUY \u2192 HOLD",
+                    decision.symbol,
+                )
+                decision.action = "HOLD"
+                decision.quantity_pct = 0.0
+                decision.reasoning = "[DAILY-LOSS BREAKER] " + (decision.reasoning or "")
+
+            # 7c-ter-bis. Stablecoin depeg breaker (auto-clears when spread
+            # recovers \u2014 see cycle step 4a-ter).  Blocks new BUYs only;
+            # existing-position management remains active.
+            if decision.action == "BUY" and self._depeg_paused:
+                logger.warning(
+                    "Stablecoin depeg active \u2014 %s BUY \u2192 HOLD",
+                    decision.symbol,
+                )
+                decision.action = "HOLD"
+                decision.quantity_pct = 0.0
+                decision.reasoning = "[DEPEG BREAKER] " + (decision.reasoning or "")
+
+            # 7c-quater. Correlation cluster guard
+            if decision.action == "BUY":
+                blocked, with_sym, corr = self._correlated_with_held(decision.symbol)
+                if blocked:
+                    logger.info(
+                        "Correlation guard: %s vs held %s = %.2f \u2265 %.2f \u2014 HOLD",
+                        decision.symbol, with_sym, corr,
+                        getattr(settings, "MAX_HELD_CORRELATION", 0.0),
+                    )
+                    decision.action = "HOLD"
+                    decision.quantity_pct = 0.0
+                    decision.reasoning = (
+                        f"[CORR GUARD vs {with_sym}={corr:.2f}] "
+                        + (decision.reasoning or "")
+                    )
+
+            # 7c-quinquies. Hard $-loss-per-trade cap (shrink size if needed)
+            if (
+                decision.action == "BUY"
+                and decision.stop_loss_pct
+                and decision.quantity_pct > 0
+                and float(getattr(settings, "MAX_LOSS_PER_TRADE_USD", 0.0) or 0.0) > 0
+            ):
+                cap_usd = float(settings.MAX_LOSS_PER_TRADE_USD)
+                pos_usd = self._portfolio.total_value * (decision.quantity_pct / 100.0)
+                risk_usd = pos_usd * (decision.stop_loss_pct / 100.0)
+                if risk_usd > cap_usd and decision.stop_loss_pct > 0:
+                    new_qty_pct = (
+                        cap_usd
+                        / (self._portfolio.total_value * (decision.stop_loss_pct / 100.0))
+                    ) * 100.0
+                    new_qty_pct = max(0.5, min(new_qty_pct, decision.quantity_pct))
+                    logger.info(
+                        "[MAX-LOSS CAP] %s qty %.2f%% -> %.2f%% (risk $%.2f -> ~$%.2f, cap $%.2f)",
+                        decision.symbol, decision.quantity_pct, new_qty_pct,
+                        risk_usd, cap_usd, cap_usd,
+                    )
+                    decision.quantity_pct = new_qty_pct
+
             # 7d. Startup warmup — block new BUY entries until OHLCV caches and
             #     ML signals have had one full cycle to warm up.  SELL decisions
             #     and existing-position management are unaffected.
@@ -1570,6 +1733,122 @@ class BotRunner:
         """Prevent re-buying a symbol for N minutes after stop-loss hit."""
         self._sl_cooldown[symbol] = datetime.now(timezone.utc) + timedelta(minutes=minutes)
 
+    def _add_post_tp_cooldown(self, symbol: str) -> None:
+        """Block re-entry to a symbol after a profit-take exit.
+
+        Stops the bot from churning back into a coin that just paid us out
+        and is statistically prone to mean-reverting against us.
+        """
+        mins = int(getattr(settings, "POST_TP_SYMBOL_COOLDOWN_MIN", 0) or 0)
+        if mins <= 0:
+            return
+        self._post_tp_cooldown[symbol] = (
+            datetime.now(timezone.utc) + timedelta(minutes=mins)
+        )
+        logger.info("[POST-TP COOLDOWN] %s: blocked for %dm", symbol, mins)
+
+    def _is_post_tp_cooldown_active(self, symbol: str) -> bool:
+        until = self._post_tp_cooldown.get(symbol)
+        if until is None:
+            return False
+        if datetime.now(timezone.utc) >= until:
+            self._post_tp_cooldown.pop(symbol, None)
+            return False
+        return True
+
+    def _check_daily_loss_breaker(self) -> bool:
+        """Daily loss circuit breaker.
+
+        Returns True if BUYs should be blocked because the portfolio is
+        down more than DAILY_LOSS_LIMIT_PCT since the start of the current
+        UTC day.  Resets baseline at 00:00 UTC.
+
+        Sells / exits remain unaffected so positions can still be closed.
+        """
+        limit_pct = float(getattr(settings, "DAILY_LOSS_LIMIT_PCT", 0.0) or 0.0)
+        if limit_pct == 0.0:
+            return False
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if today != self._daily_baseline_date:
+            # Roll over to a new day \u2014 reset baseline & breaker.
+            self._daily_baseline_date = today
+            self._daily_baseline_value = max(self._portfolio.total_value, 0.01)
+            self._daily_loss_paused = False
+            logger.info(
+                "[DAILY BASELINE] %s: $%.2f", today, self._daily_baseline_value,
+            )
+            return False
+        if self._daily_baseline_value <= 0:
+            return False
+        cur = self._portfolio.total_value
+        change_pct = (cur - self._daily_baseline_value) / self._daily_baseline_value * 100
+        if change_pct <= limit_pct:
+            if not self._daily_loss_paused:
+                logger.warning(
+                    "Daily loss breaker tripped: %.2f%% \u2264 %.2f%% \u2014 "
+                    "no new BUYs until %s 00:00 UTC",
+                    change_pct, limit_pct, today,
+                )
+            self._daily_loss_paused = True
+            return True
+        return False
+
+    def _is_weekend_utc(self) -> bool:
+        """True on Saturday or Sunday UTC (low-liquidity period)."""
+        return datetime.now(timezone.utc).weekday() >= 5
+
+    def _correlated_with_held(self, candidate: str) -> tuple[bool, str, float]:
+        """Return (blocked, reason_symbol, correlation) if candidate is too
+        highly correlated with any currently held position.
+
+        Uses _returns_cache populated each cycle from 1h OHLCV.
+        """
+        max_corr = float(getattr(settings, "MAX_HELD_CORRELATION", 0.0) or 0.0)
+        if max_corr <= 0:
+            return False, "", 0.0
+        cand = self._returns_cache.get(candidate)
+        if cand is None or len(cand) < 10:
+            return False, "", 0.0
+        try:
+            import numpy as _np
+        except Exception:
+            return False, "", 0.0
+        held_syms = [p.symbol for p in self._portfolio.all_positions()]
+        for held in held_syms:
+            if held == candidate:
+                continue
+            other = self._returns_cache.get(held)
+            if other is None or len(other) < 10:
+                continue
+            n = min(len(cand), len(other))
+            corr = float(_np.corrcoef(cand[-n:], other[-n:])[0, 1])
+            if abs(corr) >= max_corr:
+                return True, held, corr
+        return False, "", 0.0
+
+    def _max_loss_qty_cap(
+        self, price: float, sl_price: float, intended_qty: float,
+    ) -> float:
+        """Shrink intended_qty so that hitting the SL would not lose more
+        than MAX_LOSS_PER_TRADE_USD.  Returns the (possibly smaller) qty.
+
+        0 / disabled returns intended_qty unchanged.
+        """
+        cap = float(getattr(settings, "MAX_LOSS_PER_TRADE_USD", 0.0) or 0.0)
+        if cap <= 0 or sl_price <= 0 or price <= 0 or intended_qty <= 0:
+            return intended_qty
+        loss_per_unit = max(price - sl_price, 0.0)
+        if loss_per_unit <= 0:
+            return intended_qty
+        max_qty = cap / loss_per_unit
+        if max_qty < intended_qty:
+            logger.info(
+                "[MAX-LOSS CAP] qty %.6f -> %.6f (would risk $%.2f, limit $%.2f)",
+                intended_qty, max_qty, intended_qty * loss_per_unit, cap,
+            )
+            return max_qty
+        return intended_qty
+
     # ------------------------------------------------------------------ #
     # Startup warmup & persistent state
     # ------------------------------------------------------------------ #
@@ -1601,6 +1880,17 @@ class BotRunner:
                 "express_strikes": dict(self._express_strikes),
                 "banned_symbols": list(self._banned_symbols),
                 "recent_results": list(self._recent_results),
+                "post_tp_cooldown": {
+                    sym: dt.isoformat()
+                    for sym, dt in self._post_tp_cooldown.items()
+                },
+                "buy_pause_until": (
+                    self._buy_pause_until.isoformat()
+                    if getattr(self, "_buy_pause_until", None) else None
+                ),
+                "daily_baseline_value": self._daily_baseline_value,
+                "daily_baseline_date": self._daily_baseline_date,
+                "daily_loss_paused": self._daily_loss_paused,
             }
             _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
             tmp = _STATE_FILE.with_suffix(".tmp")
@@ -1644,6 +1934,31 @@ class BotRunner:
                 self._banned_symbols.add(sym)
 
             self._recent_results = [bool(r) for r in state.get("recent_results", [])][-10:]
+
+            for sym, iso in state.get("post_tp_cooldown", {}).items():
+                try:
+                    dt = datetime.fromisoformat(iso)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    if dt > now:
+                        self._post_tp_cooldown[sym] = dt
+                except Exception:
+                    pass
+
+            _bp = state.get("buy_pause_until")
+            if _bp:
+                try:
+                    _bp_dt = datetime.fromisoformat(_bp)
+                    if _bp_dt.tzinfo is None:
+                        _bp_dt = _bp_dt.replace(tzinfo=timezone.utc)
+                    if _bp_dt > now:
+                        self._buy_pause_until = _bp_dt
+                except Exception:
+                    pass
+
+            self._daily_baseline_value = float(state.get("daily_baseline_value", 0.0) or 0.0)
+            self._daily_baseline_date = str(state.get("daily_baseline_date", "") or "")
+            self._daily_loss_paused = bool(state.get("daily_loss_paused", False))
 
             logger.info(
                 "Loaded persisted bot state: %d SL cooldowns, %d express cooldowns, "
@@ -1971,12 +2286,15 @@ class BotRunner:
                         "TP cooldown: %s blocked for %d min to prevent churn",
                         symbol, tp_cool,
                     )
+                # Longer per-symbol post-TP cooldown (independent of SL window).
+                self._add_post_tp_cooldown(symbol)
             elif reason == "profit_lock":
                 # Profit lock: position peaked at +X%, dropped back to floor — counts as win
                 self._recent_results.append(True)
                 self._recent_results = self._recent_results[-10:]
                 # Short cooldown to avoid buying back immediately
                 self._add_sl_cooldown(symbol, minutes=10)
+                self._add_post_tp_cooldown(symbol)
             elif reason == "time_exit":
                 # Time exit: count as neutral (neither win nor loss streak)
                 pass

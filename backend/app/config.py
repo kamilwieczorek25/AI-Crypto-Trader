@@ -123,6 +123,33 @@ class Settings(BaseSettings):
     # How long to pause BUYs after the loss-streak threshold fires (hours).
     LOSS_STREAK_PAUSE_HOURS: float = 6.0
 
+    # ── Hard risk limits (always win over %-based limits) ─────────────────
+    # Hard $ ceiling on loss per trade (0 = disabled, use SL_PCT only).
+    # When set, position size is also capped so that hitting the SL would
+    # not lose more than this many USDC.
+    MAX_LOSS_PER_TRADE_USD: float = 0.0
+    # Daily loss circuit breaker: pause new BUYs for the rest of the UTC
+    # day if cumulative realised + unrealised PnL drops below this %.
+    # Resets at 00:00 UTC.  0 = disabled.  Recommended: -3 to -5.
+    DAILY_LOSS_LIMIT_PCT: float = -4.0
+    # Per-symbol cooldown after a profit-take exit (minutes).  Stops the
+    # bot from repeatedly buying back into a coin that just gave us TP.
+    POST_TP_SYMBOL_COOLDOWN_MIN: int = 240
+    # Block new BUYs when a held position correlates >= this with the
+    # candidate over the last 20 1-h candles.  0 = disabled.
+    MAX_HELD_CORRELATION: float = 0.75
+    # Tighten MIN_QUANT_SCORE by this amount on Saturday & Sunday UTC.
+    # Crypto liquidity halves on weekends and whipsaws are common.
+    WEEKEND_SCORE_BUMP: float = 5.0
+    # Halt all trading when |USDC/USDT spread| > this fraction (depeg
+    # detection).  0 = disabled.  Default: 0.005 = 0.5%.
+    STABLECOIN_DEPEG_THRESHOLD: float = 0.005
+
+    # ── Trading fees ──────────────────────────────────────────────────────
+    # Set to True if you've enabled "Pay fees with BNB" on Binance and hold
+    # BNB \u2014 fees drop from 0.10% to 0.075% per side (25% discount).
+    BNB_FEE_DISCOUNT: bool = False
+
     # ── Auto-backtest & tuning ─────────────────────────────────────────────
     # Run backtest on bot startup and auto-tune scorer settings
     AUTO_BACKTEST: bool = True

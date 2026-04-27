@@ -1030,6 +1030,18 @@ def rank_symbols(
         adjusted_min += 3
         logger.debug("BTC dominance (BTC.D=%.1f%%) — threshold +3", btc_dominance.get("btc_dominance", 0))
 
+    # Weekend mode: tighter threshold on Sat/Sun UTC (low liquidity, frequent
+    # whipsaws).  WEEKEND_SCORE_BUMP=0 disables.
+    try:
+        from datetime import datetime as _dt, timezone as _tz
+        if _dt.now(_tz.utc).weekday() >= 5:
+            _bump = float(getattr(settings, "WEEKEND_SCORE_BUMP", 0.0) or 0.0)
+            if _bump != 0:
+                adjusted_min += _bump
+                logger.debug("Weekend mode: threshold +%.1f", _bump)
+    except Exception:
+        pass
+
     from app.services.whale_detector import whale_detector
     whale_map = whale_detector.get_all_whale_data()
 

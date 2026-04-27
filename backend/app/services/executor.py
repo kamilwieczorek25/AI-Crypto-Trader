@@ -1,5 +1,6 @@
 """Trade executor — demo fills + real orders + safety gates + DCA."""
 
+import asyncio
 import logging
 import random
 from datetime import datetime, timezone
@@ -18,7 +19,18 @@ logger = logging.getLogger(__name__)
 _SLIPPAGE_MIN = 0.0003   # 0.03%
 _SLIPPAGE_MAX = 0.0012   # 0.12%
 
-# Binance maker/taker fee (standard tier)
+# Binance maker/taker fee (standard tier).  When BNB_FEE_DISCOUNT is enabled
+# (user holds BNB and ticked "Pay fees with BNB"), fees drop 25% to 0.075%.
+def _fee_rate() -> float:
+    try:
+        from app.config import settings as _s
+        return 0.00075 if getattr(_s, "BNB_FEE_DISCOUNT", False) else 0.001
+    except Exception:
+        return 0.001
+
+# Backwards-compat module-level constant — used as the *current* default fee.
+# Modules importing _FEE_RATE will see the value at import time, so for hot
+# changes prefer calling _fee_rate() directly.
 _FEE_RATE = 0.001  # 0.1%
 
 
@@ -29,7 +41,7 @@ def _extract_fee(order: dict, fallback_cost: float) -> float:
         return float(fee_info["cost"])
     # Fallback: estimate from order cost
     cost = float(order.get("cost", 0)) or fallback_cost
-    return cost * _FEE_RATE
+    return cost * _fee_rate()
 
 
 def _apply_slippage(price: float, direction: str) -> float:
@@ -64,6 +76,18 @@ class TradeExecutor:
         self._market = market
         # Pending DCA orders: symbol -> DCAOrder
         self._pending_dca: dict[str, DCAOrder] = {}
+        # Per-symbol execution lock — prevents the express lane and the
+        # main cycle from concurrently opening two positions on the same
+        # symbol (which would oversize and could break MAX_POSITION_PCT).
+        self._symbol_locks: dict[str, asyncio.Lock] = {}
+
+    def _lock_for(self, symbol: str) -> asyncio.Lock:
+        """Return (creating if needed) the asyncio.Lock for `symbol`."""
+        lock = self._symbol_locks.get(symbol)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._symbol_locks[symbol] = lock
+        return lock
 
     # ------------------------------------------------------------------ #
     # DCA order management
@@ -83,28 +107,57 @@ class TradeExecutor:
             age_hours = (now - order.created_at).total_seconds() / 3600
             if age_hours > 24:
                 expired.append(sym)
-                # Return reserved cash for expired DCA order
-                self._portfolio.set_cash(self._portfolio.cash_usdt + order.usdt_amount)
-                logger.info("[DCA EXPIRED] %s: returning $%.2f reserved cash", sym, order.usdt_amount)
+                # Demo: in-memory reservation was a real debit \u2014 refund it.
+                # Real: exchange holds the truth; per-cycle sync keeps cash in
+                # line, so refunding here would over-credit.
+                if settings.is_demo:
+                    self._portfolio.set_cash(self._portfolio.cash_usdt + order.usdt_amount)
+                    logger.info("[DCA EXPIRED] %s: returning $%.2f reserved cash", sym, order.usdt_amount)
+                else:
+                    logger.info("[DCA EXPIRED] %s: order dropped (real mode \u2014 no in-memory refund)", sym)
                 continue
 
             # Fill if price dipped to target
             if current_price <= order.target_price:
                 price = _apply_slippage(current_price, "BUY")
-                fee_usdt = order.usdt_amount * _FEE_RATE
+                fee_usdt = order.usdt_amount * _fee_rate()
                 usdt_after_fee = order.usdt_amount - fee_usdt
                 quantity = usdt_after_fee / price
 
+                # Real mode: sync cash from exchange before checking, so an
+                # external trade or partial fill on Binance can't trick us
+                # into opening a phantom-cash position.
+                if not settings.is_demo:
+                    try:
+                        await self._portfolio.sync_from_exchange(db)
+                    except Exception as _sx:
+                        logger.warning(
+                            "DCA pre-fill exchange sync failed for %s (will use cached cash): %s",
+                            sym, _sx,
+                        )
+
                 if order.usdt_amount > self._portfolio.cash_usdt:
-                    logger.warning("DCA fill skipped: insufficient cash for %s", sym)
+                    logger.warning(
+                        "DCA fill skipped: insufficient cash for %s "
+                        "(need $%.2f, have $%.2f)",
+                        sym, order.usdt_amount, self._portfolio.cash_usdt,
+                    )
                     expired.append(sym)
-                    # Return whatever was reserved (cash may have been lost to sync)
-                    self._portfolio.set_cash(self._portfolio.cash_usdt + order.usdt_amount)
+                    # In demo mode the reservation was real (in-memory debit at
+                    # creation time) so we refund it.  In real mode the per-cycle
+                    # exchange sync has already overwritten _cash_usdt with the
+                    # true exchange balance, so refunding would over-credit \u2014
+                    # skip it.
+                    if settings.is_demo:
+                        self._portfolio.set_cash(self._portfolio.cash_usdt + order.usdt_amount)
                     continue
 
-                # Cash was reserved at DCA creation — return it so open_position's
-                # own deduction (qty*price + fee) doesn't double-count.
-                self._portfolio.set_cash(self._portfolio.cash_usdt + order.usdt_amount)
+                # Cash was reserved at DCA creation \u2014 in demo mode return it
+                # so open_position's own deduction (qty*price + fee) doesn't
+                # double-count.  In real mode, sync above has already aligned
+                # cash with reality, so don't double-credit.
+                if settings.is_demo:
+                    self._portfolio.set_cash(self._portfolio.cash_usdt + order.usdt_amount)
 
                 await self._portfolio.open_position(
                     db, sym, quantity, price,
@@ -152,7 +205,27 @@ class TradeExecutor:
             logger.info("HOLD decision — no trade")
             return None
 
+        # Serialize per-symbol so concurrent express-lane + main-cycle calls
+        # cannot both open positions on the same symbol simultaneously.
+        async with self._lock_for(decision.symbol):
+            return await self._execute_locked(db, decision, decision_id)
+
+    async def _execute_locked(
+        self, db: AsyncSession, decision: TradeDecision, decision_id: int
+    ) -> Trade | None:
+
         if decision.action == "BUY":
+            # Re-check "already held" inside the lock.  Both callers (express
+            # lane + main cycle) pre-check this BEFORE acquiring the lock, so
+            # without this guard two concurrent BUYs on the same symbol would
+            # both pass the outer check and then both open inside the lock.
+            if any(p.symbol == decision.symbol for p in self._portfolio.all_positions()):
+                logger.info(
+                    "Skipping BUY %s \u2014 position already opened by a concurrent task",
+                    decision.symbol,
+                )
+                return None
+
             total_value = self._portfolio.total_value
             # Auto-bump tiny percentages up to meet Binance $5.50 minimum notional
             min_notional = 6.0  # slightly above Binance $5 minimum for safety
@@ -247,7 +320,7 @@ class TradeExecutor:
                 second_usdt = 0.0
 
             # Apply trading fee
-            fee_usdt = first_usdt * _FEE_RATE
+            fee_usdt = first_usdt * _fee_rate()
             usdt_after_fee = first_usdt - fee_usdt
             quantity = usdt_after_fee / price
             stop_loss_price = price * (1 - decision.stop_loss_pct / 100)
@@ -287,7 +360,7 @@ class TradeExecutor:
             sell_pct = getattr(decision, "sell_pct", 100.0)
             quantity = pos.quantity * (min(100.0, max(1.0, sell_pct)) / 100.0)
             sell_proceeds = quantity * price
-            fee_usdt = sell_proceeds * _FEE_RATE
+            fee_usdt = sell_proceeds * _fee_rate()
             pnl_usdt, pnl_pct = await self._portfolio.close_position(
                 db, decision.symbol, price, fee_usdt=fee_usdt, sell_pct=sell_pct,
             )
@@ -359,7 +432,7 @@ class TradeExecutor:
                 logger.error("Cannot get price for %s — real trade skipped", decision.symbol)
                 return None
             # Deduct fee before sizing so order doesn't overspend available cash
-            usdt_after_fee = usdt_amount * (1 - _FEE_RATE)
+            usdt_after_fee = usdt_amount * (1 - _fee_rate())
             quantity = usdt_after_fee / price
 
             order = await exchange.create_market_buy_order(decision.symbol, quantity)
