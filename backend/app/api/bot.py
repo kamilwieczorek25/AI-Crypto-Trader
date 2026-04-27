@@ -114,6 +114,7 @@ async def bot_status() -> dict:
         "circuit_breaker_tripped": bot_runner._circuit_breaker_tripped,
         "less_fear": settings.LESS_FEAR,
         "lock_risk_profile": settings.LOCK_RISK_PROFILE,
+        "momentum_mode": settings.MOMENTUM_MODE,
     }
 
 
@@ -221,6 +222,33 @@ async def set_lock_risk_profile(req: LockRiskProfileRequest) -> dict:
         "lock_risk_profile": settings.LOCK_RISK_PROFILE,
     })
     return {"enabled": settings.LOCK_RISK_PROFILE}
+
+
+class MomentumModeRequest(BaseModel):
+    enabled: bool
+
+
+@router.get("/momentum-mode")
+async def get_momentum_mode() -> dict:
+    return {"enabled": settings.MOMENTUM_MODE}
+
+
+@router.post("/momentum-mode")
+async def set_momentum_mode(req: MomentumModeRequest) -> dict:
+    settings.MOMENTUM_MODE = req.enabled
+    await save_bot_state("momentum_mode", str(req.enabled).lower())
+    logger.info("Momentum mode %s", "ENABLED" if req.enabled else "DISABLED")
+    from app.services.claude_engine import get_profile_info
+    await bot_runner._broadcast("BOT_STATUS", {
+        "running": bot_runner.is_running,
+        "mode": settings.MODE,
+        "risk_profile": get_profile_info(),
+        "cycle_count": bot_runner._cycle_count,
+        "less_fear": settings.LESS_FEAR,
+        "lock_risk_profile": settings.LOCK_RISK_PROFILE,
+        "momentum_mode": settings.MOMENTUM_MODE,
+    })
+    return {"enabled": settings.MOMENTUM_MODE}
 
 
 class AdoptRequest(BaseModel):

@@ -44,6 +44,8 @@
         data-tip="<b>😱 Less Fear</b><br>Reduces Claude's conservative bias in two ways:<br>① Auto-approves BUY when quant score ≥ 45 (skips Claude on main cycle)<br>② Skips Claude entirely in the express lane — saves API cost<br>③ Blocks auto-downgrade to Conservative profile<br><span class='tip-warn'>Use in uptrends. Disable in downtrends/choppy markets.</span>">😱 Less Fear</button>
       <button id="btn-lock-profile" class="btn-fear" onclick="toggleLockRiskProfile()"
         data-tip="<b>🔒 Lock Profile</b><br>Prevents AUTO_RISK_PROFILE from switching the risk profile automatically.<br>Your current profile is kept regardless of market regime changes.<br><span class='tip-warn'>Enable when you want to stay in Aggressive/Fast mode even if the bot detects a downtrend.</span>">🔒 Lock Profile</button>
+      <button id="btn-momentum" class="btn-fear" onclick="toggleMomentumMode()"
+        data-tip="<b>📈 Momentum Mode</b><br>Simple ride-the-wave strategy:<br>① BUYs only when 1h return ≥ +1% AND 4h trend is up (fresh momentum)<br>② Lower quant floor (40 vs 55 default) — acts faster<br>③ Skips correlation guard — momentum exposure is the goal<br>④ Auto-SELL the moment growth stalls (last 2×1h returns sum ≤ +0.1% while in profit)<br>SL still applies on top.<br><span class='tip-warn'>Best in trending markets. Disable in chop / downtrends.</span>">📈 Momentum</button>
     </div>
     <div class="header-right">
       <div class="mode-group">
@@ -456,6 +458,6 @@
   <!-- Floating tooltip for data-tip buttons -->
   <div id="btn-tooltip" role="tooltip" aria-hidden="true"></div>
 
-  <script src="app.js?v=25"></script>
+  <script src="app.js?v=26"></script>
 </body>
 </html>

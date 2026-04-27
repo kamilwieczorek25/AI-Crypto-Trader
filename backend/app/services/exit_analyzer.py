@@ -68,6 +68,10 @@ def analyze_exit(
     profit_lock_activate: float,
     profit_lock_floor_min: float,
     profit_lock_keep: float, # 0.0-1.0 (already divided by 100)
+    momentum_mode: bool = False,    # MOMENTUM_MODE active?
+    recent_returns: list | None = None,  # last N 1h returns (decimal, e.g. 0.012=+1.2%)
+    stall_bars: int = 2,
+    stall_pct: float = 0.1,         # threshold % for stall (e.g. 0.1 = 0.1%)
 ) -> ExitSignal:
     """Analyze whether an open position should be exited.
 
@@ -89,6 +93,24 @@ def analyze_exit(
     highest = getattr(pos, "highest_price", price) or price
     peak_pnl_pct = (highest - entry) / entry * 100 if highest > 0 else 0.0
     drawdown_from_peak = (highest - price) / highest * 100 if highest > 0 else 0.0
+
+    # ── 0. Momentum-mode stall exit (highest priority when enabled) ──
+    # "Sell the moment growth stalls."  Requires a meaningful position-level
+    # profit (so we don't churn out of a flat losing trade prematurely \u2014
+    # SL handles that) AND the sum of the last N 1h returns falling at or
+    # below stall_pct.
+    if momentum_mode and recent_returns and pnl_pct >= 0.5:
+        n = min(stall_bars, len(recent_returns))
+        if n > 0:
+            recent_sum_pct = sum(float(r) for r in recent_returns[-n:]) * 100.0
+            if recent_sum_pct <= stall_pct:
+                return ExitSignal(
+                    "CLOSE",
+                    f"Momentum stall: last {n}\u00d71h sum={recent_sum_pct:+.2f}% "
+                    f"\u2264 {stall_pct:+.2f}% (PnL={pnl_pct:+.1f}%)",
+                    0.9,
+                    "momentum_stall",
+                )
 
     # ── 1. GPU Exit RL (highest priority when trained) ───────────────
     if exit_rl and exit_rl.get("trained", False):

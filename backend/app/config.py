@@ -52,6 +52,26 @@ class Settings(BaseSettings):
     # The manually selected profile is kept regardless of market regime.
     LOCK_RISK_PROFILE: bool = False
 
+    # Momentum mode: simple "ride the wave" strategy.
+    # When enabled:
+    #   \u2022 BUYs are gated to coins showing fresh upward momentum
+    #     (1h return >= MOMENTUM_MIN_1H_PCT AND 4h trend up).
+    #   \u2022 Lower quant floor (40 vs 55 default) so the bot acts faster.
+    #   \u2022 Correlation guard is skipped \u2014 we WANT momentum exposure.
+    #   \u2022 Positions are exited the moment growth stalls
+    #     (last MOMENTUM_STALL_BARS \u00d7 1h returns sum to <= MOMENTUM_STALL_PCT
+    #      while still in profit).  SL still applies on top.
+    MOMENTUM_MODE: bool = False
+    # Required 1h return % for a fresh momentum BUY (e.g. 1.0 = +1.0%).
+    MOMENTUM_MIN_1H_PCT: float = 1.0
+    # How many recent 1h candles to inspect for the stall-exit check.
+    MOMENTUM_STALL_BARS: int = 2
+    # If the sum of the last N 1h returns is \u2264 this %, the position is
+    # considered to have stalled (e.g. 0.1 = barely growing).
+    MOMENTUM_STALL_PCT: float = 0.1
+    # Lowered quant floor while MOMENTUM_MODE is on (vs 55 default / 45 LESS_FEAR).
+    MOMENTUM_QUANT_FLOOR: float = 40.0
+
     # Max drawdown circuit breaker (% of initial balance — pauses bot if exceeded)
     MAX_DRAWDOWN_PCT: float = 15.0
 

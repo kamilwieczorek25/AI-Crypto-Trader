@@ -136,6 +136,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             "ENABLED" if settings.LOCK_RISK_PROFILE else "disabled",
             settings.LOCK_RISK_PROFILE, db_val,
         )
+    if "momentum_mode" in state:
+        db_val = state["momentum_mode"].lower() == "true"
+        settings.MOMENTUM_MODE = db_val or settings.MOMENTUM_MODE
+        _log.info(
+            "Momentum mode: %s (env=%s db=%s)",
+            "ENABLED" if settings.MOMENTUM_MODE else "disabled",
+            settings.MOMENTUM_MODE, db_val,
+        )
 
     # Warn early if Anthropic key is missing
     if not settings.ANTHROPIC_API_KEY:

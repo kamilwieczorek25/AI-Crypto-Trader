@@ -377,6 +377,9 @@ function renderBotStatus(s) {
   if (s.lock_risk_profile !== undefined) {
     syncLockProfileButton(s.lock_risk_profile);
   }
+  if (s.momentum_mode !== undefined) {
+    syncMomentumButton(s.momentum_mode);
+  }
 
   // Background processes panel
   if (s.bg_processes) {
@@ -652,6 +655,46 @@ async function loadLockRiskProfile() {
     if (resp.ok) {
       const data = await resp.json();
       syncLockProfileButton(data.enabled);
+    }
+  } catch (_) {}
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Momentum Mode Toggle
+   ═══════════════════════════════════════════════════════════════ */
+let momentumModeActive = false;
+
+function syncMomentumButton(enabled) {
+  momentumModeActive = enabled;
+  const btn = $('btn-momentum');
+  if (!btn) return;
+  if (enabled) {
+    btn.classList.add('active');
+    btn.textContent = '📈 Momentum ON';
+  } else {
+    btn.classList.remove('active');
+    btn.textContent = '📈 Momentum';
+  }
+}
+
+async function toggleMomentumMode() {
+  try {
+    const resp = await fetch(`${API_BASE}/api/bot/momentum-mode`, {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({enabled: !momentumModeActive}),
+    });
+    if (!resp.ok) { const e = await resp.json(); alert(e.detail || 'Failed'); return; }
+    const data = await resp.json();
+    syncMomentumButton(data.enabled);
+  } catch (e) { alert('Error: ' + e.message); }
+}
+
+async function loadMomentumMode() {
+  try {
+    const resp = await fetch(`${API_BASE}/api/bot/momentum-mode`);
+    if (resp.ok) {
+      const data = await resp.json();
+      syncMomentumButton(data.enabled);
     }
   } catch (_) {}
 }
@@ -1491,6 +1534,7 @@ function updateFooterClock() {
     loadChartSymbols(),
     loadLessFear(),
     loadLockRiskProfile(),
+    loadMomentumMode(),
     loadGpuStatus(),
   ]);
 

@@ -1055,7 +1055,12 @@ class BotRunner:
             # 5c. Skip Claude if top candidate score is too weak to ever pass
             top_candidates = quant_candidates[:2]
             best_score = top_candidates[0].score if top_candidates else 0
-            _pre_claude_floor = 45 if settings.LESS_FEAR else 55
+            if settings.MOMENTUM_MODE:
+                _pre_claude_floor = float(getattr(settings, "MOMENTUM_QUANT_FLOOR", 40.0))
+            elif settings.LESS_FEAR:
+                _pre_claude_floor = 45
+            else:
+                _pre_claude_floor = 55
             if best_score < _pre_claude_floor and not any(c.action == "SELL" for c in top_candidates):
                 logger.info(
                     "Quant: top score %.0f < %d — skipping Claude call (would HOLD anyway)",
@@ -1411,17 +1416,49 @@ class BotRunner:
 
             # 7c-quater. Correlation cluster guard
             if decision.action == "BUY":
-                blocked, with_sym, corr = self._correlated_with_held(decision.symbol)
-                if blocked:
+                # Momentum mode \u2014 we WANT correlated momentum exposure, so
+                # the cluster guard is suppressed.  Daily-loss / depeg / SL
+                # cooldown / hard $-cap all still apply.
+                if settings.MOMENTUM_MODE:
+                    pass
+                else:
+                    blocked, with_sym, corr = self._correlated_with_held(decision.symbol)
+                    if blocked:
+                        logger.info(
+                            "Correlation guard: %s vs held %s = %.2f \u2265 %.2f \u2014 HOLD",
+                            decision.symbol, with_sym, corr,
+                            getattr(settings, "MAX_HELD_CORRELATION", 0.0),
+                        )
+                        decision.action = "HOLD"
+                        decision.quantity_pct = 0.0
+                        decision.reasoning = (
+                            f"[CORR GUARD vs {with_sym}={corr:.2f}] "
+                            + (decision.reasoning or "")
+                        )
+
+            # 7c-quater-bis. Momentum-mode BUY gate \u2014 require fresh upward
+            # momentum (positive recent 1h return AND 4h trend up).  Stops the
+            # bot from buying a coin that's flat or rolling over even if its
+            # quant score is fine.
+            if decision.action == "BUY" and settings.MOMENTUM_MODE:
+                _ind_4h = (
+                    symbols_data.get(decision.symbol, {})
+                    .get("indicators", {}).get("4h", {}) or {}
+                )
+                _trend_4h = float(_ind_4h.get("trend", 0.0) or 0.0)
+                _returns = self._returns_cache.get(decision.symbol)
+                _r1h_pct = float(_returns[-1]) * 100.0 if (_returns is not None and len(_returns) >= 1) else 0.0
+                _min_pct = float(getattr(settings, "MOMENTUM_MIN_1H_PCT", 1.0) or 0.0)
+                if _r1h_pct < _min_pct or _trend_4h <= 0:
                     logger.info(
-                        "Correlation guard: %s vs held %s = %.2f \u2265 %.2f \u2014 HOLD",
-                        decision.symbol, with_sym, corr,
-                        getattr(settings, "MAX_HELD_CORRELATION", 0.0),
+                        "Momentum gate: %s 1h=%+.2f%% (need \u2265%+.2f%%), "
+                        "4h trend=%+.0f \u2014 HOLD",
+                        decision.symbol, _r1h_pct, _min_pct, _trend_4h,
                     )
                     decision.action = "HOLD"
                     decision.quantity_pct = 0.0
                     decision.reasoning = (
-                        f"[CORR GUARD vs {with_sym}={corr:.2f}] "
+                        f"[MOMENTUM GATE 1h={_r1h_pct:+.2f}% trend4h={_trend_4h:+.0f}] "
                         + (decision.reasoning or "")
                     )
 
@@ -2028,6 +2065,8 @@ class BotRunner:
                 "market_regime": self._last_regime,
                 "circuit_breaker_tripped": self._circuit_breaker_tripped,
                 "less_fear": settings.LESS_FEAR,
+                "lock_risk_profile": settings.LOCK_RISK_PROFILE,
+                "momentum_mode": settings.MOMENTUM_MODE,
                 "bg_processes": bg_processes,
             },
         )
@@ -2096,6 +2135,13 @@ class BotRunner:
                 profit_lock_activate=settings.PROFIT_LOCK_ACTIVATE_PCT,
                 profit_lock_floor_min=settings.PROFIT_LOCK_FLOOR_PCT,
                 profit_lock_keep=profit_lock_keep,
+                momentum_mode=settings.MOMENTUM_MODE,
+                recent_returns=(
+                    list(self._returns_cache.get(sym, []))
+                    if settings.MOMENTUM_MODE else None
+                ),
+                stall_bars=int(getattr(settings, "MOMENTUM_STALL_BARS", 2) or 2),
+                stall_pct=float(getattr(settings, "MOMENTUM_STALL_PCT", 0.1) or 0.0),
             )
 
             if signal.action == "HOLD":
